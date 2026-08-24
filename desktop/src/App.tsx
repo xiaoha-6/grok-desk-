@@ -73,8 +73,8 @@ import {
 
 const LEGACY_CONTEXT_WINDOW = 225000;
 const DEFAULT_CONTEXT_WINDOW = 500000;
-const HISTORY_PAGE = 48;
-const VIEW_PAGE = 40;
+const HISTORY_PAGE = 80;
+const VIEW_PAGE = 80;
 const MAX_ATTACHMENTS = 8;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 
@@ -958,7 +958,7 @@ export default function App() {
       const el = transcriptRef.current;
       const prevHeight = el?.scrollHeight || 0;
       const prevTop = el?.scrollTop || 0;
-      const hasMore = incoming.length >= HISTORY_PAGE || Boolean(history.hasMore);
+      const hasMore = incoming.length === 0 ? skip > 0 && Boolean(history.hasMore) : incoming.length >= HISTORY_PAGE || Boolean(history.hasMore);
       setConversations((list) =>
         list.map((item) => {
           if (item.id !== conversationId) return item;
@@ -971,6 +971,9 @@ export default function App() {
           };
         }),
       );
+      if (!older) {
+        setShownCount(Math.max(VIEW_PAGE, incoming.length));
+      }
       if (older || skip > 0) {
         setShownCount((count) => count + incoming.length);
         requestAnimationFrame(() => {
@@ -1002,11 +1005,8 @@ export default function App() {
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
         const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
-        if (!conversation?.grokSessionId || conversation.historyHasMore === false) return;
-        if (shownCountRef.current < conversation.messages.length) {
-          setShownCount(conversation.messages.length);
-        }
-        void loadSessionHistory(conversation.id, true);
+        if (!conversation) return;
+        revealOlder(conversation.id);
       },
       { root, rootMargin: "160px 0px 0px 0px", threshold: 0 },
     );
@@ -1574,17 +1574,32 @@ export default function App() {
     }
   }
 
+  function revealOlder(conversationId: string) {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    if (!conversation) return;
+    if (shownCountRef.current < conversation.messages.length) {
+      const el = transcriptRef.current;
+      const prevHeight = el?.scrollHeight || 0;
+      const prevTop = el?.scrollTop || 0;
+      setShownCount((count) => Math.min(conversation.messages.length, count + VIEW_PAGE));
+      requestAnimationFrame(() => {
+        const box = transcriptRef.current;
+        if (!box) return;
+        box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+      });
+      return;
+    }
+    if (conversation.grokSessionId && conversation.historyHasMore !== false) {
+      void loadSessionHistory(conversation.id, true);
+    }
+  }
+
   function onTranscriptScroll() {
     const el = transcriptRef.current;
     if (!el) return;
     followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
     if (el.scrollTop > 80) return;
-    const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
-    if (!conversation?.grokSessionId || conversation.historyHasMore === false) return;
-    if (shownCountRef.current < conversation.messages.length) {
-      setShownCount(conversation.messages.length);
-    }
-    void loadSessionHistory(conversation.id, true);
+    if (selectedIdRef.current) revealOlder(selectedIdRef.current);
   }
 
   function beginResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1910,17 +1925,14 @@ export default function App() {
         </header>
 
         <section ref={transcriptRef} className="transcript" onScroll={onTranscriptScroll}>
-          {selected?.grokSessionId ? (
+          {selected?.grokSessionId || selected?.messages.length ? (
             <div className="history-more-bar">
-              {selected.historyHasMore !== false ? (
+              {selected.messages.length > shownCount || (selected.grokSessionId && selected.historyHasMore !== false) ? (
                 <button
                   className="ghost compact history-more"
                   type="button"
                   disabled={loadingOlder}
-                  onClick={() => {
-                    setShownCount((count) => Math.max(count, selected.messages.length));
-                    void loadSessionHistory(selected.id, true);
-                  }}
+                  onClick={() => revealOlder(selected.id)}
                 >
                   {loadingOlder ? t.loadingOlder : t.loadOlder}
                 </button>

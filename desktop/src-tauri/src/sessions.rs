@@ -70,7 +70,21 @@ pub fn load_session_history(
     }
     let dir = find_session_dir(&grok_home().join("sessions"), session_id)
         .ok_or_else(|| "找不到本机 Grok 对话".to_string())?;
-    let (messages, has_more) = parse_chat_history(&dir.join("chat_history.jsonl"), limit.max(1), skip);
+    let limit = limit.max(1);
+    let history_path = dir.join("chat_history.jsonl");
+    let segments = compaction_segment_files(&dir);
+    let (messages, hist_more) = parse_chat_history(&history_path, limit, skip);
+    let has_more;
+    let messages = if messages.is_empty() && !hist_more {
+        let hist_total = count_chat_messages(&history_path);
+        let seg_skip = skip.saturating_sub(hist_total);
+        let (extra, seg_more) = parse_compaction_segments(&segments, limit, seg_skip);
+        has_more = seg_more;
+        extra
+    } else {
+        has_more = hist_more || !segments.is_empty();
+        messages
+    };
     let (used_tokens, total_tokens, compaction_count) = parse_signals(&dir.join("signals.json"));
     Ok(LocalSessionHistory {
         session_id: session_id.to_string(),
@@ -184,6 +198,74 @@ fn parse_summary(path: &Path) -> Option<LocalSessionSummary> {
     })
 }
 
+fn count_chat_messages(path: &Path) -> usize {
+    let Ok(bytes) = fs::read(path) else {
+        return 0;
+    };
+    line_ranges(&bytes)
+        .into_iter()
+        .filter(|range| {
+            let line = &bytes[range.clone()];
+            looks_like_chat_line(line)
+                && serde_json::from_slice::<Value>(line)
+                    .ok()
+                    .and_then(|value| chat_message_from_value(&value))
+                    .is_some()
+        })
+        .count()
+}
+
+fn compaction_segment_files(dir: &Path) -> Vec<PathBuf> {
+    let folder = dir.join("compaction");
+    let Ok(entries) = fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            name.starts_with("segment_") && name.ends_with(".md")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn parse_compaction_segments(
+    files: &[PathBuf],
+    limit: usize,
+    skip: usize,
+) -> (Vec<LocalSessionMessage>, bool) {
+    if files.is_empty() {
+        return (Vec::new(), false);
+    }
+    let newest_first: Vec<&PathBuf> = files.iter().rev().collect();
+    let has_more = newest_first.len() > skip + limit;
+    let page: Vec<LocalSessionMessage> = newest_first
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_string_lossy().to_string();
+            let raw = fs::read_to_string(path).ok()?;
+            let body = raw.trim();
+            if body.is_empty() {
+                return None;
+            }
+            Some(LocalSessionMessage {
+                role: "assistant".into(),
+                text: format!(
+                    "更早的对话摘要（{name}）\n\n{}",
+                    truncate_text(body, 8000)
+                ),
+            })
+        })
+        .collect();
+    let more = has_more || skip + page.len() < files.len();
+    (page, more)
+}
+
 fn parse_chat_history(path: &Path, limit: usize, skip: usize) -> (Vec<LocalSessionMessage>, bool) {
     let Ok(bytes) = fs::read(path) else {
         return (Vec::new(), false);
@@ -268,22 +350,12 @@ fn chat_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
         })
     } else if kind == "assistant" {
         let raw = content_text(value);
-        let text = if raw.is_empty() {
-            let tools = value
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .map(|items| items.len())
-                .unwrap_or(0);
-            if tools == 0 {
-                return None;
-            }
-            format!("调用了 {tools} 个工具")
-        } else {
-            truncate_text(&raw, 16_000)
-        };
+        if raw.trim().is_empty() {
+            return None;
+        }
         Some(LocalSessionMessage {
             role: "assistant".into(),
-            text,
+            text: truncate_text(&raw, 16_000),
         })
     } else {
         None
