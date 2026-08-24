@@ -2,6 +2,7 @@ mod accounts;
 mod acp;
 mod config;
 mod install;
+mod media;
 mod runtime;
 
 use accounts::{
@@ -9,8 +10,8 @@ use accounts::{
     fetch_quota, load_state, save_accounts, start_login, AccountRecord, AccountState, LoginSlot,
     SkillRecord,
 };
-use acp::{AcpClient, AcpStatus, SessionInfo, SessionOptions};
-use config::{parse_deeplink, write_config, RelayImport};
+use acp::{AcpClient, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
+use config::{parse_deeplink, write_config, RelayImport, RelayQuota};
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
 use serde::Deserialize;
@@ -101,13 +102,31 @@ async fn send_prompt(
     app: AppHandle,
     state: State<'_, AppState>,
     text: String,
+    attachments: Option<Vec<PromptAttachment>>,
 ) -> Result<(), String> {
     let acp = Arc::clone(&state.acp);
     run_blocking(move || {
         let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        client.send_prompt(&app, text)
+        client.send_prompt(&app, text, attachments.unwrap_or_default())
     })
     .await
+}
+
+#[tauri::command]
+async fn get_relay_quota() -> RelayQuota {
+    tauri::async_runtime::spawn_blocking(|| config::fetch_relay_quota(&grok_home()))
+        .await
+        .unwrap_or_else(|_| config::fetch_relay_quota(&grok_home()))
+}
+
+#[tauri::command]
+async fn read_clipboard_image() -> Result<Option<PromptAttachment>, String> {
+    run_blocking(media::read_clipboard_image).await
+}
+
+#[tauri::command]
+async fn read_image_file(path: String) -> Result<PromptAttachment, String> {
+    run_blocking(move || media::read_image_file(path)).await
 }
 
 #[tauri::command]
@@ -338,6 +357,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
             import_relay,
+            get_relay_quota,
+            read_clipboard_image,
+            read_image_file,
             parse_import_url,
             take_pending_import,
             install_runtime,

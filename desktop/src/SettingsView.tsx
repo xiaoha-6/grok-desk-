@@ -17,6 +17,7 @@ import {
   type AppSettings,
   type Lang,
   type RelayImport,
+  type RelayQuota,
   type RuntimeStatus,
   type SettingsPage,
   type SkillRecord,
@@ -95,6 +96,8 @@ export function SettingsView(props: {
   onAddAccount: (name: string) => void;
   onLogin: (account: AccountRecord) => void;
   onRefreshQuotas: () => void;
+  relayQuota: RelayQuota | null;
+  relayQuotaText: string;
   onOpenAccount: (account: AccountRecord) => void;
   onRemoveAccount: (id: string) => void;
   routedAccountId?: string;
@@ -236,7 +239,7 @@ export function SettingsView(props: {
                     value={props.settings.contextWindowTokens}
                     onChange={(event) =>
                       props.patchSettings({
-                        contextWindowTokens: Math.max(16000, Number(event.target.value) || 225000),
+                        contextWindowTokens: Math.max(16000, Number(event.target.value) || 500000),
                       })
                     }
                   />
@@ -334,6 +337,22 @@ export function SettingsView(props: {
                   {props.importing ? copy.importing : copy.import}
                 </button>
               </div>
+              {props.relayQuota?.configured ? (
+                <section className="group">
+                  <SettingsRow title={copy.relayQuota} detail={props.relayQuota.endpoint || props.form.endpoint}>
+                    <span className="pill ok">{props.relayQuotaText || copy.quotaPending}</span>
+                  </SettingsRow>
+                  {props.relayQuota.planName ? (
+                    <SettingsRow title={copy.name} detail={props.relayQuota.planName} />
+                  ) : null}
+                  {props.relayQuota.error ? <p className="error">{props.relayQuota.error}</p> : null}
+                  <div className="actions">
+                    <button className="ghost" type="button" disabled={props.refreshingQuota} onClick={props.onRefreshQuotas}>
+                      {props.refreshingQuota ? copy.refreshing : copy.refreshQuota}
+                    </button>
+                  </div>
+                </section>
+              ) : null}
             </>
           )}
 

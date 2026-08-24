@@ -1,4 +1,5 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { fileLabel, lineDiff } from "./diff";
 import { CategoryIcon, EventKindIcon, IconChevronRight } from "./icons";
 import {
   categoryTitle,
@@ -8,7 +9,31 @@ import {
   visibleEvents,
   type ActivityCategory,
 } from "./timeline";
-import type { Lang, TimelineEvent } from "./types";
+import type { FileDiff, Lang, TimelineEvent } from "./types";
+
+function CodeDiff({ diff, lang }: { diff: FileDiff; lang: Lang }) {
+  const lines = lineDiff(diff.oldText, diff.newText);
+  const path = fileLabel(diff.path);
+  return (
+    <div className="code-diff">
+      {path ? <div className="diff-path">{path}</div> : null}
+      <div className="diff-body">
+        {lines.length ? (
+          lines.map((line, index) => (
+            <div key={`${line.kind}-${index}`} className={`diff-line ${line.kind}`}>
+              <span className="diff-mark">{line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}</span>
+              <span className="diff-text">{line.text || " "}</span>
+            </div>
+          ))
+        ) : (
+          <div className="diff-line eq">
+            <span className="diff-text">{lang === "en" ? "No changes" : "无改动"}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function Disclosure({
   open,
@@ -30,7 +55,11 @@ function Disclosure({
 }
 
 function EventRow({ event, lang }: { event: TimelineEvent; lang: Lang }) {
-  const [open, setOpen] = useState(false);
+  const hasDiff = Boolean(event.diffs?.length);
+  const [open, setOpen] = useState(hasDiff || event.kind === "edit");
+  useEffect(() => {
+    if (hasDiff || event.kind === "edit") setOpen(true);
+  }, [hasDiff, event.kind]);
   const status = event.status ? statusLabel(event.status, lang) : "";
   const tone =
     event.status && /fail|error/i.test(event.status)
@@ -49,13 +78,16 @@ function EventRow({ event, lang }: { event: TimelineEvent; lang: Lang }) {
       </Disclosure>
       {open ? (
         <div className="timeline-detail">
-          {event.input ? (
+          {hasDiff
+            ? event.diffs!.map((diff, index) => <CodeDiff key={`${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />)
+            : null}
+          {!hasDiff && event.input ? (
             <div className="timeline-block">
               <div className="timeline-kicker">{lang === "en" ? "Input" : "输入"}</div>
               <pre>{event.input}</pre>
             </div>
           ) : null}
-          {event.output ? (
+          {event.output && !hasDiff ? (
             event.kind === "thought" ? (
               <pre className="thought-md">{event.output}</pre>
             ) : (

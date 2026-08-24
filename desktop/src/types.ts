@@ -31,6 +31,17 @@ export type SessionInfo = {
   cwd: string;
 };
 
+export type DiffLine = {
+  kind: "eq" | "del" | "add";
+  text: string;
+};
+
+export type FileDiff = {
+  path?: string;
+  oldText: string;
+  newText: string;
+};
+
 export type TimelineEvent = {
   id: string;
   kind: string;
@@ -38,6 +49,25 @@ export type TimelineEvent = {
   status?: string;
   input?: string;
   output?: string;
+  diffs?: FileDiff[];
+};
+
+export type RelayQuota = {
+  configured: boolean;
+  name: string;
+  endpoint: string;
+  remaining?: number | null;
+  used?: number | null;
+  total?: number | null;
+  unit?: string | null;
+  planName?: string | null;
+  error?: string | null;
+};
+
+export type PromptAttachment = {
+  mimeType?: string;
+  data?: string;
+  name?: string;
 };
 
 export type MessageMedia = {
@@ -222,7 +252,7 @@ export function defaultSettings(): AppSettings {
   return {
     permissionMode: "default",
     reasoningEffort: "high",
-    contextWindowTokens: 225000,
+    contextWindowTokens: 500000,
     autoCompactThresholdPercent: 85,
     enableMemory: false,
     enableWebSearch: true,

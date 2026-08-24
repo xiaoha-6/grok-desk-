@@ -13,9 +13,10 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.1";
+const CLIENT_VERSION: &str = "0.6.2";
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +40,14 @@ pub struct SessionInfo {
     pub session_id: String,
     pub model: String,
     pub cwd: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttachment {
+    pub mime_type: Option<String>,
+    pub data: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -428,7 +437,12 @@ impl AcpClient {
         }
     }
 
-    pub fn send_prompt(&self, app: &AppHandle, text: String) -> Result<(), String> {
+    pub fn send_prompt(
+        &self,
+        app: &AppHandle,
+        text: String,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<(), String> {
         let agent = self.agent.as_ref().ok_or_else(|| "Agent 尚未连接".to_string())?;
         let session_id = self
             .session
@@ -436,15 +450,33 @@ impl AcpClient {
             .map(|s| s.session_id.clone())
             .ok_or_else(|| "ACP Session 尚未就绪".to_string())?;
         let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err("请输入要发送的内容".into());
+        let mut prompt: Vec<Value> = Vec::new();
+        if !trimmed.is_empty() {
+            prompt.push(json!({ "type": "text", "text": trimmed }));
+        }
+        for attachment in attachments {
+            let data = attachment.data.unwrap_or_default();
+            if data.is_empty() {
+                continue;
+            }
+            if data.len() > 35_000_000 {
+                return Err("图片太大，请控制在 25MB 以内".into());
+            }
+            prompt.push(json!({
+                "type": "image",
+                "data": data,
+                "mimeType": attachment.mime_type.unwrap_or_else(|| "image/png".into()),
+                "name": attachment.name.unwrap_or_default()
+            }));
+        }
+        if prompt.is_empty() {
+            return Err("请输入要发送的内容，或粘贴一张图片".into());
         }
 
         let stdin = Arc::clone(&agent.stdin);
         let next_id = Arc::clone(&agent.next_id);
         let pending = Arc::clone(&agent.pending);
         let app = app.clone();
-        let prompt = trimmed.to_string();
         thread::spawn(move || {
             let result = rpc_request(
                 &stdin,
@@ -453,7 +485,7 @@ impl AcpClient {
                 "session/prompt",
                 json!({
                     "sessionId": session_id,
-                    "prompt": [{ "type": "text", "text": prompt }]
+                    "prompt": prompt
                 }),
                 Duration::from_secs(60 * 30),
             );
@@ -509,7 +541,10 @@ impl AcpClient {
             )
             .env(
                 "GROK_DEBUG_CONTEXT_WINDOW",
-                options.context_window_tokens.unwrap_or(225_000).to_string(),
+                options
+                    .context_window_tokens
+                    .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+                    .to_string(),
             )
             .env(
                 "GROK_AUTO_COMPACT_THRESHOLD_PERCENT",
@@ -622,7 +657,9 @@ fn spawn_fingerprint(options: &SessionOptions, model: &str) -> String {
     format!(
         "{model}|{}|{}|{}|{}|{}",
         options.grok_home.clone().unwrap_or_default(),
-        options.context_window_tokens.unwrap_or(225_000),
+        options
+            .context_window_tokens
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW),
         options.auto_compact_threshold_percent.unwrap_or(85),
         options.enable_memory.unwrap_or(false),
         options.enable_web_search.unwrap_or(true)

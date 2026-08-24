@@ -282,12 +282,284 @@ pub fn write_config(grok_home: &Path, import: &RelayImport) -> io::Result<Import
     let rendered = render_config(import);
     atomic_write(&config_path, rendered.as_bytes())?;
     restrict_owner_only(&config_path);
+    let _ = write_relay_sidecar(grok_home, import);
     Ok(ImportResult {
         config_path: config_path.display().to_string(),
         backup_path: backup_path.map(|path| path.display().to_string()),
         model: import.model.clone(),
         endpoint: import.endpoint.clone(),
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelaySidecar {
+    pub endpoint: String,
+    pub name: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayProfile {
+    pub endpoint: String,
+    pub api_key: String,
+    pub name: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayQuota {
+    pub configured: bool,
+    pub name: String,
+    pub endpoint: String,
+    pub remaining: Option<f64>,
+    pub used: Option<f64>,
+    pub total: Option<f64>,
+    pub unit: Option<String>,
+    pub plan_name: Option<String>,
+    pub error: Option<String>,
+}
+
+impl RelayQuota {
+    fn empty() -> Self {
+        Self {
+            configured: false,
+            name: DEFAULT_PROVIDER.to_string(),
+            endpoint: String::new(),
+            remaining: None,
+            used: None,
+            total: None,
+            unit: None,
+            plan_name: None,
+            error: None,
+        }
+    }
+}
+
+fn sidecar_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("grokdesk-relay.json")
+}
+
+fn write_relay_sidecar(grok_home: &Path, import: &RelayImport) -> io::Result<()> {
+    let body = serde_json::to_vec_pretty(&RelaySidecar {
+        endpoint: import.endpoint.clone(),
+        name: import.name.clone(),
+        model: import.model.clone(),
+    })
+    .map_err(io::Error::other)?;
+    atomic_write(&sidecar_path(grok_home), &body)
+}
+
+fn read_relay_sidecar(grok_home: &Path) -> Option<RelaySidecar> {
+    let bytes = fs::read(sidecar_path(grok_home)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn first_toml_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix(key) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = toml_unquote(rest.trim());
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub fn read_relay_profile(grok_home: &Path) -> Option<RelayProfile> {
+    let text = fs::read_to_string(grok_home.join("config.toml")).ok()?;
+    let api_key = first_toml_value(&text, "api_key")?;
+    let sidecar = read_relay_sidecar(grok_home);
+    let endpoint = sidecar
+        .as_ref()
+        .map(|item| item.endpoint.clone())
+        .filter(|value| !value.is_empty())
+        .or_else(|| first_toml_value(&text, "models_base_url"))
+        .or_else(|| first_toml_value(&text, "xai_api_base_url"))?;
+    Some(RelayProfile {
+        endpoint: with_v1(&endpoint),
+        api_key,
+        name: sidecar
+            .as_ref()
+            .map(|item| item.name.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()),
+        model: sidecar
+            .as_ref()
+            .map(|item| item.model.clone())
+            .filter(|value| !value.is_empty())
+            .or_else(|| first_toml_value(&text, "default"))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+    })
+}
+
+fn is_official_endpoint(endpoint: &str) -> bool {
+    let lower = endpoint.to_ascii_lowercase();
+    lower.contains("api.x.ai") || lower.contains("://x.ai/")
+}
+
+pub fn fetch_relay_quota(grok_home: &Path) -> RelayQuota {
+    let Some(profile) = read_relay_profile(grok_home) else {
+        return RelayQuota::empty();
+    };
+    if is_official_endpoint(&profile.endpoint) {
+        return RelayQuota::empty();
+    }
+    match fetch_relay_quota_inner(&profile) {
+        Ok(mut quota) => {
+            quota.configured = true;
+            quota.name = profile.name;
+            quota.endpoint = profile.endpoint;
+            quota
+        }
+        Err(error) => RelayQuota {
+            configured: true,
+            name: profile.name,
+            endpoint: profile.endpoint,
+            remaining: None,
+            used: None,
+            total: None,
+            unit: None,
+            plan_name: None,
+            error: Some(error),
+        },
+    }
+}
+
+fn fetch_relay_quota_inner(profile: &RelayProfile) -> Result<RelayQuota, String> {
+    let base = profile.endpoint.trim_end_matches('/');
+    let candidates = [
+        format!("{base}/user/balance"),
+        format!("{base}/dashboard/billing/credit_grants"),
+    ];
+    let mut last_error = "无法查询中转站额度".to_string();
+    for url in candidates {
+        match http_json_get(&url, &profile.api_key) {
+            Ok(value) => return Ok(parse_relay_quota(&value)),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn parse_relay_quota(value: &serde_json::Value) -> RelayQuota {
+    let root = value
+        .get("data")
+        .filter(|item| item.is_object())
+        .unwrap_or(value);
+    let remaining = json_number(
+        root,
+        &[
+            "remaining",
+            "balance",
+            "total_available",
+            "totalAvailable",
+            "quota_remaining",
+            "quotaRemaining",
+        ],
+    );
+    let used = json_number(
+        root,
+        &["used", "total_used", "totalUsed", "quota_used", "quotaUsed"],
+    );
+    let total = json_number(
+        root,
+        &[
+            "total",
+            "total_granted",
+            "totalGranted",
+            "quota",
+            "limit",
+            "hard_limit_usd",
+        ],
+    );
+    let unit = json_string(root, &["unit", "currency"]).or(Some("USD".into()));
+    let plan_name = json_string(root, &["planName", "plan_name", "plan", "name"]);
+    RelayQuota {
+        configured: true,
+        name: DEFAULT_PROVIDER.to_string(),
+        endpoint: String::new(),
+        remaining,
+        used,
+        total,
+        unit,
+        plan_name,
+        error: None,
+    }
+}
+
+fn json_number(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(found) = value.get(*key).and_then(value_as_f64) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(|item| item.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn value_as_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|item| item as f64))
+        .or_else(|| value.as_u64().map(|item| item as f64))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+        })
+}
+
+fn http_json_get(url: &str, api_key: &str) -> Result<serde_json::Value, String> {
+    let mut command = std::process::Command::new("curl");
+    command
+        .arg("-sS")
+        .arg("-f")
+        .arg("-m")
+        .arg("8")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {api_key}"))
+        .arg("-H")
+        .arg("Accept: application/json")
+        .arg(url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("无法查询中转站额度：{err}"))?;
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        return Err(format!("中转站额度接口 HTTP {code}"));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|err| format!("中转站额度无法解析：{err}"))
 }
 
 fn backup_if_exists(path: &Path) -> io::Result<Option<PathBuf>> {
@@ -382,7 +654,33 @@ mod tests {
         let written = fs::read_to_string(dir.join("config.toml")).unwrap();
         assert!(written.contains("sk-new"));
         assert!(credentials_ready(&dir));
+        let profile = read_relay_profile(&dir).expect("relay profile");
+        assert_eq!(profile.api_key, "sk-new");
+        assert!(profile.endpoint.contains("example.com"));
+        assert_eq!(profile.name, "Demo");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_balance_payload() {
+        let quota = parse_relay_quota(&serde_json::json!({
+            "balance": 12.34,
+            "remaining": 12.34,
+            "used": 1.1,
+            "unit": "USD",
+            "planName": "API Key 额度"
+        }));
+        assert_eq!(quota.remaining, Some(12.34));
+        assert_eq!(quota.unit.as_deref(), Some("USD"));
+        assert_eq!(quota.plan_name.as_deref(), Some("API Key 额度"));
+        let unlimited = parse_relay_quota(&serde_json::json!({ "remaining": -1, "balance": -1 }));
+        assert_eq!(unlimited.remaining, Some(-1.0));
+    }
+
+    #[test]
+    fn official_xai_endpoints_are_skipped() {
+        assert!(is_official_endpoint("https://api.x.ai/v1"));
+        assert!(!is_official_endpoint("https://api.xiaohaweb.com/v1"));
     }
 
     #[test]

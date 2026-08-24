@@ -4,12 +4,16 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ActivityTimeline } from "./ActivityTimeline";
+import { extractFileDiffs } from "./diff";
 import {
   IconArrowUp,
   IconChevronDown,
@@ -46,10 +50,13 @@ import {
   type Conversation,
   type ImportResult,
   type Lang,
+  type MessageMedia,
   type PendingPermission,
   type PendingPlan,
   type PendingQuestion,
+  type PromptAttachment,
   type RelayImport,
+  type RelayQuota,
   type RuntimeStatus,
   type SessionInfo,
   type SettingsPage,
@@ -58,6 +65,11 @@ import {
   type TimelineEvent,
   type View,
 } from "./types";
+
+const LEGACY_CONTEXT_WINDOW = 225000;
+const DEFAULT_CONTEXT_WINDOW = 500000;
+const MAX_ATTACHMENTS = 8;
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 
 const STORAGE_KEY = "grokdesk.workspace.v3";
 const LEGACY_KEYS = ["grokdesk.workspace.v2", "grokdesk.workspace.v1"];
@@ -116,7 +128,13 @@ function upsertEvent(events: TimelineEvent[], event: TimelineEvent) {
   const index = events.findIndex((item) => item.id === event.id);
   if (index >= 0) {
     const next = [...events];
-    next[index] = { ...next[index], ...event, input: event.input ?? next[index].input, output: event.output ?? next[index].output };
+    next[index] = {
+      ...next[index],
+      ...event,
+      input: event.input ?? next[index].input,
+      output: event.output ?? next[index].output,
+      diffs: event.diffs?.length ? event.diffs : next[index].diffs,
+    };
     return next;
   }
   return [...events, event];
@@ -154,6 +172,79 @@ function extensionTitle(method: string, params: Record<string, unknown>, lang: L
 
 function formatTokens(value: number) {
   return value >= 1000 ? `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k` : String(value);
+}
+
+function migrateSettings(saved?: Partial<AppSettings>): AppSettings {
+  const merged = { ...defaultSettings(), ...saved };
+  if (!saved?.contextWindowTokens || saved.contextWindowTokens === LEGACY_CONTEXT_WINDOW) {
+    merged.contextWindowTokens = DEFAULT_CONTEXT_WINDOW;
+  }
+  return merged;
+}
+
+function persistConversations(list: Conversation[]): Conversation[] {
+  return list.map((item) => ({
+    ...item,
+    messages: item.messages.map((message) => ({
+      ...message,
+      streaming: false,
+      media: (message.media || []).map((media) => ({ ...media, data: undefined })),
+    })),
+  }));
+}
+
+function formatAmount(value: number) {
+  if (!Number.isFinite(value)) return "0";
+  const abs = Math.abs(value);
+  if (abs >= 100 || Number.isInteger(value)) return String(Math.round(value * 100) / 100);
+  return value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatRelayQuota(quota: RelayQuota | null | undefined, copy: Copy) {
+  if (!quota?.configured) return "";
+  if (quota.remaining == null) return copy.quotaPending;
+  if (quota.remaining < 0) return copy.relayUnlimited;
+  const unit = quota.unit || "USD";
+  return `${copy.remainingBalance} ${formatAmount(quota.remaining)} ${unit}`;
+}
+
+function isImageFile(file: File) {
+  return file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i.test(file.name);
+}
+
+function isImagePath(path: string) {
+  return /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i.test(path);
+}
+
+function fileToAttachment(file: File): Promise<PromptAttachment> {
+  return new Promise((resolve, reject) => {
+    if (file.size > MAX_IMAGE_BYTES) {
+      reject(new Error("图片太大，请控制在 25MB 以内"));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      resolve({
+        mimeType: file.type || "image/png",
+        data: comma >= 0 ? result.slice(comma + 1) : result,
+        name: file.name || "paste.png",
+      });
+    };
+    reader.onerror = () => reject(reader.error || new Error("无法读取图片"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function mediaFromAttachment(item: PromptAttachment): MessageMedia {
+  return {
+    id: uid(),
+    type: "image",
+    mimeType: item.mimeType,
+    data: item.data,
+    name: item.name,
+  };
 }
 
 function routingScore(account: AccountRecord) {
@@ -238,7 +329,7 @@ export default function App() {
     model: saved.form?.model || "grok-4.5",
     name: saved.form?.name || "小哈AI",
   });
-  const [settings, setSettings] = useState<AppSettings>({ ...defaultSettings(), ...saved.settings });
+  const [settings, setSettings] = useState<AppSettings>(() => migrateSettings(saved.settings));
   const [conversations, setConversations] = useState<Conversation[]>(() => {
     return (saved.conversations || []).map((item) => ({
       ...item,
@@ -261,9 +352,12 @@ export default function App() {
   const [selectedSkill, setSelectedSkill] = useState<SkillRecord | null>(null);
   const [usage, setUsage] = useState<ContextUsage>({
     usedTokens: 0,
-    totalTokens: saved.settings?.contextWindowTokens || 225000,
+    totalTokens: migrateSettings(saved.settings).contextWindowTokens,
     compactionCount: 0,
   });
+  const [relayQuota, setRelayQuota] = useState<RelayQuota | null>(null);
+  const [pendingImages, setPendingImages] = useState<PromptAttachment[]>([]);
+  const [dragOver, setDragOver] = useState(false);
   const [rawEvents, setRawEvents] = useState<Array<{ method: string; payload: string }>>([]);
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
@@ -289,6 +383,8 @@ export default function App() {
   const tRef = useRef(t);
   const settingsRef = useRef(settings);
   const accountsRef = useRef(accounts);
+  const pendingImagesRef = useRef(pendingImages);
+  const pasteHandledRef = useRef(false);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -298,23 +394,33 @@ export default function App() {
   tRef.current = t;
   settingsRef.current = settings;
   accountsRef.current = accounts;
+  pendingImagesRef.current = pendingImages;
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
   const projectName = workspaceLabel(selected?.cwd || cwd, homeDir, t.home);
-  const canSend = prompt.trim().length > 0 && !installing && !running;
+  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing && !running;
   const routed = pickRoutedAccount(accounts, settings);
   const activeAccount =
     accounts.find((account) => account.id === selected?.accountId) || routed;
-  const quotaText = activeAccount?.quota?.weeklyRemainingPercent != null
+  const relayQuotaText = formatRelayQuota(relayQuota, t);
+  const usingOfficialQuota = Boolean(activeAccount?.loggedIn && activeAccount.quota?.weeklyRemainingPercent != null);
+  const showRelayIdentity = Boolean(relayQuota?.configured && !usingOfficialQuota);
+  const accountTitle = usingOfficialQuota
+    ? activeAccount?.name || t.askAccount
+    : showRelayIdentity
+      ? relayQuota?.name || form.name || t.xiaohaRelay
+      : activeAccount?.name || t.askAccount;
+  const quotaText = usingOfficialQuota
     ? lang === "en"
-      ? `${Math.round(activeAccount.quota.weeklyRemainingPercent)}% weekly remaining`
-      : `本周剩余 ${Math.round(activeAccount.quota.weeklyRemainingPercent)}%`
-    : activeAccount?.loggedIn
-      ? t.quotaPending
-      : status?.credentialsReady
-        ? t.ready
-        : t.notConfigured;
+      ? `${Math.round(activeAccount!.quota!.weeklyRemainingPercent!)}% weekly remaining`
+      : `本周剩余 ${Math.round(activeAccount!.quota!.weeklyRemainingPercent!)}%`
+    : relayQuotaText
+      || (activeAccount?.loggedIn
+        ? t.quotaPending
+        : status?.credentialsReady
+          ? t.ready
+          : t.notConfigured);
 
   const projects = useMemo(() => {
     const groups = new Map<string, Conversation[]>();
@@ -352,13 +458,21 @@ export default function App() {
         model,
         cwd,
         selectedId,
-        conversations,
+        conversations: persistConversations(conversations),
         sidebarWidth,
         settings,
         form: { ...form, apiKey: "" },
       }),
     );
   }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings]);
+
+  useEffect(() => {
+    setUsage((current) =>
+      current.totalTokens === settings.contextWindowTokens
+        ? current
+        : { ...current, totalTokens: settings.contextWindowTokens },
+    );
+  }, [settings.contextWindowTokens]);
 
   const patchSettings = useCallback((patch: Partial<AppSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
@@ -535,8 +649,9 @@ export default function App() {
           const title = String(
             update.title || metaTool?.label || metaTool?.name || update.name || (lang === "en" ? "Tool" : "工具调用"),
           );
-          const input = jsonText(update.rawInput ?? update.input ?? update.raw_input);
-          const output = jsonText(update.content ?? update.output ?? update.rawOutput);
+          const diffs = extractFileDiffs(update);
+          const input = diffs.length ? undefined : jsonText(update.rawInput ?? update.input ?? update.raw_input);
+          const output = diffs.length ? undefined : jsonText(update.content ?? update.output ?? update.rawOutput);
           assistant.events = upsertEvent(assistant.events, {
             id: `tool-${id}`,
             kind,
@@ -544,6 +659,7 @@ export default function App() {
             status: String(update.status || "pending"),
             input,
             output,
+            diffs: diffs.length ? diffs : undefined,
           });
         } else if (type === "plan") {
           const entries = (update.entries as Array<Record<string, unknown>> | undefined) || [];
@@ -713,6 +829,29 @@ export default function App() {
     }
   }, [patchSettings]);
 
+  const loadRelayQuota = useCallback(async () => {
+    try {
+      setRelayQuota(await invoke<RelayQuota>("get_relay_quota"));
+    } catch {
+      setRelayQuota(null);
+    }
+  }, []);
+
+  const addPendingImages = useCallback((items: PromptAttachment[]) => {
+    setPendingImages((current) => {
+      const next = [...current];
+      for (const item of items) {
+        if (!item.data || next.length >= MAX_ATTACHMENTS) continue;
+        const key = `${item.name || ""}:${item.data.slice(0, 64)}`;
+        if (next.some((existing) => `${existing.name || ""}:${existing.data?.slice(0, 64)}` === key)) continue;
+        next.push(item);
+      }
+      return next;
+    });
+  }, []);
+  const addPendingImagesRef = useRef(addPendingImages);
+  addPendingImagesRef.current = addPendingImages;
+
   const refreshSkills = useCallback(async () => {
     try {
       const next = await invoke<SkillRecord[]>("list_skills", { cwd: cwdRef.current || null });
@@ -731,11 +870,12 @@ export default function App() {
       }
       const merged = accountsRef.current.map((account) => next.find((item) => item.id === account.id) || account);
       await persistAccounts(merged);
+      await loadRelayQuota();
       setStatusText(tRef.current.refreshQuota);
     } finally {
       setRefreshingQuota(false);
     }
-  }, [persistAccounts]);
+  }, [loadRelayQuota, persistAccounts]);
 
   const applyImport = useCallback(
     async (payload: RelayImport) => {
@@ -754,6 +894,7 @@ export default function App() {
         const backup = result.backupPath ? `\n${tRef.current.backup}: ${result.backupPath}` : "";
         setImportMessage(`${tRef.current.wrote} ${result.configPath}${backup}\n${tRef.current.imported}`);
         await refresh();
+        await loadRelayQuota();
         setView("chat");
         setStatusText(tRef.current.imported);
         try {
@@ -769,7 +910,7 @@ export default function App() {
         setImporting(false);
       }
     },
-    [refresh],
+    [loadRelayQuota, refresh],
   );
 
   const consumeDeeplink = useCallback(
@@ -833,6 +974,7 @@ export default function App() {
     (async () => {
       const runtime = await refresh();
       await loadAccounts();
+      void loadRelayQuota();
       await refreshSkills();
       const path = cwdRef.current || runtime?.homeDir || "";
       const ensured = ensureConversation(conversationsRef.current, selectedIdRef.current, path);
@@ -869,6 +1011,22 @@ export default function App() {
         }),
       );
       await add(listen<RelayImport>("relay-import", (event) => void consumeDeeplinkRef.current(event.payload)));
+      await add(
+        getCurrentWebview().onDragDropEvent((event) => {
+          if (event.payload.type === "over" || event.payload.type === "enter") setDragOver(true);
+          else if (event.payload.type === "drop") {
+            setDragOver(false);
+            for (const path of event.payload.paths) {
+              if (!isImagePath(path)) continue;
+              void invoke<PromptAttachment>("read_image_file", { path })
+                .then((item) => addPendingImagesRef.current([item]))
+                .catch((error) => setStatusText(String(error)));
+            }
+          } else {
+            setDragOver(false);
+          }
+        }),
+      );
       try {
         const pending = await invoke<RelayImport | null>("take_pending_import");
         if (pending) await consumeDeeplinkRef.current(pending);
@@ -880,7 +1038,7 @@ export default function App() {
       alive = false;
       stops.forEach((stop) => stop());
     };
-  }, [ensureConversation, loadAccounts, refresh, refreshQuotas, refreshSkills]);
+  }, [ensureConversation, loadAccounts, loadRelayQuota, refresh, refreshQuotas, refreshSkills]);
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
@@ -933,6 +1091,7 @@ export default function App() {
     setSelectedId(created.id);
     setView("chat");
     setPrompt("");
+    setPendingImages([]);
     setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
   }
 
@@ -957,9 +1116,10 @@ export default function App() {
     );
   }
 
-  async function sendText(text: string) {
+  async function sendText(text: string, extraAttachments?: PromptAttachment[]) {
     const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
-    if (!text.trim() || !conversation || runningRef.current) return;
+    const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
+    if ((!text.trim() && !attachments.length) || !conversation || runningRef.current) return;
     const runtime = statusRef.current;
     if (!runtime?.installed) {
       setShowInstallPrompt(true);
@@ -977,15 +1137,24 @@ export default function App() {
     }
     const turnId = ++turnIdRef.current;
     setPrompt("");
+    setPendingImages([]);
     if (composerRef.current) composerRef.current.style.height = "30px";
     setRunning(true);
     setStatusText(t.connecting);
     followRef.current = true;
     const title =
       conversation.title === translate("zh").newChat || conversation.title === translate("en").newChat
-        ? text.trim().slice(0, 28)
+        ? (text.trim() || attachments[0]?.name || t.newChat).slice(0, 28)
         : conversation.title;
-    const user: ChatMessage = { id: uid(), role: "user", text: text.trim(), thought: "", events: [], media: [], streaming: false };
+    const user: ChatMessage = {
+      id: uid(),
+      role: "user",
+      text: text.trim(),
+      thought: "",
+      events: [],
+      media: attachments.map(mediaFromAttachment),
+      streaming: false,
+    };
     const assistant: ChatMessage = { id: uid(), role: "assistant", text: "", thought: "", events: [], media: [], streaming: true };
     setConversations((list) =>
       list.map((item) =>
@@ -1020,9 +1189,13 @@ export default function App() {
         ),
       );
       setStatusText(t.running);
-      await invoke("send_prompt", { text: text.trim() });
+      await invoke("send_prompt", {
+        text: text.trim(),
+        attachments: attachments.length ? attachments : null,
+      });
     } catch (error) {
       if (turnId !== turnIdRef.current) return;
+      setPendingImages(attachments);
       const message = String(error);
       if (/GROKDESK_NO_CREDENTIALS|还没有可用的登录或 API Key/.test(message)) {
         setView("settings");
@@ -1064,13 +1237,27 @@ export default function App() {
         return { ...item, messages };
       }),
     );
-    await sendText(lastUser.text);
+    const extras = lastUser.media
+      .filter((item) => item.data)
+      .map((item) => ({ mimeType: item.mimeType, data: item.data, name: item.name }));
+    await sendText(lastUser.text, extras);
   }
 
   function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void send();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
+      pasteHandledRef.current = false;
+      window.setTimeout(() => {
+        if (pasteHandledRef.current) return;
+        void invoke<PromptAttachment | null>("read_clipboard_image")
+          .then((native) => {
+            if (native?.data) addPendingImages([native]);
+          })
+          .catch(() => undefined);
+      }, 80);
     }
   }
 
@@ -1079,6 +1266,59 @@ export default function App() {
     if (!el) return;
     el.style.height = "30px";
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+  }
+
+  async function onComposerPaste(event: ReactClipboardEvent<HTMLTextAreaElement | HTMLDivElement>) {
+    const clipboard = event.clipboardData;
+    const hasText = Boolean(clipboard?.getData("text/plain")?.trim());
+    const images: File[] = [];
+    if (clipboard?.files) {
+      for (const file of Array.from(clipboard.files)) {
+        if (isImageFile(file)) images.push(file);
+      }
+    }
+    if (clipboard?.items) {
+      for (const item of Array.from(clipboard.items)) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file && !images.some((current) => current === file)) images.push(file);
+        }
+      }
+    }
+    if (images.length) {
+      event.preventDefault();
+      pasteHandledRef.current = true;
+      try {
+        addPendingImages(await Promise.all(images.map(fileToAttachment)));
+      } catch (error) {
+        setStatusText(String(error));
+      }
+      return;
+    }
+    if (hasText) {
+      pasteHandledRef.current = true;
+      return;
+    }
+    event.preventDefault();
+    pasteHandledRef.current = true;
+    try {
+      const native = await invoke<PromptAttachment | null>("read_clipboard_image");
+      if (native?.data) addPendingImages([native]);
+    } catch (error) {
+      setStatusText(String(error));
+    }
+  }
+
+  async function onComposerDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDragOver(false);
+    const files = Array.from(event.dataTransfer.files || []).filter(isImageFile);
+    if (!files.length) return;
+    try {
+      addPendingImages(await Promise.all(files.map(fileToAttachment)));
+    } catch (error) {
+      setStatusText(String(error));
+    }
   }
 
   function onTranscriptScroll() {
@@ -1236,6 +1476,8 @@ export default function App() {
         onAddAccount={(name) => void onAddAccount(name)}
         onLogin={(account) => void onLogin(account)}
         onRefreshQuotas={() => void refreshQuotas()}
+        relayQuota={relayQuota}
+        relayQuotaText={relayQuotaText}
         onOpenAccount={(account) => newConversation(account)}
         onRemoveAccount={(id) => void persistAccounts(accounts.filter((account) => account.id !== id))}
         routedAccountId={routed?.id}
@@ -1320,9 +1562,9 @@ export default function App() {
                 type="button"
                 onClick={() => setShowAccountMenu((value) => !value)}
               >
-                <span className="avatar">{(activeAccount?.name || "G").slice(0, 1)}</span>
+                <span className="avatar">{(accountTitle || "G").slice(0, 1)}</span>
                 <span className="account">
-                  <span className="account-model">{activeAccount?.name || t.askAccount}</span>
+                  <span className="account-model">{accountTitle}</span>
                   <span className="account-name">{quotaText}</span>
                 </span>
                 <span className={showAccountMenu ? "chevron open" : "chevron"}>
@@ -1410,16 +1652,16 @@ export default function App() {
               </div>
               <h1>{t.emptyTitle}</h1>
               <p>{projectName || t.emptyHint}</p>
-              {!accounts.some((account) => account.loggedIn) ? (
+              {!accounts.some((account) => account.loggedIn) && !status?.credentialsReady ? (
                 <button
                   className="primary"
                   type="button"
                   onClick={() => {
                     setView("settings");
-                    setSettingsPage("accounts");
+                    setSettingsPage("relay");
                   }}
                 >
-                  {t.addAccount}
+                  {t.xiaohaRelay}
                 </button>
               ) : null}
             </div>
@@ -1474,7 +1716,16 @@ export default function App() {
         </section>
 
         <footer className="composer-wrap">
-          <div className="composer">
+          <div
+            className={dragOver ? "composer drop-target" : "composer"}
+            onPaste={onComposerPaste}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(event) => void onComposerDrop(event)}
+          >
             {!selected?.messages.length ? (
               editingCwd ? (
                 <input
@@ -1496,11 +1747,34 @@ export default function App() {
                 </button>
               )
             ) : null}
+            {pendingImages.length ? (
+              <div className="attach-row">
+                {pendingImages.map((item, index) => (
+                  <div key={`${item.name || "img"}-${index}`} className="attach-chip">
+                    {item.data ? (
+                      <img
+                        className="attach-thumb"
+                        src={`data:${item.mimeType || "image/png"};base64,${item.data}`}
+                        alt={item.name || ""}
+                      />
+                    ) : null}
+                    <span>{item.name || t.pasteImage}</span>
+                    <button
+                      type="button"
+                      title={t.cancel}
+                      onClick={() => setPendingImages((current) => current.filter((_, i) => i !== index))}
+                    >
+                      <IconClose />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <textarea
               ref={composerRef}
               rows={1}
               value={prompt}
-              placeholder={t.composer}
+              placeholder={pendingImages.length ? t.pasteImage : t.composer}
               onChange={(event) => {
                 setPrompt(event.target.value);
                 requestAnimationFrame(resizeComposer);
@@ -1659,6 +1933,18 @@ export default function App() {
           <div className="modal" onClick={(event) => event.stopPropagation()}>
             <h3>{t.usageTitle}</h3>
             <div className="usage-list">
+              {relayQuota?.configured ? (
+                <div className="usage-row">
+                  <header>
+                    <span className="dot on" />
+                    <strong>{relayQuota.name || t.xiaohaRelay}</strong>
+                    <span className="pill ok">{t.relayQuota}</span>
+                  </header>
+                  {relayQuotaText ? <p className="hint left">{relayQuotaText}</p> : <p className="hint left">{t.quotaPending}</p>}
+                  {relayQuota.planName ? <p className="hint left">{relayQuota.planName}</p> : null}
+                  {relayQuota.error ? <p className="error">{relayQuota.error}</p> : null}
+                </div>
+              ) : null}
               {accounts.filter((account) => account.enabled).map((account) => (
                 <div key={account.id} className="usage-row">
                   <header>
