@@ -4,6 +4,7 @@ mod config;
 mod install;
 mod media;
 mod runtime;
+mod sessions;
 
 use accounts::{
     clear_login, commit_account, create_account, discover_skills, drop_uncommitted_home,
@@ -16,6 +17,7 @@ use config::{
 };
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
+use sessions::{LocalSessionHistory, LocalSessionSummary};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
@@ -119,6 +121,18 @@ async fn get_relay_quota() -> RelayQuota {
     tauri::async_runtime::spawn_blocking(|| config::fetch_relay_quota(&grok_home()))
         .await
         .unwrap_or_else(|_| config::fetch_relay_quota(&grok_home()))
+}
+
+#[tauri::command]
+async fn list_local_sessions() -> Vec<LocalSessionSummary> {
+    tauri::async_runtime::spawn_blocking(sessions::list_local_sessions)
+        .await
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn load_session_history(session_id: String) -> Result<LocalSessionHistory, String> {
+    run_blocking(move || sessions::load_session_history(&session_id)).await
 }
 
 #[tauri::command]
@@ -384,6 +398,8 @@ pub fn run() {
             stop_session,
             answer_interaction,
             call_extension,
+            list_local_sessions,
+            load_session_history,
             list_accounts,
             save_account_state,
             add_account,

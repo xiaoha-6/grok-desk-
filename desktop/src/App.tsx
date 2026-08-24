@@ -52,6 +52,8 @@ import {
   type Conversation,
   type ImportResult,
   type Lang,
+  type LocalSessionHistory,
+  type LocalSessionSummary,
   type MessageMedia,
   type ModelCatalog,
   type PendingPermission,
@@ -191,12 +193,41 @@ function migrateSettings(saved?: Partial<AppSettings>): AppSettings {
 function persistConversations(list: Conversation[]): Conversation[] {
   return list.map((item) => ({
     ...item,
-    messages: item.messages.map((message) => ({
-      ...message,
-      streaming: false,
-      media: (message.media || []).map((media) => ({ ...media, data: undefined })),
-    })),
+    messages: item.grokSessionId
+      ? []
+      : item.messages.map((message) => ({
+          ...message,
+          streaming: false,
+          media: (message.media || []).map((media) => ({ ...media, data: undefined })),
+        })),
   }));
+}
+
+function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary[]): Conversation[] {
+  const known = new Set(list.map((item) => item.grokSessionId).filter(Boolean) as string[]);
+  const extras: Conversation[] = summaries
+    .filter((item) => !known.has(item.grokSessionId))
+    .map((item) => ({
+      id: item.grokSessionId,
+      title: item.title || "Grok Session",
+      cwd: item.cwd,
+      grokSessionId: item.grokSessionId,
+      messages: [],
+      updatedAt: item.updatedAt,
+    }));
+  const merged = list.map((item) => {
+    const summary = summaries.find((entry) => entry.grokSessionId === item.grokSessionId);
+    if (!summary) return item;
+    const untitled = !item.title || item.title === "新对话" || item.title === "New chat" || item.title === "Grok Session";
+    return {
+      ...item,
+      title: untitled ? summary.title : item.title,
+      cwd: item.cwd || summary.cwd,
+      grokSessionId: item.grokSessionId || summary.grokSessionId,
+      updatedAt: Math.max(item.updatedAt || 0, summary.updatedAt || 0),
+    };
+  });
+  return [...merged, ...extras].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
 }
 
 function formatAmount(value: number) {
@@ -404,6 +435,7 @@ export default function App() {
   const availableModelsRef = useRef(availableModels);
   const relayQuotaRef = useRef(relayQuota);
   const relayReadyRef = useRef(relayReady);
+  const historyLoadedRef = useRef(new Set<string>());
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -862,6 +894,54 @@ export default function App() {
     }
   }, [patchSettings]);
 
+  const loadSessionHistory = useCallback(async (conversationId: string) => {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    if (!conversation?.grokSessionId || historyLoadedRef.current.has(conversationId)) return;
+    if (conversation.messages.length > 0) {
+      historyLoadedRef.current.add(conversationId);
+      return;
+    }
+    historyLoadedRef.current.add(conversationId);
+    try {
+      const history = await invoke<LocalSessionHistory>("load_session_history", {
+        sessionId: conversation.grokSessionId,
+      });
+      const messages: ChatMessage[] = (history.messages || []).map((item) => ({
+        id: uid(),
+        role: item.role === "assistant" ? "assistant" : "user",
+        text: item.text || "",
+        thought: "",
+        events: [],
+        media: [],
+        streaming: false,
+      }));
+      setConversations((list) =>
+        list.map((item) => (item.id === conversationId && item.messages.length === 0 ? { ...item, messages } : item)),
+      );
+      if (history.usedTokens != null) {
+        setUsage({
+          usedTokens: Number(history.usedTokens) || 0,
+          totalTokens: Number(history.totalTokens) || settingsRef.current.contextWindowTokens,
+          compactionCount: Number(history.compactionCount) || 0,
+        });
+      }
+    } catch {
+      historyLoadedRef.current.delete(conversationId);
+    }
+  }, []);
+
+  const loadLocalSessions = useCallback(async () => {
+    try {
+      const summaries = await invoke<LocalSessionSummary[]>("list_local_sessions");
+      const merged = mergeLocalSessions(conversationsRef.current, summaries || []);
+      setConversations(merged);
+      conversationsRef.current = merged;
+      return merged;
+    } catch {
+      return conversationsRef.current;
+    }
+  }, []);
+
   const loadRelayQuota = useCallback(async () => {
     try {
       const next = await invoke<RelayQuota>("get_relay_quota");
@@ -1058,10 +1138,12 @@ export default function App() {
       void loadRelayQuota();
       void loadRelayModels(false);
       await refreshSkills();
+      const imported = await loadLocalSessions();
       const path = cwdRef.current || runtime?.homeDir || "";
-      const ensured = ensureConversation(conversationsRef.current, selectedIdRef.current, path);
+      const ensured = ensureConversation(imported, selectedIdRef.current, path);
       setConversations(ensured.list);
       setSelectedId(ensured.id);
+      if (ensured.id) void loadSessionHistory(ensured.id);
       setStatusText(
         runtime?.installed
           ? runtime.credentialsReady
@@ -1120,7 +1202,7 @@ export default function App() {
       alive = false;
       stops.forEach((stop) => stop());
     };
-  }, [ensureConversation, loadAccounts, loadRelayModels, loadRelayQuota, refresh, refreshQuotas, refreshSkills]);
+  }, [ensureConversation, loadAccounts, loadLocalSessions, loadRelayModels, loadRelayQuota, loadSessionHistory, refresh, refreshQuotas, refreshSkills]);
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
@@ -1181,6 +1263,7 @@ export default function App() {
     setSelectedId(id);
     setView("chat");
     followRef.current = true;
+    void loadSessionHistory(id);
   }
 
   function deleteConversation(id: string) {

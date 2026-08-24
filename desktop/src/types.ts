@@ -113,6 +113,23 @@ export type Conversation = {
   archivedAt?: number;
 };
 
+export type LocalSessionSummary = {
+  id: string;
+  grokSessionId: string;
+  title: string;
+  cwd: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type LocalSessionHistory = {
+  sessionId: string;
+  messages: { role: string; text: string }[];
+  usedTokens?: number | null;
+  totalTokens?: number | null;
+  compactionCount?: number | null;
+};
+
 export type QuotaSnapshot = {
   weeklyUsedPercent?: number;
   weeklyRemainingPercent?: number;
