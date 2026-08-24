@@ -303,7 +303,9 @@ button { background: none; }
 
 .transcript {
   flex: 1;
+  min-height: 0;
   overflow: auto;
+  position: relative;
 }
 .empty {
   padding-top: 14vh;
@@ -361,14 +363,20 @@ button { background: none; }
 .history-more-bar {
   position: sticky;
   top: 0;
-  z-index: 4;
+  z-index: 8;
   display: flex;
   justify-content: center;
-  padding: 10px 0 14px;
-  background: linear-gradient(var(--chat) 72%, transparent);
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 12px;
+  background: var(--chat);
+  border-bottom: 1px solid var(--hairline);
 }
 .history-more {
-  justify-self: center;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  padding: 6px 14px;
+  background: var(--group);
 }
 .history-start {
   color: var(--text-3);

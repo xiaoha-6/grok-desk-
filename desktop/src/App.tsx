@@ -1910,6 +1910,25 @@ export default function App() {
         </header>
 
         <section ref={transcriptRef} className="transcript" onScroll={onTranscriptScroll}>
+          {selected?.grokSessionId ? (
+            <div className="history-more-bar">
+              {selected.historyHasMore !== false ? (
+                <button
+                  className="ghost compact history-more"
+                  type="button"
+                  disabled={loadingOlder}
+                  onClick={() => {
+                    setShownCount((count) => Math.max(count, selected.messages.length));
+                    void loadSessionHistory(selected.id, true);
+                  }}
+                >
+                  {loadingOlder ? t.loadingOlder : t.loadOlder}
+                </button>
+              ) : (
+                <span className="history-start">{t.historyStart}</span>
+              )}
+            </div>
+          ) : null}
           {!selected?.messages.length ? (
             <div className="empty">
               <div className="empty-hero">
@@ -1934,23 +1953,6 @@ export default function App() {
           ) : (
             <div className="messages">
               <div ref={topSentinelRef} className="history-sentinel" />
-              {selected.grokSessionId && selected.historyHasMore !== false ? (
-                <div className="history-more-bar">
-                  <button
-                    className="ghost compact history-more"
-                    type="button"
-                    disabled={loadingOlder}
-                    onClick={() => {
-                      setShownCount((count) => Math.max(count, selected.messages.length));
-                      void loadSessionHistory(selected.id, true);
-                    }}
-                  >
-                    {loadingOlder ? t.loadingOlder : t.loadOlder}
-                  </button>
-                </div>
-              ) : (
-                <div className="history-start">{t.historyStart}</div>
-              )}
               {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (
                 <article key={message.id} className={`row ${message.role}`}>
                   <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
