@@ -1,3 +1,4 @@
+use crate::config::{credentials_ready, NO_CREDENTIALS_CODE};
 use crate::runtime::{grok_home, resolve_binary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.0";
+const CLIENT_VERSION: &str = "0.6.1";
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -114,7 +115,7 @@ impl DiagnosticBuffer {
 }
 
 struct AgentProcess {
-    child: Child,
+    child: Mutex<Child>,
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: Arc<AtomicU64>,
     pending: Arc<PendingMap>,
@@ -122,18 +123,104 @@ struct AgentProcess {
     pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
 }
 
+impl AgentProcess {
+    fn interrupt(&self, message: &str) {
+        self.pending.fail_all(message);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
+    }
+
+    fn initialize(&self) -> Result<(), String> {
+        let client_type = if cfg!(target_os = "windows") {
+            "grokdesk-windows"
+        } else if cfg!(target_os = "macos") {
+            "grokdesk-macos"
+        } else {
+            "grokdesk-linux"
+        };
+        let result = rpc_request(
+            &self.stdin,
+            &self.next_id,
+            &self.pending,
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false,
+                    "_meta": {
+                        "x.ai/incrementalBashOutput": true,
+                        "x.ai/hunkTracker": { "mode": "full" },
+                        "x.ai/gitHeadChanged": true
+                    }
+                },
+                "_meta": {
+                    "clientType": client_type,
+                    "clientVersion": CLIENT_VERSION
+                }
+            }),
+            INIT_TIMEOUT,
+        )?;
+        authenticate_if_needed(&self.stdin, &self.next_id, &self.pending, &result)
+    }
+
+    fn open_session(
+        &self,
+        cwd: &str,
+        existing_session_id: Option<&str>,
+        options: &SessionOptions,
+    ) -> Result<String, String> {
+        let method = if existing_session_id.is_some() {
+            "session/load"
+        } else {
+            "session/new"
+        };
+        let mut params = session_params(cwd, options);
+        if let Some(session_id) = existing_session_id {
+            params["sessionId"] = json!(session_id);
+        }
+
+        match rpc_request(
+            &self.stdin,
+            &self.next_id,
+            &self.pending,
+            method,
+            params,
+            SESSION_TIMEOUT,
+        ) {
+            Ok(value) => session_id_from(&value, existing_session_id),
+            Err(error) if existing_session_id.is_some() => {
+                let created = rpc_request(
+                    &self.stdin,
+                    &self.next_id,
+                    &self.pending,
+                    "session/new",
+                    session_params(cwd, options),
+                    SESSION_TIMEOUT,
+                )?;
+                session_id_from(&created, None).map_err(|_| error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl Drop for AgentProcess {
     fn drop(&mut self) {
         self.pending.fail_all("Grok Agent 已退出");
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 pub struct AcpClient {
-    agent: Option<AgentProcess>,
+    agent: Option<Arc<AgentProcess>>,
     session: Option<SessionInfo>,
     spawn_fingerprint: Option<String>,
+    generation: u64,
 }
 
 impl Default for AcpClient {
@@ -142,6 +229,7 @@ impl Default for AcpClient {
             agent: None,
             session: None,
             spawn_fingerprint: None,
+            generation: 0,
         }
     }
 }
@@ -157,7 +245,10 @@ impl AcpClient {
     }
 
     pub fn stop(&mut self) {
-        self.agent = None;
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(agent) = self.agent.take() {
+            agent.interrupt("连接已取消");
+        }
         self.session = None;
         self.spawn_fingerprint = None;
     }
@@ -183,22 +274,35 @@ impl AcpClient {
         )
     }
 
-    pub fn call_extension(&self, method: String, mut params: Value) -> Result<Value, String> {
-        let agent = self
-            .agent
-            .as_ref()
-            .ok_or_else(|| "Agent 尚未连接".to_string())?;
-        if params.get("sessionId").and_then(Value::as_str).is_none() {
-            if let Some(session) = &self.session {
-                if let Some(object) = params.as_object_mut() {
-                    object.insert("sessionId".into(), json!(session.session_id));
+    pub fn call_extension(
+        shared: &Arc<Mutex<Self>>,
+        method: String,
+        mut params: Value,
+    ) -> Result<Value, String> {
+        let (stdin, next_id, pending, params) = {
+            let this = lock_client(shared)?;
+            let agent = this
+                .agent
+                .as_ref()
+                .ok_or_else(|| "Agent 尚未连接".to_string())?;
+            if params.get("sessionId").and_then(Value::as_str).is_none() {
+                if let Some(session) = &this.session {
+                    if let Some(object) = params.as_object_mut() {
+                        object.insert("sessionId".into(), json!(session.session_id));
+                    }
                 }
             }
-        }
+            (
+                Arc::clone(&agent.stdin),
+                Arc::clone(&agent.next_id),
+                Arc::clone(&agent.pending),
+                params,
+            )
+        };
         rpc_request(
-            &agent.stdin,
-            &agent.next_id,
-            &agent.pending,
+            &stdin,
+            &next_id,
+            &pending,
             &method,
             params,
             Duration::from_secs(30),
@@ -222,11 +326,12 @@ impl AcpClient {
         )
     }
 
-    pub fn ensure_session(
-        &mut self,
+    pub fn connect(
+        shared: &Arc<Mutex<Self>>,
         app: &AppHandle,
         options: SessionOptions,
     ) -> Result<SessionInfo, String> {
+        require_credentials(&options)?;
         let model = options
             .model
             .as_deref()
@@ -238,49 +343,89 @@ impl AcpClient {
         let fingerprint = spawn_fingerprint(&options, &model);
         let existing_session_id = options.existing_session_id.clone();
 
-        if let Some(current) = &self.session {
-            if self.agent.is_some()
-                && self.spawn_fingerprint.as_deref() == Some(&fingerprint)
-                && current.model == model
-                && current.cwd == cwd
-                && existing_session_id.as_ref() == Some(&current.session_id)
-            {
-                if let Some(agent) = &self.agent {
-                    if let Ok(mut mode) = agent.permission_mode.lock() {
-                        *mode = options
-                            .permission_mode
-                            .clone()
-                            .unwrap_or_else(|| "default".to_string());
+        let (agent, need_init, generation) = {
+            let mut this = lock_client(shared)?;
+            if let Some(current) = &this.session {
+                if this.agent.is_some()
+                    && this.spawn_fingerprint.as_deref() == Some(&fingerprint)
+                    && current.model == model
+                    && current.cwd == cwd
+                    && existing_session_id.as_ref() == Some(&current.session_id)
+                {
+                    if let Some(agent) = &this.agent {
+                        if let Ok(mut mode) = agent.permission_mode.lock() {
+                            *mode = options
+                                .permission_mode
+                                .clone()
+                                .unwrap_or_else(|| "default".to_string());
+                        }
+                    }
+                    return Ok(current.clone());
+                }
+            }
+
+            let restart_agent =
+                this.agent.is_none() || this.spawn_fingerprint.as_deref() != Some(&fingerprint);
+            if restart_agent {
+                this.stop();
+                this.spawn_agent(app, &options, &model, &cwd)?;
+                this.spawn_fingerprint = Some(fingerprint);
+            } else if let Some(agent) = &this.agent {
+                if let Ok(mut mode) = agent.permission_mode.lock() {
+                    *mode = options
+                        .permission_mode
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string());
+                }
+            }
+
+            let agent = this
+                .agent
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "Agent 尚未连接".to_string())?;
+            (agent, restart_agent, this.generation)
+        };
+
+        let connect_result = (|| {
+            if need_init {
+                agent.initialize()?;
+            }
+            agent.open_session(&cwd, existing_session_id.as_deref(), &options)
+        })();
+
+        match connect_result {
+            Ok(session_id) => {
+                let mut this = lock_client(shared)?;
+                if this.generation != generation
+                    || !this
+                        .agent
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &agent))
+                {
+                    return Err("连接已取消".into());
+                }
+                let info = SessionInfo {
+                    session_id,
+                    model,
+                    cwd,
+                };
+                this.session = Some(info.clone());
+                Ok(info)
+            }
+            Err(error) => {
+                if let Ok(mut this) = shared.lock() {
+                    if this
+                        .agent
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &agent))
+                    {
+                        this.stop();
                     }
                 }
-                return Ok(current.clone());
+                Err(error)
             }
         }
-
-        let restart_agent =
-            self.agent.is_none() || self.spawn_fingerprint.as_deref() != Some(&fingerprint);
-        if restart_agent {
-            self.stop();
-            self.spawn_agent(app, &options, &model, &cwd)?;
-            self.initialize(app)?;
-            self.spawn_fingerprint = Some(fingerprint);
-        } else if let Some(agent) = &self.agent {
-            if let Ok(mut mode) = agent.permission_mode.lock() {
-                *mode = options
-                    .permission_mode
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
-            }
-        }
-
-        let session = self.open_session(&cwd, existing_session_id.as_deref(), &options)?;
-        let info = SessionInfo {
-            session_id: session,
-            model,
-            cwd,
-        };
-        self.session = Some(info.clone());
-        Ok(info)
     }
 
     pub fn send_prompt(&self, app: &AppHandle, text: String) -> Result<(), String> {
@@ -435,92 +580,42 @@ impl AcpClient {
         );
         spawn_stderr_reader(app.clone(), stderr, Arc::clone(&diagnostics));
 
-        self.agent = Some(AgentProcess {
-            child,
+        self.agent = Some(Arc::new(AgentProcess {
+            child: Mutex::new(child),
             stdin,
             next_id,
             pending,
             permission_mode,
             pending_interactions,
-        });
+        }));
         Ok(())
     }
+}
 
-    fn initialize(&self, _app: &AppHandle) -> Result<(), String> {
-        let agent = self.agent.as_ref().ok_or_else(|| "Agent 尚未连接".to_string())?;
-        let client_type = if cfg!(target_os = "windows") {
-            "grokdesk-windows"
-        } else if cfg!(target_os = "macos") {
-            "grokdesk-macos"
-        } else {
-            "grokdesk-linux"
-        };
-        let result = rpc_request(
-            &agent.stdin,
-            &agent.next_id,
-            &agent.pending,
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false,
-                    "_meta": {
-                        "x.ai/incrementalBashOutput": true,
-                        "x.ai/hunkTracker": { "mode": "full" },
-                        "x.ai/gitHeadChanged": true
-                    }
-                },
-                "_meta": {
-                    "clientType": client_type,
-                    "clientVersion": CLIENT_VERSION
-                }
-            }),
-            INIT_TIMEOUT,
-        )?;
-        authenticate_if_needed(&agent.stdin, &agent.next_id, &agent.pending, &result)
+fn lock_client(shared: &Arc<Mutex<AcpClient>>) -> Result<std::sync::MutexGuard<'_, AcpClient>, String> {
+    shared
+        .lock()
+        .map_err(|_| "无法锁定 ACP 会话".to_string())
+}
+
+fn resolve_grok_home(options: &SessionOptions) -> PathBuf {
+    options
+        .grok_home
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(grok_home)
+}
+
+fn require_credentials(options: &SessionOptions) -> Result<(), String> {
+    let home = resolve_grok_home(options);
+    if credentials_ready(&home) {
+        return Ok(());
     }
-
-    fn open_session(
-        &self,
-        cwd: &str,
-        existing_session_id: Option<&str>,
-        options: &SessionOptions,
-    ) -> Result<String, String> {
-        let agent = self.agent.as_ref().ok_or_else(|| "Agent 尚未连接".to_string())?;
-        let method = if existing_session_id.is_some() {
-            "session/load"
-        } else {
-            "session/new"
-        };
-        let mut params = session_params(cwd, options);
-        if let Some(session_id) = existing_session_id {
-            params["sessionId"] = json!(session_id);
-        }
-
-        match rpc_request(
-            &agent.stdin,
-            &agent.next_id,
-            &agent.pending,
-            method,
-            params,
-            SESSION_TIMEOUT,
-        ) {
-            Ok(value) => session_id_from(&value, existing_session_id),
-            Err(error) if existing_session_id.is_some() => {
-                let created = rpc_request(
-                    &agent.stdin,
-                    &agent.next_id,
-                    &agent.pending,
-                    "session/new",
-                    session_params(cwd, options),
-                    SESSION_TIMEOUT,
-                )?;
-                session_id_from(&created, None).map_err(|_| error)
-            }
-            Err(error) => Err(error),
-        }
-    }
+    Err(format!(
+        "{NO_CREDENTIALS_CODE}: 还没有可用的登录或 API Key。请先在设置里导入中转站配置，或登录官方 Grok 账号。"
+    ))
 }
 
 fn spawn_fingerprint(options: &SessionOptions, model: &str) -> String {
@@ -1116,5 +1211,14 @@ mod tests {
         );
         assert!(formatted.contains("502"));
         assert!(formatted.contains("上游"));
+    }
+
+    #[test]
+    fn fail_all_unblocks_pending_rpc() {
+        let pending = PendingMap::new();
+        let (tx, rx) = mpsc::channel();
+        pending.insert("1".into(), tx);
+        pending.fail_all("连接已取消");
+        assert_eq!(rx.recv().unwrap(), Err("连接已取消".into()));
     }
 }

@@ -87,6 +87,74 @@ pub fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+pub const NO_CREDENTIALS_CODE: &str = "GROKDESK_NO_CREDENTIALS";
+
+pub fn credentials_ready(home: &Path) -> bool {
+    if home.join("auth.json").is_file() {
+        return true;
+    }
+    config_has_api_key(&home.join("config.toml"))
+}
+
+pub fn config_has_api_key(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("api_key") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        if !toml_unquote(rest.trim()).is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+fn toml_unquote(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        toml_unescape(&trimmed[1..trimmed.len() - 1])
+    } else if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed
+            .split('#')
+            .next()
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string()
+    }
+}
+
+fn toml_unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn parse_deeplink(raw: &str) -> Result<RelayImport, String> {
     let url = url::Url::parse(raw).map_err(|err| format!("无法解析导入链接：{err}"))?;
     if url.scheme() != "grokdesk" {
@@ -313,6 +381,26 @@ mod tests {
         assert!(result.backup_path.is_some());
         let written = fs::read_to_string(dir.join("config.toml")).unwrap();
         assert!(written.contains("sk-new"));
+        assert!(credentials_ready(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_inline_api_key_and_ignores_empty() {
+        let dir = std::env::temp_dir().join(format!("grokdesk-cred-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), "name = \"x\"\napi_key = \"\"\n").unwrap();
+        assert!(!credentials_ready(&dir));
+        fs::write(
+            dir.join("config.toml"),
+            "# api_key = \"ignored\"\napi_key = \"sk-live\"\n",
+        )
+        .unwrap();
+        assert!(config_has_api_key(&dir.join("config.toml")));
+        fs::write(dir.join("config.toml"), "name = \"x\"\n").unwrap();
+        fs::write(dir.join("auth.json"), "{}\n").unwrap();
+        assert!(credentials_ready(&dir));
         let _ = fs::remove_dir_all(&dir);
     }
 }

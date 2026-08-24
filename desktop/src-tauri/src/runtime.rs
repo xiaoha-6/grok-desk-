@@ -15,6 +15,7 @@ pub struct RuntimeStatus {
     pub home_dir: String,
     pub os: String,
     pub installer_url: String,
+    pub credentials_ready: bool,
 }
 
 pub fn current_os() -> &'static str {
@@ -134,6 +135,7 @@ pub fn runtime_status() -> RuntimeStatus {
             .to_string(),
         os: current_os().to_string(),
         installer_url: official_installer_url().to_string(),
+        credentials_ready: crate::config::credentials_ready(&home),
     }
 }
 

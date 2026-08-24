@@ -22,7 +22,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 struct AppState {
     pending_import: Mutex<Option<RelayImport>>,
-    acp: Mutex<AcpClient>,
+    acp: Arc<Mutex<AcpClient>>,
     login: LoginSlot,
 }
 
@@ -30,21 +30,36 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             pending_import: Mutex::new(None),
-            acp: Mutex::new(AcpClient::default()),
+            acp: Arc::new(Mutex::new(AcpClient::default())),
             login: Arc::new(Mutex::new(None)),
         }
     }
 }
 
-#[tauri::command]
-fn get_runtime_status() -> RuntimeStatus {
-    runtime_status()
+async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|err| format!("后台任务失败：{err}"))?
 }
 
 #[tauri::command]
-fn import_relay(payload: RelayImport) -> Result<config::ImportResult, String> {
-    let import = payload.normalized()?;
-    write_config(&grok_home(), &import).map_err(|err| format!("写入 config.toml 失败：{err}"))
+async fn get_runtime_status() -> RuntimeStatus {
+    tauri::async_runtime::spawn_blocking(runtime_status)
+        .await
+        .unwrap_or_else(|_| runtime_status())
+}
+
+#[tauri::command]
+async fn import_relay(payload: RelayImport) -> Result<config::ImportResult, String> {
+    run_blocking(move || {
+        let import = payload.normalized()?;
+        write_config(&grok_home(), &import).map_err(|err| format!("写入 config.toml 失败：{err}"))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -63,88 +78,91 @@ fn take_pending_import(state: State<AppState>) -> Option<RelayImport> {
 
 #[tauri::command]
 fn get_acp_status(state: State<AppState>) -> AcpStatus {
-    state
-        .acp
-        .lock()
-        .map(|client| client.status())
-        .unwrap_or(AcpStatus {
-            connected: false,
-            session_id: None,
-            model: None,
-            cwd: None,
-        })
+    state.acp.lock().map(|client| client.status()).unwrap_or(AcpStatus {
+        connected: false,
+        session_id: None,
+        model: None,
+        cwd: None,
+    })
 }
 
 #[tauri::command]
-fn ensure_session(
+async fn ensure_session(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     options: SessionOptions,
 ) -> Result<SessionInfo, String> {
-    let mut client = state
-        .acp
-        .lock()
-        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
-    client.ensure_session(&app, options)
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || AcpClient::connect(&acp, &app, options)).await
 }
 
 #[tauri::command]
-fn send_prompt(app: AppHandle, state: State<AppState>, text: String) -> Result<(), String> {
-    let client = state
-        .acp
-        .lock()
-        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
-    client.send_prompt(&app, text)
+async fn send_prompt(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    text: String,
+) -> Result<(), String> {
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || {
+        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        client.send_prompt(&app, text)
+    })
+    .await
 }
 
 #[tauri::command]
-fn cancel_turn(state: State<AppState>) -> Result<(), String> {
-    let client = state
-        .acp
-        .lock()
-        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
-    client.cancel()
+async fn cancel_turn(state: State<'_, AppState>) -> Result<(), String> {
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || {
+        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        client.cancel()
+    })
+    .await
 }
 
 #[tauri::command]
-fn stop_session(state: State<AppState>) -> Result<(), String> {
-    let mut client = state
-        .acp
-        .lock()
-        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
-    client.stop();
-    Ok(())
+async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || {
+        let mut client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        client.stop();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn answer_interaction(
-    state: State<AppState>,
+async fn answer_interaction(
+    state: State<'_, AppState>,
     request_id: String,
     result: Value,
 ) -> Result<(), String> {
-    let client = state
-        .acp
-        .lock()
-        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
-    client.answer_interaction(request_id, result)
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || {
+        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        client.answer_interaction(request_id, result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn call_extension(
-    state: State<AppState>,
+async fn call_extension(
+    state: State<'_, AppState>,
     method: String,
     params: Option<Value>,
 ) -> Result<Value, String> {
-    let client = state
-        .acp
-        .lock()
-        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
-    client.call_extension(method, params.unwrap_or_else(|| serde_json::json!({})))
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || {
+        AcpClient::call_extension(&acp, method, params.unwrap_or_else(|| serde_json::json!({})))
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_accounts() -> AccountState {
-    load_state()
+async fn list_accounts() -> AccountState {
+    tauri::async_runtime::spawn_blocking(load_state)
+        .await
+        .unwrap_or_else(|_| load_state())
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,28 +174,40 @@ struct SaveAccountsPayload {
 }
 
 #[tauri::command]
-fn save_account_state(payload: SaveAccountsPayload) -> Result<AccountState, String> {
-    save_accounts(
-        payload.accounts,
-        payload.routing_mode,
-        payload.preferred_account_id,
-    )
+async fn save_account_state(payload: SaveAccountsPayload) -> Result<AccountState, String> {
+    run_blocking(move || {
+        save_accounts(
+            payload.accounts,
+            payload.routing_mode,
+            payload.preferred_account_id,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-fn add_account(
+async fn add_account(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     name: String,
 ) -> Result<AccountRecord, String> {
-    let account = create_account(name)?;
-    start_login(app, &state.login, account.clone(), true)?;
-    Ok(account)
+    let login = Arc::clone(&state.login);
+    run_blocking(move || {
+        let account = create_account(name)?;
+        start_login(app, &login, account.clone(), true)?;
+        Ok(account)
+    })
+    .await
 }
 
 #[tauri::command]
-fn login_account(app: AppHandle, state: State<AppState>, account: AccountRecord) -> Result<(), String> {
-    start_login(app, &state.login, account, false)
+async fn login_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account: AccountRecord,
+) -> Result<(), String> {
+    let login = Arc::clone(&state.login);
+    run_blocking(move || start_login(app, &login, account, false)).await
 }
 
 #[tauri::command]
@@ -186,27 +216,35 @@ fn cancel_login(state: State<AppState>) {
 }
 
 #[tauri::command]
-fn discard_account_home(home_path: String) {
-    drop_uncommitted_home(&home_path);
+async fn discard_account_home(home_path: String) {
+    let _ = tauri::async_runtime::spawn_blocking(move || drop_uncommitted_home(&home_path)).await;
 }
 
 #[tauri::command]
-fn confirm_account(account: AccountRecord) -> Result<AccountState, String> {
-    commit_account(account)
+async fn confirm_account(account: AccountRecord) -> Result<AccountState, String> {
+    run_blocking(move || commit_account(account)).await
 }
 
 #[tauri::command]
-fn refresh_account_quota(mut account: AccountRecord) -> AccountRecord {
-    account.quota = Some(fetch_quota(&account));
-    account.logged_in = std::path::Path::new(&account.home_path)
-        .join("auth.json")
-        .is_file();
-    account
+async fn refresh_account_quota(account: AccountRecord) -> AccountRecord {
+    let fallback = account.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut account = account;
+        account.quota = Some(fetch_quota(&account));
+        account.logged_in = std::path::Path::new(&account.home_path)
+            .join("auth.json")
+            .is_file();
+        account
+    })
+    .await
+    .unwrap_or(fallback)
 }
 
 #[tauri::command]
-fn list_skills(cwd: Option<String>) -> Vec<SkillRecord> {
-    discover_skills(cwd)
+async fn list_skills(cwd: Option<String>) -> Vec<SkillRecord> {
+    tauri::async_runtime::spawn_blocking(move || discover_skills(cwd))
+        .await
+        .unwrap_or_default()
 }
 
 fn focus_main_window(app: &AppHandle) {
@@ -222,17 +260,20 @@ fn focus_window(window: &WebviewWindow) {
 }
 
 #[tauri::command]
-fn install_runtime(app: AppHandle) -> Result<String, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let app_for_log = app.clone();
-    install_official(
-        InstallEventSink {
-            on_line: Box::new(move |line| {
-                let _ = app_for_log.emit("install-log", line);
-            }),
-        },
-        cancel,
-    )
+async fn install_runtime(app: AppHandle) -> Result<String, String> {
+    run_blocking(move || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let app_for_log = app.clone();
+        install_official(
+            InstallEventSink {
+                on_line: Box::new(move |line| {
+                    let _ = app_for_log.emit("install-log", line);
+                }),
+            },
+            cancel,
+        )
+    })
+    .await
 }
 
 fn emit_deeplink(app: &AppHandle, urls: Vec<String>) {

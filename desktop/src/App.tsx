@@ -77,7 +77,9 @@ function workspaceLabel(path: string, homeDir: string, homeWord: string) {
 }
 
 function friendlyError(raw: string) {
-  const text = String(raw || "").trim() || "ACP 请求失败";
+  const text = String(raw || "")
+    .replace(/^GROKDESK_NO_CREDENTIALS:\s*/i, "")
+    .trim() || "ACP 请求失败";
   if (/上游/.test(text) || /upstream (?:service )?(?:temporarily )?unavailable/i.test(text)) {
     return text;
   }
@@ -277,6 +279,7 @@ export default function App() {
   const transcriptRef = useRef<HTMLElement | null>(null);
   const followRef = useRef(true);
   const lastImportRef = useRef("");
+  const turnIdRef = useRef(0);
   const conversationsRef = useRef(conversations);
   const selectedIdRef = useRef(selectedId);
   const runningRef = useRef(running);
@@ -307,7 +310,11 @@ export default function App() {
     ? lang === "en"
       ? `${Math.round(activeAccount.quota.weeklyRemainingPercent)}% weekly remaining`
       : `本周剩余 ${Math.round(activeAccount.quota.weeklyRemainingPercent)}%`
-    : t[accounts.length ? "quotaPending" : "notConfigured"];
+    : activeAccount?.loggedIn
+      ? t.quotaPending
+      : status?.credentialsReady
+        ? t.ready
+        : t.notConfigured;
 
   const projects = useMemo(() => {
     const groups = new Map<string, Conversation[]>();
@@ -831,11 +838,22 @@ export default function App() {
       const ensured = ensureConversation(conversationsRef.current, selectedIdRef.current, path);
       setConversations(ensured.list);
       setSelectedId(ensured.id);
-      setStatusText(runtime?.installed ? tRef.current.ready : tRef.current.needRuntime);
+      setStatusText(
+        runtime?.installed
+          ? runtime.credentialsReady
+            ? tRef.current.ready
+            : tRef.current.needCredentials
+          : tRef.current.needRuntime,
+      );
       if (runtime && !runtime.installed) setShowInstallPrompt(true);
       await add(listen<string>("install-log", (event) => setInstallLog((log) => `${log}${event.payload}\n`)));
       await add(listen<AcpUpdate>("acp-update", (event) => handleAcpUpdateRef.current(event.payload)));
-      await add(listen<AcpTurnDone>("acp-turn-done", (event) => finishTurnRef.current(event.payload.ok ? undefined : event.payload.error)));
+      await add(
+        listen<AcpTurnDone>("acp-turn-done", (event) => {
+          if (!runningRef.current) return;
+          finishTurnRef.current(event.payload.ok ? undefined : event.payload.error);
+        }),
+      );
       await add(
         listen<{ method: string; requestId: string; params: Record<string, unknown> }>("acp-interaction", (event) =>
           handleInteractionRef.current(event.payload),
@@ -942,10 +960,22 @@ export default function App() {
   async function sendText(text: string) {
     const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
     if (!text.trim() || !conversation || runningRef.current) return;
-    if (!status?.installed) {
+    const runtime = statusRef.current;
+    if (!runtime?.installed) {
       setShowInstallPrompt(true);
       return;
     }
+    const named = accountsRef.current.find((item) => item.id === conversation.accountId);
+    const account = named?.loggedIn
+      ? named
+      : pickRoutedAccount(accountsRef.current, settingsRef.current);
+    if (runtime.credentialsReady === false && !account?.loggedIn) {
+      setView("settings");
+      setSettingsPage("relay");
+      setStatusText(t.needCredentials);
+      return;
+    }
+    const turnId = ++turnIdRef.current;
     setPrompt("");
     if (composerRef.current) composerRef.current.style.height = "30px";
     setRunning(true);
@@ -965,9 +995,6 @@ export default function App() {
       ),
     );
     requestAnimationFrame(() => scrollToBottom(true));
-    const account =
-      accountsRef.current.find((item) => item.id === conversation.accountId) ||
-      pickRoutedAccount(accountsRef.current, settingsRef.current);
     try {
       const session = await invoke<SessionInfo>("ensure_session", {
         options: {
@@ -984,6 +1011,7 @@ export default function App() {
           enableSubagents: settingsRef.current.enableSubagents,
         },
       });
+      if (turnId !== turnIdRef.current) return;
       setConversations((list) =>
         list.map((item) =>
           item.id === conversation.id
@@ -994,7 +1022,13 @@ export default function App() {
       setStatusText(t.running);
       await invoke("send_prompt", { text: text.trim() });
     } catch (error) {
-      finishTurn(String(error));
+      if (turnId !== turnIdRef.current) return;
+      const message = String(error);
+      if (/GROKDESK_NO_CREDENTIALS|还没有可用的登录或 API Key/.test(message)) {
+        setView("settings");
+        setSettingsPage("relay");
+      }
+      finishTurn(message);
     }
   }
 
@@ -1003,12 +1037,18 @@ export default function App() {
   }
 
   async function stopTurn() {
+    turnIdRef.current += 1;
+    finishTurn();
     try {
       await invoke("cancel_turn");
     } catch {
       // ignore
     }
-    finishTurn();
+    try {
+      await invoke("stop_session");
+    } catch {
+      // ignore
+    }
   }
 
   async function regenerate() {

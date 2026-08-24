@@ -8,6 +8,7 @@ export type RuntimeStatus = {
   homeDir: string;
   os: string;
   installerUrl: string;
+  credentialsReady: boolean;
 };
 
 export type RelayImport = {
