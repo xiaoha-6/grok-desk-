@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.4";
+const CLIENT_VERSION: &str = "0.6.5";
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;
@@ -116,10 +116,22 @@ impl DiagnosticBuffer {
             upper.contains("ERROR")
                 || upper.contains("502")
                 || upper.contains("503")
+                || upper.contains("402")
+                || upper.contains("403")
+                || upper.contains("QUOTA")
+                || upper.contains("CREDIT")
+                || upper.contains("WEEKLY")
+                || upper.contains("LIMIT")
+                || line.contains("额度")
                 || upper.contains("BAD GATEWAY")
                 || upper.contains("UNAVAILABLE")
                 || upper.contains("INTERNAL")
         }).cloned()
+    }
+
+    fn last(&self) -> Option<String> {
+        let lines = self.lines.lock().ok()?;
+        lines.last().cloned()
     }
 }
 
@@ -130,6 +142,7 @@ struct AgentProcess {
     pending: Arc<PendingMap>,
     permission_mode: Arc<Mutex<String>>,
     pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
+    diagnostics: Arc<DiagnosticBuffer>,
     home: PathBuf,
 }
 
@@ -149,10 +162,7 @@ impl AgentProcess {
         } else {
             "grokdesk-linux"
         };
-        let result = rpc_request(
-            &self.stdin,
-            &self.next_id,
-            &self.pending,
+        let result = self.request(
             "initialize",
             json!({
                 "protocolVersion": 1,
@@ -175,6 +185,11 @@ impl AgentProcess {
         authenticate_if_needed(&self.stdin, &self.next_id, &self.pending, &result, &self.home)
     }
 
+    fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        rpc_request(&self.stdin, &self.next_id, &self.pending, method, params, timeout)
+            .map_err(|err| decorate_rpc_error(method, err, &self.diagnostics))
+    }
+
     fn open_session(
         &self,
         cwd: &str,
@@ -191,24 +206,10 @@ impl AgentProcess {
             params["sessionId"] = json!(session_id);
         }
 
-        match rpc_request(
-            &self.stdin,
-            &self.next_id,
-            &self.pending,
-            method,
-            params,
-            SESSION_TIMEOUT,
-        ) {
+        match self.request(method, params, SESSION_TIMEOUT) {
             Ok(value) => session_id_from(&value, existing_session_id),
             Err(error) if existing_session_id.is_some() => {
-                let created = rpc_request(
-                    &self.stdin,
-                    &self.next_id,
-                    &self.pending,
-                    "session/new",
-                    session_params(cwd, options),
-                    SESSION_TIMEOUT,
-                )?;
+                let created = self.request("session/new", session_params(cwd, options), SESSION_TIMEOUT)?;
                 session_id_from(&created, None).map_err(|_| error)
             }
             Err(error) => Err(error),
@@ -557,6 +558,13 @@ impl AcpClient {
         if options.enable_web_search == Some(false) {
             command.env("GROK_WEB_FETCH", "0");
         }
+        if crate::config::is_relay_configured(&grok_home()) {
+            if let Some(profile) = crate::config::read_relay_profile(&grok_home()) {
+                command.env("GROK_CLI_CHAT_PROXY_BASE_URL", &profile.endpoint);
+                command.env("XAI_API_KEY", &profile.api_key);
+                command.env("GROK_CODE_XAI_API_KEY", &profile.api_key);
+            }
+        }
 
         let bin_dir = binary
             .parent()
@@ -622,6 +630,7 @@ impl AcpClient {
             pending,
             permission_mode,
             pending_interactions,
+            diagnostics,
             home,
         }));
         Ok(())
@@ -899,6 +908,37 @@ fn authenticate_if_needed(
         INIT_TIMEOUT,
     )
     .map(|_| ())
+}
+
+fn looks_like_official_quota(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    upper.contains("WEEKLY LIMIT")
+        || upper.contains("RUN OUT OF CREDITS")
+        || upper.contains("FREE USAGE LIMIT")
+        || upper.contains("STATUS 402")
+        || text.contains("额度不足")
+        || text.contains("周限额")
+}
+
+fn decorate_rpc_error(method: &str, err: String, diagnostics: &DiagnosticBuffer) -> String {
+    let extra = diagnostics
+        .last_relevant()
+        .or_else(|| diagnostics.last());
+    let mut out = err;
+    if let Some(extra) = extra {
+        if !out.contains(&extra) {
+            out = format!("{out}\n{extra}");
+        }
+    }
+    if looks_like_official_quota(&out) {
+        format!(
+            "{out}\n这是官方 Grok 周额度或登录限制，不是中转站余额。请确认已写入中转站配置后，开一个新对话再试。"
+        )
+    } else if out.contains("超时") {
+        format!("{out}\nGrok Agent 在 {method} 阶段没有返回。若本机配了中转站，这通常是还在连官方 grok.com。请开新对话重试。")
+    } else {
+        out
+    }
 }
 
 fn rpc_request(

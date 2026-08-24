@@ -1,13 +1,13 @@
 Unicode True
-!define PRODUCT_NAME "GrokDesk"
-!define PRODUCT_VERSION "0.6.4"
+!define PRODUCT_NAME "xiaoha grok 桌面版"
+!define PRODUCT_VERSION "0.6.5"
 !define PRODUCT_PUBLISHER "小哈AI"
 !define PRODUCT_EXE "GrokDesk.exe"
 !define PROTOCOL "grokdesk"
 
 Name "${PRODUCT_NAME}"
 OutFile "GrokDesk-${PRODUCT_VERSION}-windows-x64-setup.exe"
-InstallDir "$LOCALAPPDATA\${PRODUCT_NAME}"
+InstallDir "$LOCALAPPDATA\GrokDesk"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Icon "icon.ico"
@@ -29,13 +29,13 @@ Section "Install"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "DisplayName" "${PRODUCT_NAME}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "DisplayVersion" "${PRODUCT_VERSION}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "Publisher" "${PRODUCT_PUBLISHER}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "UninstallString" "$INSTDIR\Uninstall.exe"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXE}"
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "NoModify" 1
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "NoRepair" 1
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "DisplayName" "${PRODUCT_NAME}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "DisplayVersion" "${PRODUCT_VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "Publisher" "${PRODUCT_PUBLISHER}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "UninstallString" "$INSTDIR\Uninstall.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "DisplayIcon" "$INSTDIR\${PRODUCT_EXE}"
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "NoModify" 1
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk" "NoRepair" 1
 
   WriteRegStr HKCU "Software\Classes\${PROTOCOL}" "" "URL:${PRODUCT_NAME}"
   WriteRegStr HKCU "Software\Classes\${PROTOCOL}" "URL Protocol" ""
@@ -51,6 +51,6 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
   RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
-  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\GrokDesk"
   DeleteRegKey HKCU "Software\Classes\${PROTOCOL}"
 SectionEnd

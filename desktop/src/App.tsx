@@ -104,6 +104,9 @@ function friendlyError(raw: string) {
   if (/503/.test(text)) {
     return `${text}\n上游暂时过载（503）。请稍后重试。`;
   }
+  if (/weekly limit|run out of credits|free usage limit|status 402|额度不足|周限额/i.test(text)) {
+    return `${text}\n这是官方 Grok 的周额度/登录限制，不是中转站余额。中转站显示「额度不限」时，请开一个新对话，让桌面端走中转站而不是 grok.com。`;
+  }
   return text;
 }
 
