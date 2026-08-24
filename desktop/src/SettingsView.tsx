@@ -582,7 +582,9 @@ export function SettingsView(props: {
                         }
                       />
                     </header>
-                    {account.quota?.weeklyRemainingPercent != null ? (
+                    {!account.enabled ? (
+                      <p className="hint left">{copy.accountDisabled}</p>
+                    ) : account.quota?.weeklyRemainingPercent != null ? (
                       <div className="quota">
                         <div className="quota-row">
                           <span>{copy.weeklyLeft}</span>

@@ -52,7 +52,7 @@ impl RelayImport {
             if trimmed.is_empty() {
                 DEFAULT_MODEL.to_string()
             } else {
-                trimmed.to_string()
+                canonical_model_id(trimmed)
             }
         };
         let name = {
@@ -434,6 +434,122 @@ fn is_official_endpoint(endpoint: &str) -> bool {
     lower.contains("api.x.ai") || lower.contains("://x.ai/")
 }
 
+pub fn is_relay_configured(grok_home: &Path) -> bool {
+    read_relay_profile(grok_home)
+        .map(|profile| !is_official_endpoint(&profile.endpoint))
+        .unwrap_or(false)
+}
+
+pub fn canonical_model_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in ["grok/", "xai/", "x-ai/", "x-ai:"] {
+        if lower.starts_with(prefix) {
+            let rest = trimmed[prefix.len()..].trim();
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+pub fn resolve_agent_home(requested: Option<&str>) -> Result<PathBuf, String> {
+    let default = crate::runtime::grok_home();
+    if is_relay_configured(&default) {
+        return prepare_relay_runtime_home(&default);
+    }
+    Ok(requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(default))
+}
+
+pub fn prepare_relay_runtime_home(grok_home: &Path) -> Result<PathBuf, String> {
+    let home = grok_home.join("grokdesk-relay");
+    fs::create_dir_all(&home).map_err(|err| format!("无法准备中转站运行目录：{err}"))?;
+    for name in [
+        "bin",
+        "skills",
+        "plugins",
+        "hooks",
+        "agents",
+        "commands",
+        "marketplaces",
+        "sessions",
+    ] {
+        let source = grok_home.join(name);
+        let target = home.join(name);
+        if source.exists() && !target.exists() {
+            link_or_copy(&source, &target);
+        }
+    }
+    for name in [
+        "config.toml",
+        "managed_config.toml",
+        "grokdesk-relay.json",
+        "models_cache.json",
+    ] {
+        let source = grok_home.join(name);
+        let target = home.join(name);
+        if source.exists() {
+            let _ = fs::copy(&source, &target);
+        }
+    }
+    let auth = home.join("auth.json");
+    if auth.exists() {
+        let _ = fs::remove_file(&auth);
+    }
+    Ok(home)
+}
+
+fn link_or_copy(source: &Path, target: &Path) {
+    if source.is_dir() {
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(source, target);
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(source, target).is_err() {
+                let _ = copy_dir(source, target);
+            }
+        }
+        return;
+    }
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(source, target).is_err() {
+            let _ = fs::copy(source, target);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_file(source, target).is_err() {
+            let _ = fs::copy(source, target);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_dir(source: &Path, target: &Path) -> io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let to = target.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &to)?;
+        } else {
+            let _ = fs::copy(entry.path(), to);
+        }
+    }
+    Ok(())
+}
+
 pub fn fetch_relay_quota(grok_home: &Path) -> RelayQuota {
     let Some(profile) = read_relay_profile(grok_home) else {
         return RelayQuota::empty();
@@ -565,21 +681,23 @@ fn parse_model_catalog(value: &serde_json::Value) -> Vec<CatalogModel> {
 
 fn catalog_model_from_value(value: &serde_json::Value) -> Option<CatalogModel> {
     if let Some(id) = value.as_str().map(str::trim).filter(|item| !item.is_empty()) {
+        let id = canonical_model_id(id);
         return Some(CatalogModel {
-            id: id.to_string(),
-            name: id.to_string(),
+            id: id.clone(),
+            name: id,
             context_window: None,
         });
     }
-    let id = json_string(
+    let raw_id = json_string(
         value,
         &["id", "model", "model_id", "modelId", "name"],
     )?;
-    if id.is_empty() {
+    if raw_id.is_empty() {
         return None;
     }
+    let id = canonical_model_id(&raw_id);
     let name = json_string(value, &["display_name", "displayName", "name", "label"])
-        .filter(|item| !item.is_empty())
+        .filter(|item| !item.is_empty() && item != &raw_id)
         .unwrap_or_else(|| id.clone());
     let context_window = json_number(
         value,
@@ -665,7 +783,7 @@ pub fn set_active_model(
     model: &str,
     context_window: Option<u64>,
 ) -> Result<(), String> {
-    let model = model.trim();
+    let model = canonical_model_id(model.trim());
     if model.is_empty() {
         return Err("缺少模型".into());
     }
@@ -674,8 +792,8 @@ pub fn set_active_model(
         return Ok(());
     }
     let mut text = fs::read_to_string(&path).map_err(|err| format!("读取配置失败：{err}"))?;
-    text = set_models_default(&text, model);
-    let escaped = toml_escape(model);
+    text = set_models_default(&text, &model);
+    let escaped = toml_escape(&model);
     let has_block = text.contains(&format!("[model.\"{escaped}\"]"))
         || text.contains(&format!("[model.{model}]"));
     if !has_block {
@@ -693,8 +811,8 @@ pub fn set_active_model(
                 }
                 text.push('\n');
                 text.push_str(&render_model_block(
-                    model,
-                    model,
+                    &model,
+                    &model,
                     &profile.name,
                     &profile.api_key,
                     window,
@@ -1003,9 +1121,10 @@ mod tests {
             "data": [
                 { "id": "gpt-4.1", "object": "model" },
                 { "id": "grok-4.5", "display_name": "Grok 4.5", "context_window": 500000 },
-                { "id": "grok-4.6" }
+                { "id": "grok/grok-4.6" }
             ]
         }));
+        assert_eq!(canonical_model_id("grok/grok-4.6"), "grok-4.6");
         assert_eq!(openai[0].id, "grok-4.6");
         assert_eq!(openai[1].id, "grok-4.5");
         assert_eq!(openai[1].name, "Grok 4.5");

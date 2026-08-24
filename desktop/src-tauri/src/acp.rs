@@ -1,4 +1,4 @@
-use crate::config::{credentials_ready, NO_CREDENTIALS_CODE};
+use crate::config::{canonical_model_id, credentials_ready, resolve_agent_home, NO_CREDENTIALS_CODE};
 use crate::runtime::{grok_home, resolve_binary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,9 +13,9 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.3";
-const INIT_TIMEOUT: Duration = Duration::from_secs(45);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
+const CLIENT_VERSION: &str = "0.6.4";
+const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -130,6 +130,7 @@ struct AgentProcess {
     pending: Arc<PendingMap>,
     permission_mode: Arc<Mutex<String>>,
     pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
+    home: PathBuf,
 }
 
 impl AgentProcess {
@@ -171,7 +172,7 @@ impl AgentProcess {
             }),
             INIT_TIMEOUT,
         )?;
-        authenticate_if_needed(&self.stdin, &self.next_id, &self.pending, &result)
+        authenticate_if_needed(&self.stdin, &self.next_id, &self.pending, &result, &self.home)
     }
 
     fn open_session(
@@ -341,16 +342,21 @@ impl AcpClient {
         options: SessionOptions,
     ) -> Result<SessionInfo, String> {
         require_credentials(&options)?;
-        let model = options
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("grok-4.5")
-            .to_string();
+        let model = canonical_model_id(
+            options
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("grok-4.5"),
+        );
         let cwd = resolve_cwd(options.cwd.clone())?;
         let fingerprint = spawn_fingerprint(&options, &model);
-        let existing_session_id = options.existing_session_id.clone();
+        let existing_session_id = if crate::config::is_relay_configured(&grok_home()) {
+            None
+        } else {
+            options.existing_session_id.clone()
+        };
 
         let (agent, need_init, generation) = {
             let mut this = lock_client(shared)?;
@@ -512,13 +518,7 @@ impl AcpClient {
         cwd: &str,
     ) -> Result<(), String> {
         let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
-        let home = options
-            .grok_home
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(grok_home);
+        let home = resolve_agent_home(options.grok_home.as_deref())?;
         let mut command = Command::new(&binary);
         command.arg("agent");
         if !model.is_empty() {
@@ -622,6 +622,7 @@ impl AcpClient {
             pending,
             permission_mode,
             pending_interactions,
+            home,
         }));
         Ok(())
     }
@@ -633,19 +634,9 @@ fn lock_client(shared: &Arc<Mutex<AcpClient>>) -> Result<std::sync::MutexGuard<'
         .map_err(|_| "无法锁定 ACP 会话".to_string())
 }
 
-fn resolve_grok_home(options: &SessionOptions) -> PathBuf {
-    options
-        .grok_home
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(grok_home)
-}
-
 fn require_credentials(options: &SessionOptions) -> Result<(), String> {
-    let home = resolve_grok_home(options);
-    if credentials_ready(&home) {
+    let home = resolve_agent_home(options.grok_home.as_deref())?;
+    if credentials_ready(&home) || credentials_ready(&grok_home()) {
         return Ok(());
     }
     Err(format!(
@@ -654,9 +645,11 @@ fn require_credentials(options: &SessionOptions) -> Result<(), String> {
 }
 
 fn spawn_fingerprint(options: &SessionOptions, model: &str) -> String {
+    let home = resolve_agent_home(options.grok_home.as_deref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
     format!(
-        "{model}|{}|{}|{}|{}|{}",
-        options.grok_home.clone().unwrap_or_default(),
+        "{model}|{home}|{}|{}|{}|{}",
         options
             .context_window_tokens
             .unwrap_or(DEFAULT_CONTEXT_WINDOW),
@@ -872,7 +865,13 @@ fn authenticate_if_needed(
     next_id: &Arc<AtomicU64>,
     pending: &Arc<PendingMap>,
     result: &Value,
+    home: &Path,
 ) -> Result<(), String> {
+    if crate::config::config_has_api_key(&home.join("config.toml"))
+        || crate::config::config_has_api_key(&grok_home().join("config.toml"))
+    {
+        return Ok(());
+    }
     let meta = result.get("_meta");
     let default_id = meta
         .and_then(|value| value.get("defaultAuthMethodId"))

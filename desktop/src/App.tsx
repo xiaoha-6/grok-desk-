@@ -36,6 +36,7 @@ import { MessageBody } from "./markdown";
 import { SettingsView } from "./SettingsView";
 import { isRedundantExtension, jsonText } from "./timeline";
 import {
+  canonicalModelId,
   defaultSettings,
   EFFORTS,
   mergeModelOptions,
@@ -205,7 +206,7 @@ function formatAmount(value: number) {
 function formatRelayQuota(quota: RelayQuota | null | undefined, copy: Copy) {
   if (!quota?.configured) return "";
   if (quota.remaining == null) return copy.quotaPending;
-  if (quota.remaining < 0) return copy.relayUnlimited;
+  if (quota.remaining < 0 || quota.remaining >= 99_000_000) return copy.relayUnlimited;
   const unit = quota.unit || "USD";
   return `${copy.remainingBalance} ${formatAmount(quota.remaining)} ${unit}`;
 }
@@ -285,6 +286,7 @@ type PersistShape = {
   sidebarWidth?: number;
   settings?: Partial<AppSettings>;
   availableModels?: CatalogModel[];
+  relayReady?: boolean;
 };
 
 function loadPersist(): PersistShape {
@@ -311,7 +313,7 @@ export default function App() {
   const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [showUsageCard, setShowUsageCard] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(Math.min(400, Math.max(220, saved.sidebarWidth || 280)));
-  const [model, setModel] = useState(saved.model || "grok-4.5");
+  const [model, setModel] = useState(canonicalModelId(saved.model || "grok-4.5") || "grok-4.5");
   const [cwd, setCwd] = useState(saved.cwd || "");
   const [prompt, setPrompt] = useState("");
   const [editingCwd, setEditingCwd] = useState(false);
@@ -329,7 +331,7 @@ export default function App() {
   const [form, setForm] = useState<RelayImport>({
     endpoint: saved.form?.endpoint || "https://api.xiaohaweb.com/v1",
     apiKey: "",
-    model: saved.form?.model || saved.model || "grok-4.5",
+    model: canonicalModelId(saved.form?.model || saved.model || "grok-4.5") || "grok-4.5",
     name: saved.form?.name || "小哈AI",
   });
   const [availableModels, setAvailableModels] = useState<CatalogModel[]>(
@@ -338,6 +340,7 @@ export default function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState("");
   const [modelsMessage, setModelsMessage] = useState("");
+  const [relayReady, setRelayReady] = useState(Boolean(saved.relayReady));
   const [settings, setSettings] = useState<AppSettings>(() => migrateSettings(saved.settings));
   const [conversations, setConversations] = useState<Conversation[]>(() => {
     return (saved.conversations || []).map((item) => ({
@@ -396,6 +399,8 @@ export default function App() {
   const pasteHandledRef = useRef(false);
   const formRef = useRef(form);
   const availableModelsRef = useRef(availableModels);
+  const relayQuotaRef = useRef(relayQuota);
+  const relayReadyRef = useRef(relayReady);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -408,17 +413,26 @@ export default function App() {
   pendingImagesRef.current = pendingImages;
   formRef.current = form;
   availableModelsRef.current = availableModels;
+  relayQuotaRef.current = relayQuota;
+  relayReadyRef.current = relayReady;
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
   const projectName = workspaceLabel(selected?.cwd || cwd, homeDir, t.home);
   const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing && !running;
-  const routed = pickRoutedAccount(accounts, settings);
-  const activeAccount =
-    accounts.find((account) => account.id === selected?.accountId) || routed;
+  const relayConfigured = Boolean(relayQuota?.configured || relayReady);
+  const routed = relayConfigured ? undefined : pickRoutedAccount(accounts, settings);
+  const activeAccount = relayConfigured
+    ? undefined
+    : accounts.find((account) => account.id === selected?.accountId && account.enabled) || routed;
   const relayQuotaText = formatRelayQuota(relayQuota, t);
-  const usingOfficialQuota = Boolean(activeAccount?.loggedIn && activeAccount.quota?.weeklyRemainingPercent != null);
-  const showRelayIdentity = Boolean(relayQuota?.configured && !usingOfficialQuota);
+  const usingOfficialQuota = Boolean(
+    !relayConfigured &&
+      activeAccount?.enabled &&
+      activeAccount?.loggedIn &&
+      activeAccount.quota?.weeklyRemainingPercent != null,
+  );
+  const showRelayIdentity = Boolean(relayConfigured);
   const accountTitle = usingOfficialQuota
     ? activeAccount?.name || t.askAccount
     : showRelayIdentity
@@ -477,9 +491,10 @@ export default function App() {
         settings,
         form: { ...form, apiKey: "" },
         availableModels,
+        relayReady,
       }),
     );
-  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings, availableModels]);
+  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings, availableModels, relayReady]);
 
   useEffect(() => {
     setUsage((current) =>
@@ -846,14 +861,16 @@ export default function App() {
 
   const loadRelayQuota = useCallback(async () => {
     try {
-      setRelayQuota(await invoke<RelayQuota>("get_relay_quota"));
+      const next = await invoke<RelayQuota>("get_relay_quota");
+      setRelayQuota(next);
+      if (next.configured) setRelayReady(true);
     } catch {
       setRelayQuota(null);
     }
   }, []);
 
   const selectModel = useCallback((id: string) => {
-    const next = id.trim();
+    const next = canonicalModelId(id.trim());
     if (!next) return;
     setModel(next);
     setForm((current) => (current.model === next ? current : { ...current, model: next }));
@@ -949,7 +966,8 @@ export default function App() {
           model: result.model,
           apiKey: payload.apiKey,
         }));
-        setModel(result.model);
+        setModel(canonicalModelId(result.model) || result.model);
+        setRelayReady(true);
         const backup = result.backupPath ? `\n${tRef.current.backup}: ${result.backupPath}` : "";
         setImportMessage(`${tRef.current.wrote} ${result.configPath}${backup}\n${tRef.current.imported}`);
         await refresh();
@@ -1186,10 +1204,13 @@ export default function App() {
       setShowInstallPrompt(true);
       return;
     }
+    const relayOn = Boolean(relayQuotaRef.current?.configured || relayReadyRef.current);
     const named = accountsRef.current.find((item) => item.id === conversation.accountId);
-    const account = named?.loggedIn
-      ? named
-      : pickRoutedAccount(accountsRef.current, settingsRef.current);
+    const account = relayOn
+      ? undefined
+      : named?.enabled && named?.loggedIn
+        ? named
+        : pickRoutedAccount(accountsRef.current, settingsRef.current);
     if (runtime.credentialsReady === false && !account?.loggedIn) {
       setView("settings");
       setSettingsPage("relay");
@@ -1228,10 +1249,10 @@ export default function App() {
     try {
       const session = await invoke<SessionInfo>("ensure_session", {
         options: {
-          model: modelRef.current,
+          model: canonicalModelId(modelRef.current),
           cwd: conversation.cwd || cwdRef.current,
-          existingSessionId: conversation.grokSessionId ?? null,
-          grokHome: account?.homePath || null,
+          existingSessionId: relayOn ? null : conversation.grokSessionId ?? null,
+          grokHome: relayOn ? null : account?.homePath || null,
           permissionMode: settingsRef.current.permissionMode,
           reasoningEffort: settingsRef.current.reasoningEffort,
           contextWindowTokens: settingsRef.current.contextWindowTokens,
@@ -1245,7 +1266,7 @@ export default function App() {
       setConversations((list) =>
         list.map((item) =>
           item.id === conversation.id
-            ? { ...item, grokSessionId: session.sessionId, cwd: session.cwd, accountId: account?.id }
+            ? { ...item, grokSessionId: session.sessionId, cwd: session.cwd, accountId: relayOn ? undefined : account?.id }
             : item,
         ),
       );

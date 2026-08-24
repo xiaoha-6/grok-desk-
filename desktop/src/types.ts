@@ -245,6 +245,19 @@ export const MODELS = [
   "grok-4.20-multi-agent-0309",
 ];
 
+export function canonicalModelId(id: string): string {
+  const trimmed = String(id || "").trim();
+  if (!trimmed) return "";
+  const lower = trimmed.toLowerCase();
+  for (const prefix of ["grok/", "xai/", "x-ai/", "x-ai:"]) {
+    if (lower.startsWith(prefix)) {
+      const rest = trimmed.slice(prefix.length).trim();
+      if (rest) return rest;
+    }
+  }
+  return trimmed;
+}
+
 export function fallbackCatalog(): CatalogModel[] {
   return MODELS.map((id) => ({ id, name: id }));
 }
@@ -253,12 +266,14 @@ export function mergeModelOptions(catalog: CatalogModel[] | undefined, current: 
   const seen = new Set<string>();
   const out: CatalogModel[] = [];
   const add = (item: CatalogModel) => {
-    const id = String(item?.id || "").trim();
+    const raw = String(item?.id || "").trim();
+    const id = canonicalModelId(raw);
     if (!id || seen.has(id)) return;
     seen.add(id);
+    const rawName = String(item.name || raw).trim() || id;
     out.push({
       id,
-      name: String(item.name || id).trim() || id,
+      name: rawName === raw ? id : rawName,
       contextWindow: item.contextWindow,
     });
   };
