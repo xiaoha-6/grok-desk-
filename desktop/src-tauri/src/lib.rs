@@ -1,16 +1,30 @@
+mod acp;
 mod config;
 mod install;
 mod runtime;
 
+use acp::{AcpClient, AcpStatus, SessionInfo};
 use config::{parse_deeplink, write_config, RelayImport};
 use install::{install_official, InstallEventSink};
-use runtime::{grok_home, launch_grok, runtime_status, RuntimeStatus};
+use runtime::{grok_home, runtime_status, RuntimeStatus};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_deep_link::DeepLinkExt;
 
-static PENDING_IMPORT: Mutex<Option<RelayImport>> = Mutex::new(None);
+struct AppState {
+    pending_import: Mutex<Option<RelayImport>>,
+    acp: Mutex<AcpClient>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            pending_import: Mutex::new(None),
+            acp: Mutex::new(AcpClient::default()),
+        }
+    }
+}
 
 #[tauri::command]
 fn get_runtime_status() -> RuntimeStatus {
@@ -29,13 +43,69 @@ fn parse_import_url(url: String) -> Result<RelayImport, String> {
 }
 
 #[tauri::command]
-fn open_grok() -> Result<(), String> {
-    launch_grok()
+fn take_pending_import(state: State<AppState>) -> Option<RelayImport> {
+    state
+        .pending_import
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
 }
 
 #[tauri::command]
-fn take_pending_import() -> Option<RelayImport> {
-    PENDING_IMPORT.lock().ok().and_then(|mut slot| slot.take())
+fn get_acp_status(state: State<AppState>) -> AcpStatus {
+    state
+        .acp
+        .lock()
+        .map(|client| client.status())
+        .unwrap_or(AcpStatus {
+            connected: false,
+            session_id: None,
+            model: None,
+            cwd: None,
+        })
+}
+
+#[tauri::command]
+fn ensure_session(
+    app: AppHandle,
+    state: State<AppState>,
+    model: Option<String>,
+    cwd: Option<String>,
+    existing_session_id: Option<String>,
+) -> Result<SessionInfo, String> {
+    let mut client = state
+        .acp
+        .lock()
+        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
+    client.ensure_session(&app, model, cwd, existing_session_id)
+}
+
+#[tauri::command]
+fn send_prompt(app: AppHandle, state: State<AppState>, text: String) -> Result<(), String> {
+    let client = state
+        .acp
+        .lock()
+        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
+    client.send_prompt(&app, text)
+}
+
+#[tauri::command]
+fn cancel_turn(state: State<AppState>) -> Result<(), String> {
+    let client = state
+        .acp
+        .lock()
+        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
+    client.cancel()
+}
+
+#[tauri::command]
+fn stop_session(state: State<AppState>) -> Result<(), String> {
+    let mut client = state
+        .acp
+        .lock()
+        .map_err(|_| "无法锁定 ACP 会话".to_string())?;
+    client.stop();
+    Ok(())
 }
 
 fn focus_main_window(app: &AppHandle) {
@@ -68,8 +138,10 @@ fn emit_deeplink(app: &AppHandle, urls: Vec<String>) {
     for url in urls {
         match parse_deeplink(&url) {
             Ok(payload) => {
-                if let Ok(mut slot) = PENDING_IMPORT.lock() {
-                    *slot = Some(payload.clone());
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(mut slot) = state.pending_import.lock() {
+                        *slot = Some(payload.clone());
+                    }
                 }
                 let _ = app.emit("relay-import", payload);
             }
@@ -103,6 +175,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
+        .manage(AppState::default())
         .setup(|app| {
             #[cfg(desktop)]
             {
@@ -124,9 +197,13 @@ pub fn run() {
             get_runtime_status,
             import_relay,
             parse_import_url,
-            open_grok,
             take_pending_import,
-            install_runtime
+            install_runtime,
+            get_acp_status,
+            ensure_session,
+            send_prompt,
+            cancel_turn,
+            stop_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrokDesk");

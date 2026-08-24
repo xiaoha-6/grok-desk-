@@ -1,12 +1,13 @@
 # GrokDesk desktop (Windows / macOS)
 
-Cross-platform helper for this GrokDesk fork:
+Cross-platform GrokDesk workspace for this fork:
 
 1. Detect whether official **Grok Build** is installed (`~/.grok/bin/grok` or `%USERPROFILE%\.grok\bin\grok.exe`).
 2. One-click install from the official xAI scripts — never a third-party binary.
 3. Import a 小哈 / Xiaoha relay into `config.toml`, including `grokdesk://v1/import` links from the keys page.
+4. Open the same ACP chat workspace as macOS GrokDesk (`grok agent --model … stdio`), not a CLI console.
 
-The original SwiftUI app under `Sources/` remains the macOS ACP workspace. This Tauri app is the Windows (and macOS) connector.
+The original SwiftUI app under `Sources/` remains the native macOS workspace. This Tauri app is the Windows (and Linux) desktop GUI.
 
 ## Official Grok install
 

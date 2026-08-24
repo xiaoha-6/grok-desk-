@@ -12,6 +12,7 @@ pub struct RuntimeStatus {
     pub grok_home: String,
     pub config_path: String,
     pub config_exists: bool,
+    pub home_dir: String,
     pub os: String,
     pub installer_url: String,
 }
@@ -127,11 +128,16 @@ pub fn runtime_status() -> RuntimeStatus {
         grok_home: home.display().to_string(),
         config_path: config_path.display().to_string(),
         config_exists: config_path.is_file(),
+        home_dir: dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .display()
+            .to_string(),
         os: current_os().to_string(),
         installer_url: official_installer_url().to_string(),
     }
 }
 
+#[allow(dead_code)]
 pub fn launch_grok() -> Result<(), String> {
     let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
     #[cfg(target_os = "macos")]
