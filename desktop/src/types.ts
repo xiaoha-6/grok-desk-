@@ -112,6 +112,7 @@ export type Conversation = {
   updatedAt: number;
   archivedAt?: number;
   historyHasMore?: boolean;
+  historySkip?: number;
 };
 
 export type LocalSessionSummary = {

@@ -222,6 +222,15 @@ function persistConversations(list: Conversation[]): Conversation[] {
   }));
 }
 
+function mergeHistoryMessages(existing: ChatMessage[], incoming: ChatMessage[], prepend: boolean) {
+  if (!incoming.length) return existing;
+  if (!existing.length) return incoming;
+  const keys = new Set(existing.map((item) => `${item.role}:${item.text.slice(0, 160)}`));
+  const extra = incoming.filter((item) => !keys.has(`${item.role}:${item.text.slice(0, 160)}`));
+  if (!extra.length) return existing;
+  return prepend ? [...extra, ...existing] : [...existing, ...extra];
+}
+
 function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary[]): Conversation[] {
   const known = new Set(list.map((item) => item.grokSessionId).filter(Boolean) as string[]);
   const extras: Conversation[] = summaries
@@ -233,6 +242,8 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
       grokSessionId: item.grokSessionId,
       messages: [],
       updatedAt: item.updatedAt,
+      historyHasMore: true,
+      historySkip: 0,
     }));
   const merged = list.map((item) => {
     const summary = summaries.find((entry) => entry.grokSessionId === item.grokSessionId);
@@ -244,6 +255,7 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
       cwd: item.cwd || summary.cwd,
       grokSessionId: item.grokSessionId || summary.grokSessionId,
       updatedAt: Math.max(item.updatedAt || 0, summary.updatedAt || 0),
+      historyHasMore: item.historyHasMore !== false,
     };
   });
   return [...merged, ...extras].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
@@ -408,6 +420,7 @@ export default function App() {
   });
   const [selectedId, setSelectedId] = useState<string | null>(saved.selectedId || null);
   const [shownCount, setShownCount] = useState(VIEW_PAGE);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
   const [addingAccount, setAddingAccount] = useState(false);
@@ -437,6 +450,7 @@ export default function App() {
   const t: Copy = translate(lang);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLElement | null>(null);
+  const topSentinelRef = useRef<HTMLDivElement | null>(null);
   const followRef = useRef(true);
   const lastImportRef = useRef("");
   const turnIdRef = useRef(0);
@@ -920,18 +934,12 @@ export default function App() {
   const loadSessionHistory = useCallback(async (conversationId: string, older = false) => {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation?.grokSessionId || historyBusyRef.current) return;
-    if (!older) {
-      if (historyLoadedRef.current.has(conversationId)) return;
-      if (conversation.messages.length > 0) {
-        historyLoadedRef.current.add(conversationId);
-        return;
-      }
-      historyLoadedRef.current.add(conversationId);
-    } else if (conversation.historyHasMore === false) {
-      return;
-    }
+    if (older && conversation.historyHasMore === false) return;
+    if (!older && historyLoadedRef.current.has(conversationId)) return;
+    if (!older) historyLoadedRef.current.add(conversationId);
     historyBusyRef.current = true;
-    const skip = older ? conversation.messages.length : 0;
+    if (older) setLoadingOlder(true);
+    const skip = older ? conversation.historySkip || conversation.messages.length : 0;
     try {
       const history = await invoke<LocalSessionHistory>("load_session_history", {
         sessionId: conversation.grokSessionId,
@@ -950,14 +958,20 @@ export default function App() {
       const el = transcriptRef.current;
       const prevHeight = el?.scrollHeight || 0;
       const prevTop = el?.scrollTop || 0;
+      const hasMore = incoming.length >= HISTORY_PAGE || Boolean(history.hasMore);
       setConversations((list) =>
         list.map((item) => {
           if (item.id !== conversationId) return item;
-          const messages = older ? [...incoming, ...item.messages] : item.messages.length ? item.messages : incoming;
-          return { ...item, messages, historyHasMore: Boolean(history.hasMore) };
+          const messages = mergeHistoryMessages(item.messages, incoming, older || item.messages.length > 0);
+          return {
+            ...item,
+            messages,
+            historyHasMore: incoming.length === 0 ? false : hasMore,
+            historySkip: skip + incoming.length,
+          };
         }),
       );
-      if (older) {
+      if (older || skip > 0) {
         setShownCount((count) => count + incoming.length);
         requestAnimationFrame(() => {
           const box = transcriptRef.current;
@@ -976,8 +990,29 @@ export default function App() {
       if (!older) historyLoadedRef.current.delete(conversationId);
     } finally {
       historyBusyRef.current = false;
+      setLoadingOlder(false);
     }
   }, []);
+
+  useEffect(() => {
+    const root = transcriptRef.current;
+    const target = topSentinelRef.current;
+    if (!root || !target) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+        if (!conversation?.grokSessionId || conversation.historyHasMore === false) return;
+        if (shownCountRef.current < conversation.messages.length) {
+          setShownCount(conversation.messages.length);
+        }
+        void loadSessionHistory(conversation.id, true);
+      },
+      { root, rootMargin: "160px 0px 0px 0px", threshold: 0 },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [selectedId, selected?.messages.length, loadSessionHistory]);
 
   const loadLocalSessions = useCallback(async () => {
     try {
@@ -1543,21 +1578,13 @@ export default function App() {
     const el = transcriptRef.current;
     if (!el) return;
     followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
-    if (el.scrollTop > 96) return;
+    if (el.scrollTop > 80) return;
     const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
-    if (!conversation) return;
+    if (!conversation?.grokSessionId || conversation.historyHasMore === false) return;
     if (shownCountRef.current < conversation.messages.length) {
-      const prevHeight = el.scrollHeight;
-      const prevTop = el.scrollTop;
-      setShownCount((count) => Math.min(conversation.messages.length, count + VIEW_PAGE));
-      requestAnimationFrame(() => {
-        const box = transcriptRef.current;
-        if (!box) return;
-        box.scrollTop = box.scrollHeight - prevHeight + prevTop;
-      });
-      return;
+      setShownCount(conversation.messages.length);
     }
-    if (conversation.historyHasMore !== false) void loadSessionHistory(conversation.id, true);
+    void loadSessionHistory(conversation.id, true);
   }
 
   function beginResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1906,20 +1933,18 @@ export default function App() {
             </div>
           ) : (
             <div className="messages">
-              {selected.historyHasMore || shownCount < selected.messages.length ? (
+              <div ref={topSentinelRef} className="history-sentinel" />
+              {selected.grokSessionId && selected.historyHasMore !== false ? (
                 <button
                   className="ghost compact history-more"
                   type="button"
-                  disabled={historyBusyRef.current}
+                  disabled={loadingOlder}
                   onClick={() => {
-                    if (shownCount < selected.messages.length) {
-                      setShownCount((count) => Math.min(selected.messages.length, count + VIEW_PAGE));
-                    } else {
-                      void loadSessionHistory(selected.id, true);
-                    }
+                    setShownCount((count) => Math.max(count, selected.messages.length));
+                    void loadSessionHistory(selected.id, true);
                   }}
                 >
-                  {t.loadOlder}
+                  {loadingOlder ? t.loadingOlder : t.loadOlder}
                 </button>
               ) : null}
               {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (

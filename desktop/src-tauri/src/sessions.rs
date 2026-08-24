@@ -233,9 +233,10 @@ fn line_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
 }
 
 fn looks_like_chat_line(line: &[u8]) -> bool {
-    const USER: &[u8] = br#""type":"user""#;
-    const ASSISTANT: &[u8] = br#""type":"assistant""#;
-    memmem(line, USER) || memmem(line, ASSISTANT)
+    memmem(line, br#""type":"user""#)
+        || memmem(line, br#""type": "user""#)
+        || memmem(line, br#""type":"assistant""#)
+        || memmem(line, br#""type": "assistant""#)
 }
 
 fn memmem(haystack: &[u8], needle: &[u8]) -> bool {

@@ -354,9 +354,13 @@ button { background: none; }
   display: grid;
   gap: 26px;
 }
+.history-sentinel {
+  height: 1px;
+  width: 100%;
+}
 .history-more {
   justify-self: center;
-  margin-bottom: 4px;
+  margin: 4px 0 12px;
 }
 .timeline-folded {
   color: var(--text-3);
