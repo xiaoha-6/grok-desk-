@@ -11,6 +11,7 @@ import {
   IconTerminal,
 } from "./icons";
 import type { Copy } from "./i18n";
+import { ModelPicker } from "./ModelPicker";
 import {
   mergeModelOptions,
   type AccountRecord,
@@ -53,6 +54,8 @@ function ModelSelect({
   loading,
   refreshLabel,
   allowCustom,
+  searchPlaceholder,
+  emptyLabel,
 }: {
   value: string;
   options: CatalogModel[];
@@ -61,23 +64,26 @@ function ModelSelect({
   loading?: boolean;
   refreshLabel?: string;
   allowCustom?: boolean;
+  searchPlaceholder?: string;
+  emptyLabel?: string;
 }) {
   const current = options.some((item) => item.id === value) ? value : options[0]?.id || value;
   return (
     <div className="model-pick">
-      {options.length || !allowCustom ? (
-        <select value={current} onChange={(event) => onChange(event.target.value)} disabled={loading}>
-          {options.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.name && item.name !== item.id ? `${item.name} · ${item.id}` : item.id}
-            </option>
-          ))}
-        </select>
-      ) : (
-        <input value={value} spellCheck={false} onChange={(event) => onChange(event.target.value)} placeholder="grok-4.5" />
-      )}
+      <ModelPicker
+        value={current}
+        options={options}
+        onChange={onChange}
+        disabled={loading}
+        variant="field"
+        align="end"
+        allowCustom={allowCustom}
+        searchPlaceholder={searchPlaceholder}
+        emptyLabel={emptyLabel}
+        customPlaceholder="grok-4.5"
+      />
       {onRefresh ? (
-        <button className="ghost" type="button" disabled={loading} onClick={onRefresh}>
+        <button className="ghost compact" type="button" disabled={loading} onClick={onRefresh}>
           {refreshLabel}
         </button>
       ) : null}
@@ -121,6 +127,7 @@ export function SettingsView(props: {
   onRefreshModels: (fromForm?: boolean) => void;
   cwd: string;
   applyCwd: (path: string) => void;
+  onPickWorkspace?: () => void;
   status: RuntimeStatus | null;
   statusError: string;
   installing: boolean;
@@ -245,10 +252,19 @@ export function SettingsView(props: {
                     onRefresh={() => props.onRefreshModels(false)}
                     loading={props.modelsLoading}
                     refreshLabel={props.modelsLoading ? copy.fetchingModels : copy.fetchModels}
+                    searchPlaceholder={copy.searchModels}
+                    emptyLabel={copy.noMatchingModels}
                   />
                 </SettingsRow>
                 <SettingsRow title={copy.workspace} detail={copy.workspaceDetail}>
-                  <input value={props.cwd} spellCheck={false} onChange={(event) => props.applyCwd(event.target.value)} />
+                  <div className="model-pick">
+                    <input value={props.cwd} spellCheck={false} onChange={(event) => props.applyCwd(event.target.value)} />
+                    {props.onPickWorkspace ? (
+                      <button className="ghost compact" type="button" onClick={props.onPickWorkspace}>
+                        {copy.chooseFolder}
+                      </button>
+                    ) : null}
+                  </div>
                 </SettingsRow>
                 <SettingsRow title={copy.effort} detail={copy.modelDetail}>
                   <select
@@ -366,6 +382,8 @@ export function SettingsView(props: {
                       loading={props.modelsLoading}
                       refreshLabel={props.modelsLoading ? copy.fetchingModels : copy.fetchModels}
                       allowCustom
+                      searchPlaceholder={copy.searchModels}
+                      emptyLabel={copy.noMatchingModels}
                     />
                   </label>
                   <label>

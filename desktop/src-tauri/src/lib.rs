@@ -5,6 +5,7 @@ mod install;
 mod media;
 mod runtime;
 mod sessions;
+mod workspace;
 
 use accounts::{
     clear_login, commit_account, create_account, discover_skills, drop_uncommitted_home,
@@ -18,6 +19,7 @@ use config::{
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
 use sessions::{LocalSessionHistory, LocalSessionSummary};
+use workspace::{WorkspaceEntry, WorkspaceFile};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
@@ -128,6 +130,28 @@ async fn list_local_sessions() -> Vec<LocalSessionSummary> {
     tauri::async_runtime::spawn_blocking(sessions::list_local_sessions)
         .await
         .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn pick_workspace_folder(current: Option<String>) -> Option<String> {
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("选择工作目录");
+    if let Some(path) = current.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        dialog = dialog.set_directory(path);
+    }
+    dialog
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn list_workspace(root: String, path: Option<String>) -> Result<Vec<WorkspaceEntry>, String> {
+    run_blocking(move || workspace::list_workspace(&root, path.as_deref())).await
+}
+
+#[tauri::command]
+async fn read_workspace_file(root: String, path: String) -> Result<WorkspaceFile, String> {
+    run_blocking(move || workspace::read_workspace_file(&root, &path)).await
 }
 
 #[tauri::command]
@@ -411,6 +435,9 @@ pub fn run() {
             call_extension,
             list_local_sessions,
             load_session_history,
+            pick_workspace_folder,
+            list_workspace,
+            read_workspace_file,
             list_accounts,
             save_account_state,
             add_account,

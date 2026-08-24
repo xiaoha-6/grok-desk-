@@ -1,11 +1,13 @@
 {
   "name": "grokdesk-desktop",
   "private": true,
-  "version": "0.6.13",
+  "version": "0.6.17",
   "packageManager": "pnpm@10.15.1",
   "type": "module",
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "scripts": {
     "dev": "vite",
@@ -14,11 +16,18 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@iconify-json/vscode-icons": "^1.2.75",
+    "@iconify/react": "^6.0.2",
+    "@monaco-editor/react": "^4.7.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-deep-link": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "monaco-editor": "^0.56.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-arborist": "^3.16.0",
+    "react-dom": "^18.3.1",
+    "react-resizable-panels": "^4.12.3",
+    "vscode-icons-js": "^11.6.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

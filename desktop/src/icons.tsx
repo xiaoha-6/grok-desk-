@@ -43,6 +43,15 @@ export function IconCompose(props: IconProps) {
     </Svg>
   );
 }
+export function IconCodePane(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2.2" />
+      <path d="M14.5 4.5v15" />
+      <path d="M17 9.5l2 2.5-2 2.5" />
+    </Svg>
+  );
+}
 export function IconFolder(props: IconProps) {
   return (
     <Svg {...props}>

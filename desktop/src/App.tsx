@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -20,6 +22,7 @@ import {
   IconChevronRight,
   IconClose,
   IconCompose,
+  IconCodePane,
   IconFolder,
   IconGauge,
   IconGear,
@@ -33,6 +36,7 @@ import {
 } from "./icons";
 import { t as translate, type Copy } from "./i18n";
 import { MessageBody } from "./markdown";
+import { ModelPicker } from "./ModelPicker";
 import { SettingsView } from "./SettingsView";
 import { isRedundantExtension, jsonText } from "./timeline";
 import {
@@ -50,6 +54,7 @@ import {
   type ChatMessage,
   type ContextUsage,
   type Conversation,
+  type FileDiff,
   type ImportResult,
   type Lang,
   type LocalSessionHistory,
@@ -80,18 +85,39 @@ const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 
 const STORAGE_KEY = "grokdesk.workspace.v3";
 const LEGACY_KEYS = ["grokdesk.workspace.v2", "grokdesk.workspace.v1"];
+const WorkspacePanel = lazy(() => import("./WorkspacePanel").then((mod) => ({ default: mod.WorkspacePanel })));
 
 function uid() {
   return crypto.randomUUID();
 }
 
+function normalizePath(path: string) {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function samePath(a: string, b: string) {
+  return normalizePath(a).toLowerCase() === normalizePath(b).toLowerCase();
+}
+
+function isHomeLikePath(path: string, homeDir = "") {
+  const normalized = normalizePath(path);
+  if (!normalized) return true;
+  if (normalized === "/" || /^[a-zA-Z]:$/.test(normalized)) return true;
+  if (homeDir && samePath(normalized, homeDir)) return true;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 2 && (parts[0] === "Users" || parts[0] === "home")) return true;
+  return false;
+}
+
+function usableWorkspace(path: string, homeDir = "") {
+  const trimmed = path.trim();
+  return isHomeLikePath(trimmed, homeDir) ? "" : trimmed;
+}
+
 function workspaceLabel(path: string, homeDir: string, homeWord: string) {
   if (!path) return homeWord;
-  const normalized = path.replace(/[\\/]+$/, "");
-  if (homeDir && normalized.replace(/\\/g, "/") === homeDir.replace(/\\/g, "/")) {
-    return homeWord;
-  }
-  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  if (isHomeLikePath(path, homeDir)) return homeWord;
+  const parts = normalizePath(path).split("/").filter(Boolean);
   return parts[parts.length - 1] || homeWord;
 }
 
@@ -349,6 +375,8 @@ type PersistShape = {
   conversations?: Conversation[];
   form?: Partial<RelayImport>;
   sidebarWidth?: number;
+  workspaceWidth?: number;
+  showWorkspace?: boolean;
   settings?: Partial<AppSettings>;
   availableModels?: CatalogModel[];
   relayReady?: boolean;
@@ -375,9 +403,13 @@ export default function App() {
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("general");
   const [showSidebar, setShowSidebar] = useState(true);
   const [showInspector, setShowInspector] = useState(false);
+  const [showWorkspace, setShowWorkspace] = useState(Boolean(saved.showWorkspace));
+  const [workspaceFocusPath, setWorkspaceFocusPath] = useState("");
+  const [workspaceFocusTick, setWorkspaceFocusTick] = useState(0);
   const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [showUsageCard, setShowUsageCard] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(Math.min(400, Math.max(220, saved.sidebarWidth || 280)));
+  const [workspaceWidth, setWorkspaceWidth] = useState(Math.min(820, Math.max(420, saved.workspaceWidth || 560)));
   const [model, setModel] = useState(canonicalModelId(saved.model || "grok-4.5") || "grok-4.5");
   const [cwd, setCwd] = useState(saved.cwd || "");
   const [prompt, setPrompt] = useState("");
@@ -490,7 +522,9 @@ export default function App() {
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
-  const projectName = workspaceLabel(selected?.cwd || cwd, homeDir, t.home);
+  const sessionCwd = selected?.cwd || cwd;
+  const workspaceRoot = usableWorkspace(sessionCwd, homeDir);
+  const projectName = workspaceLabel(sessionCwd, homeDir, t.home);
   const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing && !running;
   const relayConfigured = Boolean(relayQuota?.configured || relayReady);
   const routed = relayConfigured ? undefined : pickRoutedAccount(accounts, settings);
@@ -538,7 +572,6 @@ export default function App() {
       .sort((a, b) => (b.items[0]?.updatedAt || 0) - (a.items[0]?.updatedAt || 0));
   }, [conversations, homeDir, t.home]);
 
-  const effortLabel = EFFORTS.find((item) => item.id === settings.reasoningEffort)?.label || settings.reasoningEffort;
   const modelOptions = useMemo(() => mergeModelOptions(availableModels, model), [availableModels, model]);
   const usagePercent = Math.round(
     Math.min(100, Math.max(0, usage.totalTokens ? (usage.usedTokens / usage.totalTokens) * 100 : 0)),
@@ -560,13 +593,15 @@ export default function App() {
         selectedId,
         conversations: persistConversations(conversations),
         sidebarWidth,
+        workspaceWidth,
+        showWorkspace,
         settings,
         form: { ...form, apiKey: "" },
         availableModels,
         relayReady,
       }),
     );
-  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings, availableModels, relayReady]);
+  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, workspaceWidth, showWorkspace, form, settings, availableModels, relayReady]);
 
   useEffect(() => {
     setUsage((current) =>
@@ -763,6 +798,21 @@ export default function App() {
             output,
             diffs: diffs.length ? diffs : undefined,
           });
+          const inputRec = asRecord(update.rawInput ?? update.input ?? update.raw_input);
+          const editPath = String(
+            diffs.find((item) => item.path)?.path ||
+              update.path ||
+              metaTool?.path ||
+              inputRec?.path ||
+              inputRec?.file_path ||
+              inputRec?.filePath ||
+              "",
+          );
+          if (editPath && /edit|write|replace|file/i.test(`${kind} ${title}`)) {
+            setWorkspaceFocusPath(editPath);
+            setWorkspaceFocusTick((tick) => tick + 1);
+            setShowWorkspace(true);
+          }
         } else if (type === "plan") {
           const entries = (update.entries as Array<Record<string, unknown>> | undefined) || [];
           assistant.events = upsertEvent(assistant.events, {
@@ -909,8 +959,7 @@ export default function App() {
     try {
       const next = await invoke<RuntimeStatus>("get_runtime_status");
       setStatus(next);
-      setCwd((value) => value || next.homeDir);
-      setConversations((list) => list.map((item) => (item.cwd ? item : { ...item, cwd: next.homeDir })));
+      setCwd((value) => (isHomeLikePath(value, next.homeDir) ? "" : value));
       return next;
     } catch (error) {
       setStatusError(String(error));
@@ -1230,7 +1279,7 @@ export default function App() {
       void loadRelayModels(false);
       await refreshSkills();
       const imported = await loadLocalSessions();
-      const path = cwdRef.current || runtime?.homeDir || "";
+      const path = usableWorkspace(cwdRef.current, runtime?.homeDir || "");
       const ensured = ensureConversation(imported, selectedIdRef.current, path);
       setConversations(ensured.list);
       setSelectedId(ensured.id);
@@ -1309,7 +1358,7 @@ export default function App() {
         const created: Conversation = {
           id: uid(),
           title: tRef.current.newChat,
-          cwd: cwdRef.current || statusRef.current?.homeDir || "",
+          cwd: usableWorkspace(cwdRef.current, statusRef.current?.homeDir || ""),
           messages: [],
           updatedAt: Date.now(),
         };
@@ -1337,7 +1386,7 @@ export default function App() {
     const created: Conversation = {
       id: uid(),
       title: t.newChat,
-      cwd: cwd || homeDir,
+      cwd: usableWorkspace(cwd, homeDir),
       accountId: account?.id || activeAccount?.id,
       messages: [],
       updatedAt: Date.now(),
@@ -1351,16 +1400,18 @@ export default function App() {
   }
 
   function selectConversation(id: string) {
+    const item = conversations.find((entry) => entry.id === id);
     setSelectedId(id);
     setShownCount(VIEW_PAGE);
     setView("chat");
     followRef.current = true;
+    if (item?.cwd) setCwd(item.cwd);
     void loadSessionHistory(id);
   }
 
   function deleteConversation(id: string) {
     const next = conversations.filter((item) => item.id !== id);
-    const ensured = ensureConversation(next, id === selectedId ? null : selectedId, cwd || homeDir);
+    const ensured = ensureConversation(next, id === selectedId ? null : selectedId, usableWorkspace(cwd, homeDir));
     setConversations(ensured.list);
     setSelectedId(ensured.id);
   }
@@ -1369,8 +1420,24 @@ export default function App() {
     const trimmed = path.trim();
     setCwd(trimmed);
     setConversations((list) =>
-      list.map((item) => (item.id === selectedId && item.messages.length === 0 ? { ...item, cwd: trimmed } : item)),
+      list.map((item) => (item.id === selectedId ? { ...item, cwd: trimmed } : item)),
     );
+  }
+
+  async function pickWorkspaceFolder() {
+    try {
+      const picked = await invoke<string | null>("pick_workspace_folder", {
+        current: workspaceRoot || sessionCwd || null,
+      });
+      if (!picked) return;
+      if (isHomeLikePath(picked, homeDir)) {
+        setStatusText(t.workspaceHomeHint);
+        return;
+      }
+      applyCwd(picked);
+    } catch (error) {
+      setStatusText(String(error));
+    }
   }
 
   async function sendText(text: string, extraAttachments?: PromptAttachment[]) {
@@ -1623,6 +1690,20 @@ export default function App() {
     window.addEventListener("pointerup", up);
   }
 
+  function beginWorkspaceResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = workspaceWidth;
+    const origin = event.clientX;
+    const move = (next: PointerEvent) => {
+      setWorkspaceWidth(Math.min(920, Math.max(380, start - (next.clientX - origin))));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
   async function answerPermission(optionId: string | null) {
     if (!pendingPermission) return;
     try {
@@ -1712,6 +1793,21 @@ export default function App() {
   const lastAssistant = [...(selected?.messages || [])].reverse().find((item) => item.role === "assistant");
   const toolEvents = lastAssistant?.events.filter((event) => event.id.startsWith("tool-")) || [];
   const planEvent = lastAssistant?.events.find((event) => event.kind === "plan");
+  const fileDiffs = useMemo(() => {
+    const latest = new Map<string, FileDiff>();
+    for (const message of selected?.messages || []) {
+      for (const event of message.events || []) {
+        for (const diff of event.diffs || []) {
+          latest.set(diff.path || `anon-${latest.size}`, diff);
+        }
+      }
+    }
+    return [...latest.values()];
+  }, [selected?.messages]);
+  const changedPaths = useMemo(
+    () => fileDiffs.map((diff) => diff.path).filter((path): path is string => Boolean(path)),
+    [fileDiffs],
+  );
 
   if (view === "settings") {
     return (
@@ -1740,8 +1836,9 @@ export default function App() {
         modelsError={modelsError}
         modelsMessage={modelsMessage}
         onRefreshModels={(fromForm) => void loadRelayModels(Boolean(fromForm))}
-        cwd={cwd}
+        cwd={sessionCwd}
         applyCwd={applyCwd}
+        onPickWorkspace={() => void pickWorkspaceFolder()}
         status={status}
         statusError={statusError}
         installing={installing}
@@ -1904,8 +2001,10 @@ export default function App() {
                 <IconSidebar />
               </button>
             ) : null}
-            <IconFolder />
-            <span>{projectName}</span>
+            <button className="crumb-folder" type="button" title={t.pickWorkspace} onClick={() => void pickWorkspaceFolder()}>
+              <IconFolder />
+              <span>{workspaceRoot ? projectName : t.chooseFolder}</span>
+            </button>
             <span className="sep">
               <IconChevronRight />
             </span>
@@ -1921,12 +2020,31 @@ export default function App() {
               <div className="live quiet">{osLabel}</div>
             ) : null}
             <button
-              className="icon-btn"
+              className={`icon-btn${showWorkspace ? " on" : ""}`}
+              type="button"
+              title={showWorkspace ? t.hideWorkspace : t.showWorkspace}
+              onClick={() => setShowWorkspace((value) => !value)}
+            >
+              <IconCodePane />
+            </button>
+            <button
+              className={`icon-btn${showInspector ? " on" : ""}`}
               type="button"
               title={t.inspector}
               onClick={() => setShowInspector((value) => !value)}
             >
               <IconInspector />
+            </button>
+            <button
+              className="icon-btn"
+              type="button"
+              title={t.settings}
+              onClick={() => {
+                setView("settings");
+                setSettingsPage("general");
+              }}
+            >
+              <IconGear />
             </button>
           </div>
         </header>
@@ -2040,18 +2158,28 @@ export default function App() {
                 <input
                   className="cwd-input"
                   autoFocus
-                  value={cwd}
+                  value={sessionCwd}
                   spellCheck={false}
                   onChange={(event) => applyCwd(event.target.value)}
                   onBlur={() => setEditingCwd(false)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") setEditingCwd(false);
+                    if (event.key === "Escape") setEditingCwd(false);
                   }}
                 />
               ) : (
-                <button className="workspace-chip" type="button" onClick={() => setEditingCwd(true)}>
+                <button
+                  className="workspace-chip"
+                  type="button"
+                  title={t.pickWorkspace}
+                  onClick={() => void pickWorkspaceFolder()}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setEditingCwd(true);
+                  }}
+                >
                   <IconFolder />
-                  <span>{projectName || t.chooseFolder}</span>
+                  <span>{workspaceRoot ? projectName : t.chooseFolder}</span>
                   <IconChevronDown />
                 </button>
               )
@@ -2107,21 +2235,19 @@ export default function App() {
               <button className="icon-btn context-btn" type="button" onClick={() => setShowContext((value) => !value)}>
                 <span className="context-ring" style={{ background: `conic-gradient(currentColor ${usagePercent}%, var(--hairline) 0)` }} />
               </button>
-              <span className="hint inline">{`${model} · ${effortLabel}`}</span>
-              <select
-                className="model-mini"
+              <span className="composer-bar-spacer" />
+              <ModelPicker
                 value={modelOptions.some((item) => item.id === model) ? model : modelOptions[0]?.id || model}
-                onChange={(event) => selectModel(event.target.value)}
+                options={modelOptions}
+                onChange={selectModel}
                 disabled={running}
-              >
-                {modelOptions.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name && item.name !== item.id ? `${item.name} · ${item.id}` : item.id}
-                  </option>
-                ))}
-              </select>
+                variant="inline"
+                align="end"
+                searchPlaceholder={t.searchModels}
+                emptyLabel={t.noMatchingModels}
+              />
               <select
-                className="model-mini"
+                className="effort-mini"
                 value={settings.reasoningEffort}
                 onChange={(event) => patchSettings({ reasoningEffort: event.target.value })}
                 disabled={running}
@@ -2168,6 +2294,25 @@ export default function App() {
           </div>
         </footer>
       </main>
+
+      {showWorkspace ? (
+        <>
+          <div className="resize workspace-edge" onPointerDown={beginWorkspaceResize} />
+          <Suspense fallback={<aside className="workspace" style={{ width: workspaceWidth, minWidth: workspaceWidth, flex: "0 0 auto" }} />}>
+            <WorkspacePanel
+              cwd={workspaceRoot}
+              changedPaths={changedPaths}
+              diffs={fileDiffs}
+              focusPath={workspaceFocusPath}
+              focusTick={workspaceFocusTick}
+              copy={t}
+              onClose={() => setShowWorkspace(false)}
+              onPickFolder={() => void pickWorkspaceFolder()}
+              width={workspaceWidth}
+            />
+          </Suspense>
+        </>
+      ) : null}
 
       {showInspector ? (
         <aside className="inspector">
