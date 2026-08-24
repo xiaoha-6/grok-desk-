@@ -137,16 +137,18 @@ button { background: none; }
   padding: 22px 13px 8px;
 }
 .brand-mark {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  object-fit: cover;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  color: var(--text);
 }
 .brand-name {
   flex: 1;
-  font-size: 15px;
+  min-width: 0;
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
 }
 .icon-btn {
   width: 28px;
@@ -304,23 +306,46 @@ button { background: none; }
   overflow: auto;
 }
 .empty {
-  padding-top: 110px;
+  padding-top: 14vh;
   display: grid;
   justify-items: center;
   text-align: center;
-  gap: 10px;
+  gap: 12px;
 }
-.spark { color: var(--text-2); }
+.empty-hero {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.empty-mark {
+  width: 68px;
+  height: 68px;
+  flex: 0 0 auto;
+}
+.empty-wordmark {
+  font-size: 44px;
+  font-weight: 500;
+  letter-spacing: -0.045em;
+  line-height: 1;
+}
 .empty h1 {
   margin: 0;
-  font-size: 24px;
-  font-weight: 600;
-  letter-spacing: -0.03em;
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: var(--text-2);
 }
 .empty p {
   margin: 0;
-  color: var(--text-2);
+  color: var(--text-3);
   font-size: 14px;
+}
+@media (max-width: 900px) {
+  .empty-mark { width: 48px; height: 48px; }
+  .empty-wordmark { font-size: 32px; }
 }
 .messages {
   max-width: 780px;

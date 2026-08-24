@@ -28,7 +28,7 @@ import {
   IconRefresh,
   IconShield,
   IconSidebar,
-  IconSpark,
+  GrokMark,
   IconStop,
 } from "./icons";
 import { t as translate, type Copy } from "./i18n";
@@ -1589,7 +1589,7 @@ export default function App() {
         <>
           <aside className="sidebar" style={{ width: sidebarWidth }}>
             <div className="brand-row">
-              <img className="brand-mark" src="/app-icon.png" alt="" />
+              <GrokMark size={22} className="brand-mark" />
               <div className="brand-name">{t.brand}</div>
               <button className="icon-btn" type="button" title={t.hideSidebar} onClick={() => setShowSidebar(false)}>
                 <IconSidebar />
@@ -1737,8 +1737,9 @@ export default function App() {
         <section ref={transcriptRef} className="transcript" onScroll={onTranscriptScroll}>
           {!selected?.messages.length ? (
             <div className="empty">
-              <div className="spark">
-                <IconSpark />
+              <div className="empty-hero">
+                <GrokMark size={72} className="empty-mark" />
+                <div className="empty-wordmark">{t.emptyWordmark}</div>
               </div>
               <h1>{t.emptyTitle}</h1>
               <p>{projectName || t.emptyHint}</p>

@@ -1,8 +1,8 @@
 Unicode True
 !define PRODUCT_NAME "xiaoha grok 桌面版"
-!define PRODUCT_VERSION "0.6.5"
+!define PRODUCT_VERSION "0.6.6"
 !define PRODUCT_PUBLISHER "小哈AI"
-!define PRODUCT_EXE "GrokDesk.exe"
+!define PRODUCT_EXE "xiaoha-grok.exe"
 !define PROTOCOL "grokdesk"
 
 Name "${PRODUCT_NAME}"
@@ -22,6 +22,10 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File /oname=${PRODUCT_EXE} "grokdesk.exe"
   File "icon.ico"
+  Delete "$INSTDIR\GrokDesk.exe"
+  Delete "$DESKTOP\GrokDesk.lnk"
+  Delete "$SMPROGRAMS\GrokDesk\GrokDesk.lnk"
+  RMDir "$SMPROGRAMS\GrokDesk"
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\icon.ico"
