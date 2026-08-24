@@ -32,3 +32,13 @@ pnpm tauri build
 
 Windows artifacts: `src-tauri/target/release/bundle/nsis/` and `msi/`  
 macOS artifacts: `src-tauri/target/release/bundle/dmg/` and `macos/`
+
+Cross-compiling the Windows installer from macOS:
+
+```bash
+pnpm build
+cd src-tauri
+PATH="/usr/bin:$PATH" cargo xwin build --release --target x86_64-pc-windows-msvc --features custom-protocol
+```
+
+`--features custom-protocol` is required. Without it the exe opens `http://localhost:1420` and Windows shows ERR_CONNECTION_REFUSED.

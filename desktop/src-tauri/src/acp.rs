@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.4.0";
+const CLIENT_VERSION: &str = "0.4.1";
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 
