@@ -951,7 +951,14 @@ export default function App() {
         role: item.role === "assistant" ? "assistant" : "user",
         text: item.text || "",
         thought: "",
-        events: [],
+        events: (item.events || []).map((event) => ({
+          id: event.id || uid(),
+          kind: event.kind || "other",
+          title: event.title || event.kind || "工具调用",
+          status: event.status,
+          input: event.input,
+          output: event.output,
+        })),
         media: [],
         streaming: false,
       }));
@@ -1969,7 +1976,11 @@ export default function App() {
                 <article key={message.id} className={`row ${message.role}`}>
                   <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
                     {message.role === "assistant" && message.events.length ? (
-                      <ActivityTimeline events={message.events} lang={lang} defaultOpen={message.streaming} />
+                      <ActivityTimeline
+                        events={message.events}
+                        lang={lang}
+                        defaultOpen={message.streaming || message.events.length > 0}
+                      />
                     ) : message.thought ? (
                       <details className="thought" open={message.streaming && !message.text}>
                         <summary>{t.thinking}</summary>

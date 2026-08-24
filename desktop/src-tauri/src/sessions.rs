@@ -32,11 +32,27 @@ pub struct LocalSessionSummary {
     pub message_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTimelineEvent {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSessionMessage {
     pub role: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<LocalTimelineEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,10 +89,11 @@ pub fn load_session_history(
     let limit = limit.max(1);
     let history_path = dir.join("chat_history.jsonl");
     let segments = compaction_segment_files(&dir);
-    let (messages, hist_more) = parse_chat_history(&history_path, limit, skip);
+    let all = reconstruct_turns(&history_path);
+    let hist_total = all.len();
+    let (messages, hist_more) = slice_end(&all, limit, skip);
     let has_more;
     let messages = if messages.is_empty() && !hist_more {
-        let hist_total = count_chat_messages(&history_path);
         let seg_skip = skip.saturating_sub(hist_total);
         let (extra, seg_more) = parse_compaction_segments(&segments, limit, seg_skip);
         has_more = seg_more;
@@ -198,21 +215,214 @@ fn parse_summary(path: &Path) -> Option<LocalSessionSummary> {
     })
 }
 
-fn count_chat_messages(path: &Path) -> usize {
+fn slice_end(all: &[LocalSessionMessage], limit: usize, skip: usize) -> (Vec<LocalSessionMessage>, bool) {
+    if skip >= all.len() {
+        return (Vec::new(), false);
+    }
+    let end = all.len() - skip;
+    let start = end.saturating_sub(limit);
+    (all[start..end].to_vec(), start > 0)
+}
+
+fn reconstruct_turns(path: &Path) -> Vec<LocalSessionMessage> {
     let Ok(bytes) = fs::read(path) else {
-        return 0;
+        return Vec::new();
     };
-    line_ranges(&bytes)
-        .into_iter()
-        .filter(|range| {
-            let line = &bytes[range.clone()];
-            looks_like_chat_line(line)
-                && serde_json::from_slice::<Value>(line)
-                    .ok()
-                    .and_then(|value| chat_message_from_value(&value))
-                    .is_some()
-        })
-        .count()
+    let mut out = Vec::new();
+    let mut events: Vec<LocalTimelineEvent> = Vec::new();
+    let mut text = String::new();
+    for range in line_ranges(&bytes) {
+        let line = &bytes[range];
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            "user" => {
+                flush_assistant(&mut out, &mut text, &mut events);
+                if let Some(message) = user_message_from_value(&value) {
+                    out.push(message);
+                }
+            }
+            "reasoning" => {
+                if let Some(event) = reasoning_event(&value) {
+                    events.push(event);
+                }
+            }
+            "assistant" | "backend_tool_call" => {
+                push_tool_calls(&mut events, &value);
+                let raw = content_text(&value);
+                if !raw.trim().is_empty() {
+                    text = truncate_text(&raw, 16_000);
+                    flush_assistant(&mut out, &mut text, &mut events);
+                }
+            }
+            "tool_result" => apply_tool_result(&mut events, &value),
+            _ => {}
+        }
+    }
+    flush_assistant(&mut out, &mut text, &mut events);
+    out
+}
+
+fn flush_assistant(
+    out: &mut Vec<LocalSessionMessage>,
+    text: &mut String,
+    events: &mut Vec<LocalTimelineEvent>,
+) {
+    if text.is_empty() && events.is_empty() {
+        return;
+    }
+    out.push(LocalSessionMessage {
+        role: "assistant".into(),
+        text: std::mem::take(text),
+        events: std::mem::take(events),
+    });
+}
+
+fn user_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
+    let raw = content_text(value);
+    if value.get("prompt_index").is_none() && !raw.contains("<user_query>") {
+        return None;
+    }
+    let text = extract_user_query(&raw);
+    if text.is_empty() {
+        return None;
+    }
+    Some(LocalSessionMessage {
+        role: "user".into(),
+        text: truncate_text(&text, 12_000),
+        events: Vec::new(),
+    })
+}
+
+fn reasoning_event(value: &Value) -> Option<LocalTimelineEvent> {
+    let summary = value.get("summary").and_then(Value::as_array)?;
+    let text = summary
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(LocalTimelineEvent {
+        id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("thought")
+            .to_string(),
+        kind: "thought".into(),
+        title: "思考过程".into(),
+        status: Some("completed".into()),
+        input: None,
+        output: Some(truncate_text(&text, 4000)),
+    })
+}
+
+fn push_tool_calls(events: &mut Vec<LocalTimelineEvent>, value: &Value) {
+    let Some(calls) = value.get("tool_calls").and_then(Value::as_array) else {
+        return;
+    };
+    for call in calls {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let name = call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let args = parse_args(call.get("arguments"));
+        let (kind, title) = tool_label(name, &args);
+        let input = serde_json::to_string_pretty(&args).ok();
+        events.push(LocalTimelineEvent {
+            id: if id.is_empty() {
+                format!("tool-{}", events.len())
+            } else {
+                format!("tool-{id}")
+            },
+            kind: kind.into(),
+            title,
+            status: Some("completed".into()),
+            input,
+            output: None,
+        });
+    }
+}
+
+fn apply_tool_result(events: &mut [LocalTimelineEvent], value: &Value) {
+    let Some(id) = value.get("tool_call_id").and_then(Value::as_str) else {
+        return;
+    };
+    let key = format!("tool-{id}");
+    let output = content_text(value);
+    if output.trim().is_empty() {
+        return;
+    }
+    if let Some(event) = events.iter_mut().rev().find(|item| item.id == key) {
+        event.output = Some(truncate_text(&output, 4000));
+        event.status = Some("completed".into());
+    }
+}
+
+fn parse_args(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(text)) => serde_json::from_str(text).unwrap_or(Value::String(text.clone())),
+        Some(other) => other.clone(),
+        None => Value::Null,
+    }
+}
+
+fn tool_label(name: &str, args: &Value) -> (&'static str, String) {
+    let path = args
+        .get("target_file")
+        .or_else(|| args.get("path"))
+        .or_else(|| args.get("file_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("");
+    let pattern = args
+        .get("pattern")
+        .or_else(|| args.get("query"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match name {
+        "read_file" | "Read" => ("read", format!("Read `{path}`")),
+        "search_replace" | "Write" | "write" | "edit" => ("edit", format!("Edit `{path}`")),
+        "run_terminal_command" | "bash" | "Shell" => (
+            "execute",
+            if command.is_empty() {
+                "Run command".into()
+            } else {
+                format!("Run `{command}`")
+            },
+        ),
+        "grep" | "rg" => (
+            "search",
+            if pattern.is_empty() {
+                "Search".into()
+            } else {
+                format!("Search `{pattern}`")
+            },
+        ),
+        "web_search" => ("search", "Web search".into()),
+        "web_fetch" => ("fetch", "Fetch URL".into()),
+        "list_dir" | "Glob" => ("list", format!("List `{path}`")),
+        _ => ("other", name.replace('_', " ")),
+    }
 }
 
 fn compaction_segment_files(dir: &Path) -> Vec<PathBuf> {
@@ -259,6 +469,7 @@ fn parse_compaction_segments(
                     "更早的对话摘要（{name}）\n\n{}",
                     truncate_text(body, 8000)
                 ),
+                events: Vec::new(),
             })
         })
         .collect();
@@ -267,42 +478,7 @@ fn parse_compaction_segments(
 }
 
 fn parse_chat_history(path: &Path, limit: usize, skip: usize) -> (Vec<LocalSessionMessage>, bool) {
-    let Ok(bytes) = fs::read(path) else {
-        return (Vec::new(), false);
-    };
-    let ranges = line_ranges(&bytes);
-    let mut collected = Vec::new();
-    let mut seen = 0usize;
-    let mut has_more = false;
-    for range in ranges.into_iter().rev() {
-        let line = &bytes[range];
-        if line.is_empty() {
-            continue;
-        }
-        if !looks_like_chat_line(line) {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            continue;
-        };
-        let Some(message) = chat_message_from_value(&value) else {
-            continue;
-        };
-        seen += 1;
-        if seen <= skip {
-            continue;
-        }
-        collected.push(message);
-        if collected.len() >= limit {
-            has_more = true;
-            break;
-        }
-    }
-    if !has_more {
-        has_more = seen > skip + collected.len();
-    }
-    collected.reverse();
-    (collected, has_more)
+    slice_end(&reconstruct_turns(path), limit, skip)
 }
 
 fn line_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
@@ -318,48 +494,6 @@ fn line_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
         ranges.push(start..bytes.len());
     }
     ranges
-}
-
-fn looks_like_chat_line(line: &[u8]) -> bool {
-    memmem(line, br#""type":"user""#)
-        || memmem(line, br#""type": "user""#)
-        || memmem(line, br#""type":"assistant""#)
-        || memmem(line, br#""type": "assistant""#)
-}
-
-fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
-}
-
-fn chat_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
-    let kind = value.get("type")?.as_str()?;
-    if kind == "user" {
-        let raw = content_text(value);
-        if value.get("prompt_index").is_none()
-            && !raw.contains("<user_query>")
-        {
-            return None;
-        }
-        let text = extract_user_query(&raw);
-        if text.is_empty() {
-            return None;
-        }
-        Some(LocalSessionMessage {
-            role: "user".into(),
-            text: truncate_text(&text, 12_000),
-        })
-    } else if kind == "assistant" {
-        let raw = content_text(value);
-        if raw.trim().is_empty() {
-            return None;
-        }
-        Some(LocalSessionMessage {
-            role: "assistant".into(),
-            text: truncate_text(&raw, 16_000),
-        })
-    } else {
-        None
-    }
 }
 
 fn truncate_text(text: &str, max: usize) -> String {

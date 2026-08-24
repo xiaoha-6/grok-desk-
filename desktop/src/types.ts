@@ -127,7 +127,7 @@ export type LocalSessionSummary = {
 
 export type LocalSessionHistory = {
   sessionId: string;
-  messages: { role: string; text: string }[];
+  messages: { role: string; text: string; events?: TimelineEvent[] }[];
   usedTokens?: number | null;
   totalTokens?: number | null;
   compactionCount?: number | null;

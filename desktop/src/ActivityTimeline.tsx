@@ -121,7 +121,7 @@ function CategoryGroup({
   streaming?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const shown = streaming ? events.slice(-8) : events.slice(-4);
+  const shown = events.slice(0, 30);
   const hidden = events.length - shown.length;
   return (
     <div className="timeline-run">
