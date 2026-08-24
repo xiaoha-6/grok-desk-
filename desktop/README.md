@@ -1,6 +1,6 @@
 # GrokDesk desktop (Windows / macOS)
 
-Cross-platform GrokDesk workspace for this fork:
+Cross-platform GrokDesk workspace for this fork. The Windows/Linux UI is a React workspace (not Vue) that follows the original Swift GrokDesk layout: sidebar, chat, composer, and a full-window settings pane.
 
 1. Detect whether official **Grok Build** is installed (`~/.grok/bin/grok` or `%USERPROFILE%\.grok\bin\grok.exe`).
 2. One-click install from the official xAI scripts — never a third-party binary.

@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.4.1";
+const CLIENT_VERSION: &str = "0.5.0";
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -60,6 +60,40 @@ impl PendingMap {
                 let _ = tx.send(Err(message.to_string()));
             }
         }
+    }
+}
+
+struct DiagnosticBuffer {
+    lines: Mutex<Vec<String>>,
+}
+
+impl DiagnosticBuffer {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lines: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn push(&self, line: String) {
+        if let Ok(mut lines) = self.lines.lock() {
+            if lines.len() >= 16 {
+                lines.remove(0);
+            }
+            lines.push(line);
+        }
+    }
+
+    fn last_relevant(&self) -> Option<String> {
+        let lines = self.lines.lock().ok()?;
+        lines.iter().rev().find(|line| {
+            let upper = line.to_ascii_uppercase();
+            upper.contains("ERROR")
+                || upper.contains("502")
+                || upper.contains("503")
+                || upper.contains("BAD GATEWAY")
+                || upper.contains("UNAVAILABLE")
+                || upper.contains("INTERNAL")
+        }).cloned()
     }
 }
 
@@ -267,8 +301,15 @@ impl AcpClient {
         let stdin = Arc::new(Mutex::new(stdin));
         let next_id = Arc::new(AtomicU64::new(1));
         let pending = PendingMap::new();
-        spawn_stdout_reader(app.clone(), Arc::clone(&stdin), Arc::clone(&pending), stdout);
-        spawn_stderr_reader(app.clone(), stderr);
+        let diagnostics = DiagnosticBuffer::new();
+        spawn_stdout_reader(
+            app.clone(),
+            Arc::clone(&stdin),
+            Arc::clone(&pending),
+            Arc::clone(&diagnostics),
+            stdout,
+        );
+        spawn_stderr_reader(app.clone(), stderr, Arc::clone(&diagnostics));
 
         self.agent = Some(AgentProcess {
             child,
@@ -382,6 +423,7 @@ fn spawn_stdout_reader(
     app: AppHandle,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<PendingMap>,
+    diagnostics: Arc<DiagnosticBuffer>,
     stdout: impl std::io::Read + Send + 'static,
 ) {
     thread::spawn(move || {
@@ -395,18 +437,23 @@ fn spawn_stdout_reader(
             let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            dispatch_message(&app, &stdin, &pending, json);
+            dispatch_message(&app, &stdin, &pending, &diagnostics, json);
         }
         pending.fail_all("Grok Agent 已退出");
         let _ = app.emit("acp-exit", json!({ "ok": false }));
     });
 }
 
-fn spawn_stderr_reader(app: AppHandle, stderr: impl std::io::Read + Send + 'static) {
+fn spawn_stderr_reader(
+    app: AppHandle,
+    stderr: impl std::io::Read + Send + 'static,
+    diagnostics: Arc<DiagnosticBuffer>,
+) {
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             if let Some(plain) = user_facing_diagnostic(&line) {
+                diagnostics.push(plain.clone());
                 let _ = app.emit("acp-diagnostic", plain);
             }
         }
@@ -417,6 +464,7 @@ fn dispatch_message(
     app: &AppHandle,
     stdin: &Arc<Mutex<ChildStdin>>,
     pending: &PendingMap,
+    diagnostics: &DiagnosticBuffer,
     json: Value,
 ) {
     let id = json.get("id").cloned();
@@ -426,11 +474,8 @@ fn dispatch_message(
             let key = stringify_id(id);
             if let Some(tx) = pending.take(&key) {
                 if let Some(error) = json.get("error") {
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("ACP 请求失败")
-                        .to_string();
+                    let last = diagnostics.last_relevant();
+                    let message = format_rpc_error(error, last.as_deref());
                     let _ = tx.send(Err(message));
                 } else {
                     let result = json.get("result").cloned().unwrap_or(Value::Null);
@@ -696,6 +741,84 @@ pub fn content_text(update: &Value) -> String {
         .to_string()
 }
 
+fn compact_json_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) if text.trim().is_empty() => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        other => {
+            let text = other.to_string();
+            if text == "null" || text == "{}" || text == "[]" {
+                None
+            } else {
+                Some(text)
+            }
+        }
+    }
+}
+
+fn looks_generic(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    lower == "internal error"
+        || lower == "internal_error"
+        || lower == "error"
+        || lower == "acp 请求失败"
+}
+
+fn explain_upstream(message: String) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("502")
+        || lower.contains("bad gateway")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("upstream service")
+    {
+        format!(
+            "{message}\n上游模型服务暂时不可用。这通常是中转站或 xAI 上游波动，不是本机 Grok Build 没装好。请稍后重试。"
+        )
+    } else if lower.contains("503") {
+        format!("{message}\n上游暂时过载（503）。请稍后重试。")
+    } else {
+        message
+    }
+}
+
+fn format_rpc_error(error: &Value, last_diag: Option<&str>) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("ACP 请求失败")
+        .trim();
+    let data = error.get("data").and_then(compact_json_text);
+    let mut parts: Vec<String> = Vec::new();
+    if !message.is_empty() {
+        parts.push(message.to_string());
+    }
+    if let Some(data) = data {
+        if !parts.iter().any(|part| part.contains(&data) || data.contains(part)) {
+            parts.push(data);
+        }
+    }
+    if let Some(diag) = last_diag.map(str::trim).filter(|value| !value.is_empty()) {
+        let already = parts.iter().any(|part| part.contains(diag));
+        let useful = looks_generic(message)
+            || diag.contains("502")
+            || diag.contains("503")
+            || diag.to_ascii_lowercase().contains("bad gateway")
+            || diag.to_ascii_lowercase().contains("unavailable");
+        if !already && useful {
+            parts.push(diag.to_string());
+        }
+    }
+    let joined = if parts.is_empty() {
+        "ACP 请求失败".to_string()
+    } else {
+        parts.join(" — ")
+    };
+    explain_upstream(joined)
+}
+
 fn user_facing_diagnostic(line: &str) -> Option<String> {
     let ansi = regex_lite_strip(line);
     let plain = ansi.trim();
@@ -770,5 +893,20 @@ mod tests {
             Some("boom")
         );
         assert!(user_facing_diagnostic("2026-08-24 WARN leftover").is_none());
+    }
+
+    #[test]
+    fn formats_internal_error_with_upstream_status() {
+        let error = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": "responses API error status=502 Bad Gateway"
+        });
+        let formatted = format_rpc_error(
+            &error,
+            Some("responses API error status=502 Bad Gateway model_id=grok-4.6"),
+        );
+        assert!(formatted.contains("502"));
+        assert!(formatted.contains("上游"));
     }
 }
