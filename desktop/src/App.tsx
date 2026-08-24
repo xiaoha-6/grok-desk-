@@ -73,6 +73,8 @@ import {
 
 const LEGACY_CONTEXT_WINDOW = 225000;
 const DEFAULT_CONTEXT_WINDOW = 500000;
+const HISTORY_PAGE = 48;
+const VIEW_PAGE = 40;
 const MAX_ATTACHMENTS = 8;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 
@@ -132,6 +134,22 @@ function toolMeta(update: Record<string, unknown>) {
   return asRecord(meta?.["x.ai/tool"]) || asRecord(meta?.tool);
 }
 
+const MAX_LIVE_EVENTS = 80;
+
+function compactEvents(events: TimelineEvent[]): TimelineEvent[] {
+  if (events.length <= MAX_LIVE_EVENTS) return events;
+  const dropped = events.length - MAX_LIVE_EVENTS;
+  return [
+    {
+      id: "folded-events",
+      kind: "context",
+      title: `已折叠 ${dropped} 个早期步骤`,
+      status: "completed",
+    },
+    ...events.slice(-MAX_LIVE_EVENTS),
+  ];
+}
+
 function upsertEvent(events: TimelineEvent[], event: TimelineEvent) {
   const index = events.findIndex((item) => item.id === event.id);
   if (index >= 0) {
@@ -143,9 +161,9 @@ function upsertEvent(events: TimelineEvent[], event: TimelineEvent) {
       output: event.output ?? next[index].output,
       diffs: event.diffs?.length ? event.diffs : next[index].diffs,
     };
-    return next;
+    return compactEvents(next);
   }
-  return [...events, event];
+  return compactEvents([...events, event]);
 }
 
 function extensionKind(method: string) {
@@ -195,9 +213,10 @@ function persistConversations(list: Conversation[]): Conversation[] {
     ...item,
     messages: item.grokSessionId
       ? []
-      : item.messages.map((message) => ({
+      : item.messages.slice(-30).map((message) => ({
           ...message,
           streaming: false,
+          events: (message.events || []).slice(-12),
           media: (message.media || []).map((media) => ({ ...media, data: undefined })),
         })),
   }));
@@ -388,6 +407,7 @@ export default function App() {
     }));
   });
   const [selectedId, setSelectedId] = useState<string | null>(saved.selectedId || null);
+  const [shownCount, setShownCount] = useState(VIEW_PAGE);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
   const [addingAccount, setAddingAccount] = useState(false);
@@ -436,6 +456,8 @@ export default function App() {
   const relayQuotaRef = useRef(relayQuota);
   const relayReadyRef = useRef(relayReady);
   const historyLoadedRef = useRef(new Set<string>());
+  const historyBusyRef = useRef(false);
+  const shownCountRef = useRef(VIEW_PAGE);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -450,6 +472,7 @@ export default function App() {
   availableModelsRef.current = availableModels;
   relayQuotaRef.current = relayQuota;
   relayReadyRef.current = relayReady;
+  shownCountRef.current = shownCount;
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
@@ -894,19 +917,28 @@ export default function App() {
     }
   }, [patchSettings]);
 
-  const loadSessionHistory = useCallback(async (conversationId: string) => {
+  const loadSessionHistory = useCallback(async (conversationId: string, older = false) => {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
-    if (!conversation?.grokSessionId || historyLoadedRef.current.has(conversationId)) return;
-    if (conversation.messages.length > 0) {
+    if (!conversation?.grokSessionId || historyBusyRef.current) return;
+    if (!older) {
+      if (historyLoadedRef.current.has(conversationId)) return;
+      if (conversation.messages.length > 0) {
+        historyLoadedRef.current.add(conversationId);
+        return;
+      }
       historyLoadedRef.current.add(conversationId);
+    } else if (conversation.historyHasMore === false) {
       return;
     }
-    historyLoadedRef.current.add(conversationId);
+    historyBusyRef.current = true;
+    const skip = older ? conversation.messages.length : 0;
     try {
       const history = await invoke<LocalSessionHistory>("load_session_history", {
         sessionId: conversation.grokSessionId,
+        limit: HISTORY_PAGE,
+        skip,
       });
-      const messages: ChatMessage[] = (history.messages || []).map((item) => ({
+      const incoming: ChatMessage[] = (history.messages || []).map((item) => ({
         id: uid(),
         role: item.role === "assistant" ? "assistant" : "user",
         text: item.text || "",
@@ -915,10 +947,25 @@ export default function App() {
         media: [],
         streaming: false,
       }));
+      const el = transcriptRef.current;
+      const prevHeight = el?.scrollHeight || 0;
+      const prevTop = el?.scrollTop || 0;
       setConversations((list) =>
-        list.map((item) => (item.id === conversationId && item.messages.length === 0 ? { ...item, messages } : item)),
+        list.map((item) => {
+          if (item.id !== conversationId) return item;
+          const messages = older ? [...incoming, ...item.messages] : item.messages.length ? item.messages : incoming;
+          return { ...item, messages, historyHasMore: Boolean(history.hasMore) };
+        }),
       );
-      if (history.usedTokens != null) {
+      if (older) {
+        setShownCount((count) => count + incoming.length);
+        requestAnimationFrame(() => {
+          const box = transcriptRef.current;
+          if (!box) return;
+          box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+        });
+      }
+      if (!older && history.usedTokens != null) {
         setUsage({
           usedTokens: Number(history.usedTokens) || 0,
           totalTokens: Number(history.totalTokens) || settingsRef.current.contextWindowTokens,
@@ -926,7 +973,9 @@ export default function App() {
         });
       }
     } catch {
-      historyLoadedRef.current.delete(conversationId);
+      if (!older) historyLoadedRef.current.delete(conversationId);
+    } finally {
+      historyBusyRef.current = false;
     }
   }, []);
 
@@ -1261,6 +1310,7 @@ export default function App() {
 
   function selectConversation(id: string) {
     setSelectedId(id);
+    setShownCount(VIEW_PAGE);
     setView("chat");
     followRef.current = true;
     void loadSessionHistory(id);
@@ -1493,6 +1543,21 @@ export default function App() {
     const el = transcriptRef.current;
     if (!el) return;
     followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
+    if (el.scrollTop > 96) return;
+    const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+    if (!conversation) return;
+    if (shownCountRef.current < conversation.messages.length) {
+      const prevHeight = el.scrollHeight;
+      const prevTop = el.scrollTop;
+      setShownCount((count) => Math.min(conversation.messages.length, count + VIEW_PAGE));
+      requestAnimationFrame(() => {
+        const box = transcriptRef.current;
+        if (!box) return;
+        box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+      });
+      return;
+    }
+    if (conversation.historyHasMore !== false) void loadSessionHistory(conversation.id, true);
   }
 
   function beginResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1841,7 +1906,23 @@ export default function App() {
             </div>
           ) : (
             <div className="messages">
-              {selected.messages.map((message) => (
+              {selected.historyHasMore || shownCount < selected.messages.length ? (
+                <button
+                  className="ghost compact history-more"
+                  type="button"
+                  disabled={historyBusyRef.current}
+                  onClick={() => {
+                    if (shownCount < selected.messages.length) {
+                      setShownCount((count) => Math.min(selected.messages.length, count + VIEW_PAGE));
+                    } else {
+                      void loadSessionHistory(selected.id, true);
+                    }
+                  }}
+                >
+                  {t.loadOlder}
+                </button>
+              ) : null}
+              {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (
                 <article key={message.id} className={`row ${message.role}`}>
                   <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
                     {message.role === "assistant" && message.events.length ? (

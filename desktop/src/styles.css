@@ -354,6 +354,15 @@ button { background: none; }
   display: grid;
   gap: 26px;
 }
+.history-more {
+  justify-self: center;
+  margin-bottom: 4px;
+}
+.timeline-folded {
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 4px 0 8px 28px;
+}
 .row.user { display: flex; justify-content: flex-end; }
 .bubble {
   max-width: 100%;

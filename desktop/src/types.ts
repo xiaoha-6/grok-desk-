@@ -111,6 +111,7 @@ export type Conversation = {
   messages: ChatMessage[];
   updatedAt: number;
   archivedAt?: number;
+  historyHasMore?: boolean;
 };
 
 export type LocalSessionSummary = {
@@ -128,6 +129,7 @@ export type LocalSessionHistory = {
   usedTokens?: number | null;
   totalTokens?: number | null;
   compactionCount?: number | null;
+  hasMore?: boolean;
 };
 
 export type QuotaSnapshot = {

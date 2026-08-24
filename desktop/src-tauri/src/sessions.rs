@@ -46,6 +46,7 @@ pub struct LocalSessionHistory {
     pub used_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub compaction_count: Option<u64>,
+    pub has_more: bool,
 }
 
 pub fn list_local_sessions() -> Vec<LocalSessionSummary> {
@@ -57,14 +58,18 @@ pub fn list_local_sessions() -> Vec<LocalSessionSummary> {
     out
 }
 
-pub fn load_session_history(session_id: &str) -> Result<LocalSessionHistory, String> {
+pub fn load_session_history(
+    session_id: &str,
+    limit: usize,
+    skip: usize,
+) -> Result<LocalSessionHistory, String> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return Err("缺少 session id".into());
     }
     let dir = find_session_dir(&grok_home().join("sessions"), session_id)
         .ok_or_else(|| "找不到本机 Grok 对话".to_string())?;
-    let messages = parse_chat_history(&dir.join("chat_history.jsonl"));
+    let (messages, has_more) = parse_chat_history(&dir.join("chat_history.jsonl"), limit.max(1), skip);
     let (used_tokens, total_tokens, compaction_count) = parse_signals(&dir.join("signals.json"));
     Ok(LocalSessionHistory {
         session_id: session_id.to_string(),
@@ -72,6 +77,7 @@ pub fn load_session_history(session_id: &str) -> Result<LocalSessionHistory, Str
         used_tokens,
         total_tokens,
         compaction_count,
+        has_more,
     })
 }
 
@@ -172,44 +178,107 @@ fn parse_summary(path: &Path) -> Option<LocalSessionSummary> {
     })
 }
 
-fn parse_chat_history(path: &Path) -> Vec<LocalSessionMessage> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
+fn parse_chat_history(path: &Path, limit: usize, skip: usize) -> (Vec<LocalSessionMessage>, bool) {
+    let Ok(bytes) = fs::read(path) else {
+        return (Vec::new(), false);
     };
-    let mut messages = Vec::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    let ranges = line_ranges(&bytes);
+    let mut collected = Vec::new();
+    let mut seen = 0usize;
+    let mut has_more = false;
+    for range in ranges.into_iter().rev() {
+        let line = &bytes[range];
+        if line.is_empty() {
             continue;
-        };
-        let Some(kind) = value.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if kind == "user" {
-            if value.get("prompt_index").is_none() {
-                continue;
-            }
-            let raw = content_text(&value);
-            let text = extract_user_query(&raw);
-            if !text.is_empty() {
-                messages.push(LocalSessionMessage {
-                    role: "user".into(),
-                    text,
-                });
-            }
-        } else if kind == "assistant" {
-            let text = content_text(&value);
-            if !text.is_empty() {
-                messages.push(LocalSessionMessage {
-                    role: "assistant".into(),
-                    text,
-                });
-            }
         }
-        if messages.len() >= 800 {
+        if !looks_like_chat_line(line) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let Some(message) = chat_message_from_value(&value) else {
+            continue;
+        };
+        seen += 1;
+        if seen <= skip {
+            continue;
+        }
+        collected.push(message);
+        if collected.len() >= limit {
+            has_more = true;
             break;
         }
     }
-    messages
+    if !has_more {
+        has_more = seen > skip + collected.len();
+    }
+    collected.reverse();
+    (collected, has_more)
+}
+
+fn line_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            ranges.push(start..index);
+            start = index + 1;
+        }
+    }
+    if start < bytes.len() {
+        ranges.push(start..bytes.len());
+    }
+    ranges
+}
+
+fn looks_like_chat_line(line: &[u8]) -> bool {
+    const USER: &[u8] = br#""type":"user""#;
+    const ASSISTANT: &[u8] = br#""type":"assistant""#;
+    memmem(line, USER) || memmem(line, ASSISTANT)
+}
+
+fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn chat_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
+    let kind = value.get("type")?.as_str()?;
+    if kind == "user" {
+        if value.get("prompt_index").is_none() {
+            return None;
+        }
+        let text = extract_user_query(&content_text(value));
+        if text.is_empty() {
+            return None;
+        }
+        Some(LocalSessionMessage {
+            role: "user".into(),
+            text: truncate_text(&text, 12_000),
+        })
+    } else if kind == "assistant" {
+        let text = content_text(value);
+        if text.is_empty() {
+            return None;
+        }
+        Some(LocalSessionMessage {
+            role: "assistant".into(),
+            text: truncate_text(&text, 16_000),
+        })
+    } else {
+        None
+    }
+}
+
+fn truncate_text(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…", &text[..end])
 }
 
 fn parse_signals(path: &Path) -> (Option<u64>, Option<u64>, Option<u64>) {
@@ -376,11 +445,15 @@ mod tests {
         let summary = parse_summary(&session.join("summary.json")).unwrap();
         assert_eq!(summary.title, "您好");
         assert_eq!(summary.cwd, "/Users/ha");
-        let messages = parse_chat_history(&session.join("chat_history.jsonl"));
+        let (messages, has_more) = parse_chat_history(&session.join("chat_history.jsonl"), 40, 0);
+        assert!(!has_more);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text, "您好");
         assert_eq!(messages[1].text, "你好，我是 Grok");
+        let (latest, more) = parse_chat_history(&session.join("chat_history.jsonl"), 1, 0);
+        assert!(more);
+        assert_eq!(latest[0].text, "你好，我是 Grok");
         let _ = fs::remove_dir_all(&dir);
     }
 }

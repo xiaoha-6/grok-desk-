@@ -131,8 +131,19 @@ async fn list_local_sessions() -> Vec<LocalSessionSummary> {
 }
 
 #[tauri::command]
-async fn load_session_history(session_id: String) -> Result<LocalSessionHistory, String> {
-    run_blocking(move || sessions::load_session_history(&session_id)).await
+async fn load_session_history(
+    session_id: String,
+    limit: Option<u32>,
+    skip: Option<u32>,
+) -> Result<LocalSessionHistory, String> {
+    run_blocking(move || {
+        sessions::load_session_history(
+            &session_id,
+            limit.unwrap_or(48) as usize,
+            skip.unwrap_or(0) as usize,
+        )
+    })
+    .await
 }
 
 #[tauri::command]

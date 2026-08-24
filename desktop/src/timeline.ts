@@ -29,6 +29,11 @@ const REDUNDANT = new Set([
   "x.ai/settings/update",
   "x.ai/mcp initialized",
   "x.ai/mcp/servers updated",
+  "x.ai/mcp/init progress",
+  "x.ai/mcp/server status",
+  "response completed",
+  "image compressed",
+  "updating plan",
 ]);
 
 export function categoryTitle(category: ActivityCategory, lang: "zh" | "en") {

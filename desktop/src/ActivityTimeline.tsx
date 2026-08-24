@@ -12,7 +12,9 @@ import {
 import type { FileDiff, Lang, TimelineEvent } from "./types";
 
 function CodeDiff({ diff, lang }: { diff: FileDiff; lang: Lang }) {
-  const lines = lineDiff(diff.oldText, diff.newText);
+  const oldText = diff.oldText.length > 8000 ? `${diff.oldText.slice(0, 8000)}\n…` : diff.oldText;
+  const newText = diff.newText.length > 8000 ? `${diff.newText.slice(0, 8000)}\n…` : diff.newText;
+  const lines = lineDiff(oldText, newText);
   const path = fileLabel(diff.path);
   return (
     <div className="code-diff">
@@ -54,12 +56,14 @@ function Disclosure({
   );
 }
 
-function EventRow({ event, lang }: { event: TimelineEvent; lang: Lang }) {
+function clip(text: string, max = 1600) {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n…`;
+}
+
+function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang; startOpen?: boolean }) {
   const hasDiff = Boolean(event.diffs?.length);
-  const [open, setOpen] = useState(hasDiff || event.kind === "edit");
-  useEffect(() => {
-    if (hasDiff || event.kind === "edit") setOpen(true);
-  }, [hasDiff, event.kind]);
+  const [open, setOpen] = useState(Boolean(startOpen && (hasDiff || event.kind === "edit" || event.status === "in_progress")));
   const status = event.status ? statusLabel(event.status, lang) : "";
   const tone =
     event.status && /fail|error/i.test(event.status)
@@ -84,18 +88,18 @@ function EventRow({ event, lang }: { event: TimelineEvent; lang: Lang }) {
           {!hasDiff && event.input ? (
             <div className="timeline-block">
               <div className="timeline-kicker">{lang === "en" ? "Input" : "输入"}</div>
-              <pre>{event.input}</pre>
+              <pre>{clip(event.input)}</pre>
             </div>
           ) : null}
           {event.output && !hasDiff ? (
             event.kind === "thought" ? (
-              <pre className="thought-md">{event.output}</pre>
+              <pre className="thought-md">{clip(event.output, 4000)}</pre>
             ) : (
               <div className="timeline-block">
                 <div className="timeline-kicker">
                   {event.kind === "plan" ? (lang === "en" ? "Plan" : "内容") : lang === "en" ? "Result" : "结果"}
                 </div>
-                <pre>{event.output}</pre>
+                <pre>{clip(event.output)}</pre>
               </div>
             )
           ) : null}
@@ -109,12 +113,16 @@ function CategoryGroup({
   category,
   events,
   lang,
+  streaming,
 }: {
   category: ActivityCategory;
   events: TimelineEvent[];
   lang: Lang;
+  streaming?: boolean;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
+  const shown = streaming ? events.slice(-8) : events.slice(-4);
+  const hidden = events.length - shown.length;
   return (
     <div className="timeline-run">
       <Disclosure open={open} onToggle={() => setOpen((value) => !value)}>
@@ -126,8 +134,13 @@ function CategoryGroup({
       </Disclosure>
       {open ? (
         <div className="timeline-children">
-          {events.map((event) => (
-            <EventRow key={event.id} event={event} lang={lang} />
+          {hidden > 0 ? (
+            <div className="timeline-folded">
+              {lang === "en" ? `${hidden} earlier steps folded` : `已折叠 ${hidden} 个早期步骤`}
+            </div>
+          ) : null}
+          {shown.map((event) => (
+            <EventRow key={event.id} event={event} lang={lang} startOpen={streaming} />
           ))}
         </div>
       ) : null}
@@ -138,13 +151,16 @@ function CategoryGroup({
 export function ActivityTimeline({
   events,
   lang,
-  defaultOpen = true,
+  defaultOpen = false,
 }: {
   events: TimelineEvent[];
   lang: Lang;
   defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  useEffect(() => {
+    if (defaultOpen) setOpen(true);
+  }, [defaultOpen]);
   const visible = visibleEvents(events);
   const runs = groupRuns(events);
   if (!visible.length) return null;
@@ -160,7 +176,13 @@ export function ActivityTimeline({
       {open ? (
         <div className="timeline-children">
           {runs.map((run) => (
-            <CategoryGroup key={run.id} category={run.category} events={run.events} lang={lang} />
+            <CategoryGroup
+              key={run.id}
+              category={run.category}
+              events={run.events}
+              lang={lang}
+              streaming={defaultOpen}
+            />
           ))}
         </div>
       ) : null}
