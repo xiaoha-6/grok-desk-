@@ -1,6 +1,6 @@
 [package]
 name = "grokdesk"
-version = "0.3.0"
+version = "0.3.1"
 description = "GrokDesk — Windows/macOS helper for official Grok Build and Xiaoha relay import"
 authors = ["xiaoha"]
 edition = "2021"

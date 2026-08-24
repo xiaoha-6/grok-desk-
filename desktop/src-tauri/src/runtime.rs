@@ -151,14 +151,16 @@ pub fn launch_grok() -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let status = Command::new("cmd")
-            .args(["/C", "start", "", &binary.display().to_string()])
-            .status()
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+        let home = grok_home();
+        Command::new(&binary)
+            .current_dir(&home)
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(|_| ())
             .map_err(|err| format!("无法启动 Grok：{err}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err("启动 Grok 失败".into());
+        return Ok(());
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {

@@ -6,9 +6,11 @@ use config::{parse_deeplink, write_config, RelayImport};
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, launch_grok, runtime_status, RuntimeStatus};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_deep_link::DeepLinkExt;
+
+static PENDING_IMPORT: Mutex<Option<RelayImport>> = Mutex::new(None);
 
 #[tauri::command]
 fn get_runtime_status() -> RuntimeStatus {
@@ -32,6 +34,23 @@ fn open_grok() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn take_pending_import() -> Option<RelayImport> {
+    PENDING_IMPORT.lock().ok().and_then(|mut slot| slot.take())
+}
+
+fn focus_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        focus_window(&window);
+    }
+}
+
+fn focus_window(window: &WebviewWindow) {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+#[tauri::command]
 fn install_runtime(app: AppHandle) -> Result<String, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let app_for_log = app.clone();
@@ -49,6 +68,9 @@ fn emit_deeplink(app: &AppHandle, urls: Vec<String>) {
     for url in urls {
         match parse_deeplink(&url) {
             Ok(payload) => {
+                if let Ok(mut slot) = PENDING_IMPORT.lock() {
+                    *slot = Some(payload.clone());
+                }
                 let _ = app.emit("relay-import", payload);
             }
             Err(err) => {
@@ -56,6 +78,7 @@ fn emit_deeplink(app: &AppHandle, urls: Vec<String>) {
             }
         }
     }
+    focus_main_window(app);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,9 +94,8 @@ pub fn run() {
                 .collect::<Vec<_>>();
             if !urls.is_empty() {
                 emit_deeplink(&app, urls);
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
+            } else {
+                focus_main_window(&app);
             }
         }));
     }
@@ -103,6 +125,7 @@ pub fn run() {
             import_relay,
             parse_import_url,
             open_grok,
+            take_pending_import,
             install_runtime
         ])
         .run(tauri::generate_context!())

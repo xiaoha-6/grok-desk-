@@ -57,7 +57,9 @@ const zh = {
   backup: "已备份原配置",
   windowsHint: "Windows 官方安装命令：irm https://x.ai/cli/install.ps1 | iex",
   unixHint: "macOS / Linux 官方安装命令：curl -fsSL https://x.ai/cli/install.sh | bash",
-  afterImport: "导入完成后，在终端运行 grok inspect，再用 /model 选择 grok-4.5。",
+  afterImport: "写入成功后会自动打开 Grok。也可再点「打开 Grok」。",
+  launched: "已自动打开 Grok",
+  launchFailed: "配置已写入，但打开 Grok 失败",
 };
 
 const en = {
@@ -88,7 +90,9 @@ const en = {
   backup: "Previous config backed up",
   windowsHint: "Windows official install: irm https://x.ai/cli/install.ps1 | iex",
   unixHint: "macOS / Linux official install: curl -fsSL https://x.ai/cli/install.sh | bash",
-  afterImport: "After import, run grok inspect, then /model grok-4.5.",
+  afterImport: "Grok opens automatically after a successful write. You can also click Open Grok.",
+  launched: "Opened Grok",
+  launchFailed: "Config written, but opening Grok failed",
 };
 
 const lang = ref<"zh" | "en">("zh");
@@ -103,6 +107,7 @@ const importing = ref(false);
 const importMessage = ref("");
 const importError = ref("");
 const pending = ref<RelayImport | null>(null);
+let lastImportSig = "";
 
 const form = reactive<RelayImport>({
   endpoint: "https://api.xiaohaweb.com/v1",
@@ -153,7 +158,11 @@ async function launch() {
   }
 }
 
-async function applyImport(payload: RelayImport) {
+function importSig(payload: RelayImport) {
+  return `${payload.endpoint}\n${payload.apiKey}\n${payload.model}\n${payload.name}`;
+}
+
+async function applyImport(payload: RelayImport, autoLaunch = true) {
   importing.value = true;
   importError.value = "";
   importMessage.value = "";
@@ -170,6 +179,14 @@ async function applyImport(payload: RelayImport) {
         : `已写入 ${result.configPath}`) + backup;
     pending.value = null;
     await refresh();
+    if (autoLaunch && status.value?.installed) {
+      try {
+        await invoke("open_grok");
+        importMessage.value += `\n${t.value.launched}`;
+      } catch (error) {
+        importError.value = `${t.value.launchFailed}：${String(error)}`;
+      }
+    }
   } catch (error) {
     importError.value = String(error);
   } finally {
@@ -177,12 +194,24 @@ async function applyImport(payload: RelayImport) {
   }
 }
 
-function fillPending(payload: RelayImport) {
-  pending.value = payload;
+function fillForm(payload: RelayImport) {
   form.endpoint = payload.endpoint;
   form.apiKey = payload.apiKey;
   form.model = payload.model || "grok-4.5";
   form.name = payload.name || "小哈AI";
+}
+
+async function consumeDeeplink(payload: RelayImport) {
+  const sig = importSig(payload);
+  if (sig === lastImportSig) return;
+  lastImportSig = sig;
+  fillForm(payload);
+  try {
+    await invoke("take_pending_import");
+  } catch {
+    // ignore missing pending slot
+  }
+  await applyImport(payload, true);
 }
 
 onMounted(async () => {
@@ -195,7 +224,7 @@ onMounted(async () => {
   );
   stops.push(
     await listen<RelayImport>("relay-import", (event) => {
-      fillPending(event.payload);
+      void consumeDeeplink(event.payload);
     })
   );
   stops.push(
@@ -203,6 +232,14 @@ onMounted(async () => {
       importError.value = event.payload;
     })
   );
+  try {
+    const queued = await invoke<RelayImport | null>("take_pending_import");
+    if (queued) {
+      await consumeDeeplink(queued);
+    }
+  } catch {
+    // no queued deeplink
+  }
   onUnmounted(() => {
     stops.forEach((stop) => stop());
   });
