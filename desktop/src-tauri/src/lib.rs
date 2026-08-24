@@ -11,7 +11,9 @@ use accounts::{
     SkillRecord,
 };
 use acp::{AcpClient, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
-use config::{parse_deeplink, write_config, RelayImport, RelayQuota};
+use config::{
+    parse_deeplink, write_config, ModelCatalog, ModelListRequest, RelayImport, RelayQuota,
+};
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
 use serde::Deserialize;
@@ -117,6 +119,16 @@ async fn get_relay_quota() -> RelayQuota {
     tauri::async_runtime::spawn_blocking(|| config::fetch_relay_quota(&grok_home()))
         .await
         .unwrap_or_else(|_| config::fetch_relay_quota(&grok_home()))
+}
+
+#[tauri::command]
+async fn list_relay_models(payload: Option<ModelListRequest>) -> Result<ModelCatalog, String> {
+    run_blocking(move || config::fetch_model_catalog(&grok_home(), payload.as_ref())).await
+}
+
+#[tauri::command]
+async fn set_active_model(model: String, context_window: Option<u64>) -> Result<(), String> {
+    run_blocking(move || config::set_active_model(&grok_home(), &model, context_window)).await
 }
 
 #[tauri::command]
@@ -358,6 +370,8 @@ pub fn run() {
             get_runtime_status,
             import_relay,
             get_relay_quota,
+            list_relay_models,
+            set_active_model,
             read_clipboard_image,
             read_image_file,
             parse_import_url,

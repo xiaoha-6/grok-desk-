@@ -85,6 +85,11 @@ final class AppModel: ObservableObject {
         accounts = state.accounts; conversations = state.conversations
         selectedConversationID = state.selectedConversationID; settings = state.settings
         hiddenProjectPaths = state.hiddenProjectPaths ?? []
+        let legacyContextWindow = 225_000
+        let defaultContextWindow = 500_000
+        if settings.contextWindowTokens == nil || settings.contextWindowTokens == legacyContextWindow {
+            settings.contextWindowTokens = defaultContextWindow
+        }
         if let completed = settings.hasCompletedLanguageOnboarding {
             needsLanguageOnboarding = !completed
         } else if hadPersistedState {

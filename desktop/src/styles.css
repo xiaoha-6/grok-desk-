@@ -573,6 +573,27 @@ button { background: none; }
   word-break: break-all;
 }
 .row-control { flex: 0 0 auto; }
+.model-pick {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.model-pick select,
+.model-pick input {
+  min-width: 200px;
+  max-width: 280px;
+}
+.group.stacked .model-pick {
+  justify-content: flex-start;
+}
+.group.stacked .model-pick select,
+.group.stacked .model-pick input {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
 .row-control select, .row-control input, .group.stacked input {
   background: var(--input);
   border: 1px solid var(--hairline);

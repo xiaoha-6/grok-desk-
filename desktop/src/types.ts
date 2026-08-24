@@ -64,6 +64,18 @@ export type RelayQuota = {
   error?: string | null;
 };
 
+export type CatalogModel = {
+  id: string;
+  name: string;
+  contextWindow?: number | null;
+};
+
+export type ModelCatalog = {
+  models: CatalogModel[];
+  source: string;
+  endpoint?: string | null;
+};
+
 export type PromptAttachment = {
   mimeType?: string;
   data?: string;
@@ -225,12 +237,36 @@ export type SettingsPage =
   | "archived";
 
 export const MODELS = [
+  "grok-4.6",
   "grok-4.5",
   "grok-4.3",
   "grok-build-0.1",
   "grok-composer-2.5-fast",
   "grok-4.20-multi-agent-0309",
 ];
+
+export function fallbackCatalog(): CatalogModel[] {
+  return MODELS.map((id) => ({ id, name: id }));
+}
+
+export function mergeModelOptions(catalog: CatalogModel[] | undefined, current: string): CatalogModel[] {
+  const seen = new Set<string>();
+  const out: CatalogModel[] = [];
+  const add = (item: CatalogModel) => {
+    const id = String(item?.id || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push({
+      id,
+      name: String(item.name || id).trim() || id,
+      contextWindow: item.contextWindow,
+    });
+  };
+  (catalog || []).forEach(add);
+  if (current.trim()) add({ id: current.trim(), name: current.trim() });
+  if (!out.length) fallbackCatalog().forEach(add);
+  return out;
+}
 
 export const EFFORTS = [
   { id: "minimal", label: "Minimal" },

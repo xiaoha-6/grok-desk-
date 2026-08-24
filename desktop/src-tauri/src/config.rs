@@ -8,6 +8,7 @@ pub const DEFAULT_MODEL: &str = "grok-4.5";
 pub const DEFAULT_PROVIDER: &str = "小哈AI";
 
 const MANAGED_MODELS: &[(&str, &str, u64)] = &[
+    ("grok-4.6", "Grok 4.6", 500_000),
     ("grok-4.5", "Grok 4.5", 500_000),
     ("grok-build-0.1", "Grok Build", 256_000),
     ("grok-4.20-multi-agent-0309", "Grok 4.20 Multi Agent", 1_000_000),
@@ -337,6 +338,30 @@ impl RelayQuota {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogModel {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalog {
+    pub models: Vec<CatalogModel>,
+    pub source: String,
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListRequest {
+    pub endpoint: Option<String>,
+    pub api_key: Option<String>,
+}
+
 fn sidecar_path(grok_home: &Path) -> PathBuf {
     grok_home.join("grokdesk-relay.json")
 }
@@ -453,6 +478,285 @@ fn fetch_relay_quota_inner(profile: &RelayProfile) -> Result<RelayQuota, String>
     Err(last_error)
 }
 
+pub fn fetch_model_catalog(
+    grok_home: &Path,
+    request: Option<&ModelListRequest>,
+) -> Result<ModelCatalog, String> {
+    let profile = read_relay_profile(grok_home);
+    let endpoint = request
+        .and_then(|item| item.endpoint.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(with_v1)
+        .or_else(|| profile.as_ref().map(|item| item.endpoint.clone()));
+    let api_key = request
+        .and_then(|item| item.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| profile.as_ref().map(|item| item.api_key.clone()));
+
+    let mut last_error = "还没有可查询的中转站或 Grok 模型列表".to_string();
+    if let (Some(endpoint), Some(api_key)) = (endpoint.as_deref(), api_key.as_deref()) {
+        if !is_official_endpoint(endpoint) {
+            match fetch_relay_models(endpoint, api_key) {
+                Ok(models) if !models.is_empty() => {
+                    return Ok(ModelCatalog {
+                        models,
+                        source: "relay".into(),
+                        endpoint: Some(endpoint.to_string()),
+                    });
+                }
+                Ok(_) => last_error = "中转站没有返回可用模型".into(),
+                Err(error) => last_error = error,
+            }
+        }
+    }
+
+    match list_cli_models() {
+        Ok(models) if !models.is_empty() => Ok(ModelCatalog {
+            models,
+            source: "cli".into(),
+            endpoint,
+        }),
+        Ok(_) => Err(last_error),
+        Err(error) => Err(if last_error.contains("还没有可查询") {
+            error
+        } else {
+            last_error
+        }),
+    }
+}
+
+fn fetch_relay_models(endpoint: &str, api_key: &str) -> Result<Vec<CatalogModel>, String> {
+    let base = endpoint.trim_end_matches('/');
+    let value = http_json_get_timeout(&format!("{base}/models"), api_key, "15")?;
+    let models = parse_model_catalog(&value);
+    if models.is_empty() {
+        return Err("中转站没有返回可用模型".into());
+    }
+    Ok(models)
+}
+
+fn parse_model_catalog(value: &serde_json::Value) -> Vec<CatalogModel> {
+    let mut models = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let items = value
+        .get("data")
+        .and_then(|item| item.as_array())
+        .or_else(|| value.get("models").and_then(|item| item.as_array()))
+        .or_else(|| value.as_array());
+    if let Some(items) = items {
+        for item in items {
+            if let Some(model) = catalog_model_from_value(item) {
+                if seen.insert(model.id.clone()) {
+                    models.push(model);
+                }
+            }
+        }
+    }
+    models.sort_by(|left, right| {
+        model_rank(&left.id)
+            .cmp(&model_rank(&right.id))
+            .then_with(|| left.id.to_ascii_lowercase().cmp(&right.id.to_ascii_lowercase()))
+    });
+    models
+}
+
+fn catalog_model_from_value(value: &serde_json::Value) -> Option<CatalogModel> {
+    if let Some(id) = value.as_str().map(str::trim).filter(|item| !item.is_empty()) {
+        return Some(CatalogModel {
+            id: id.to_string(),
+            name: id.to_string(),
+            context_window: None,
+        });
+    }
+    let id = json_string(
+        value,
+        &["id", "model", "model_id", "modelId", "name"],
+    )?;
+    if id.is_empty() {
+        return None;
+    }
+    let name = json_string(value, &["display_name", "displayName", "name", "label"])
+        .filter(|item| !item.is_empty())
+        .unwrap_or_else(|| id.clone());
+    let context_window = json_number(
+        value,
+        &["context_window", "contextWindow", "context_window_tokens", "max_context"],
+    )
+    .and_then(|item| {
+        if item.is_finite() && item > 0.0 {
+            Some(item.round() as u64)
+        } else {
+            None
+        }
+    });
+    Some(CatalogModel {
+        id,
+        name,
+        context_window,
+    })
+}
+
+fn model_rank(id: &str) -> u8 {
+    let lower = id.to_ascii_lowercase();
+    if lower.starts_with("grok-4.6") {
+        0
+    } else if lower.starts_with("grok-4.5") {
+        1
+    } else if lower.contains("grok") {
+        2
+    } else {
+        3
+    }
+}
+
+fn list_cli_models() -> Result<Vec<CatalogModel>, String> {
+    let binary = crate::runtime::resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
+    let mut command = std::process::Command::new(&binary);
+    command
+        .arg("models")
+        .env("GROK_HOME", crate::runtime::grok_home())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    hide_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|err| format!("无法读取 Grok 模型列表：{err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "读取 Grok 模型列表失败：{}",
+            stderr.trim().chars().take(180).collect::<String>()
+        ));
+    }
+    let mut models = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        let id = if let Some(rest) = trimmed.strip_prefix("* ") {
+            rest
+        } else if let Some(rest) = trimmed.strip_prefix("- ") {
+            rest
+        } else {
+            continue;
+        };
+        let id = id.split_whitespace().next().unwrap_or("").trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        models.push(CatalogModel {
+            id: id.to_string(),
+            name: id.to_string(),
+            context_window: None,
+        });
+    }
+    models.sort_by(|left, right| {
+        model_rank(&left.id)
+            .cmp(&model_rank(&right.id))
+            .then_with(|| left.id.to_ascii_lowercase().cmp(&right.id.to_ascii_lowercase()))
+    });
+    Ok(models)
+}
+
+pub fn set_active_model(
+    grok_home: &Path,
+    model: &str,
+    context_window: Option<u64>,
+) -> Result<(), String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("缺少模型".into());
+    }
+    let path = grok_home.join("config.toml");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut text = fs::read_to_string(&path).map_err(|err| format!("读取配置失败：{err}"))?;
+    text = set_models_default(&text, model);
+    let escaped = toml_escape(model);
+    let has_block = text.contains(&format!("[model.\"{escaped}\"]"))
+        || text.contains(&format!("[model.{model}]"));
+    if !has_block {
+        if let Some(profile) = read_relay_profile(grok_home) {
+            if !is_official_endpoint(&profile.endpoint) {
+                let window = context_window.unwrap_or_else(|| {
+                    if model.to_ascii_lowercase().contains("grok") {
+                        500_000
+                    } else {
+                        200_000
+                    }
+                });
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push('\n');
+                text.push_str(&render_model_block(
+                    model,
+                    model,
+                    &profile.name,
+                    &profile.api_key,
+                    window,
+                ));
+            }
+        }
+    }
+    atomic_write(&path, text.as_bytes()).map_err(|err| format!("写入配置失败：{err}"))?;
+    if let Some(sidecar) = read_relay_sidecar(grok_home) {
+        let _ = write_relay_sidecar(
+            grok_home,
+            &RelayImport {
+                endpoint: sidecar.endpoint,
+                api_key: String::new(),
+                model: model.to_string(),
+                name: sidecar.name,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn set_models_default(text: &str, model: &str) -> String {
+    let replacement = format!("default = \"{}\"", toml_escape(model));
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut in_models = false;
+    let mut replaced = false;
+    let mut models_index = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_models = trimmed == "[models]";
+            if in_models {
+                models_index = Some(index);
+            }
+        }
+        if in_models
+            && trimmed.starts_with("default")
+            && !trimmed.starts_with("default_reasoning")
+            && trimmed.split_once('=').is_some()
+        {
+            lines[index] = replacement.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        if let Some(index) = models_index {
+            lines.insert(index + 1, replacement);
+        } else {
+            lines.push(String::new());
+            lines.push("[models]".into());
+            lines.push(replacement);
+        }
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 fn parse_relay_quota(value: &serde_json::Value) -> RelayQuota {
     let root = value
         .get("data")
@@ -532,13 +836,27 @@ fn value_as_f64(value: &serde_json::Value) -> Option<f64> {
         })
 }
 
+fn hide_window(command: &mut std::process::Command) {
+    let _ = command;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 fn http_json_get(url: &str, api_key: &str) -> Result<serde_json::Value, String> {
+    http_json_get_timeout(url, api_key, "8")
+}
+
+fn http_json_get_timeout(url: &str, api_key: &str, timeout_secs: &str) -> Result<serde_json::Value, String> {
     let mut command = std::process::Command::new("curl");
     command
         .arg("-sS")
         .arg("-f")
         .arg("-m")
-        .arg("8")
+        .arg(timeout_secs)
         .arg("-H")
         .arg(format!("Authorization: Bearer {api_key}"))
         .arg("-H")
@@ -546,20 +864,15 @@ fn http_json_get(url: &str, api_key: &str) -> Result<serde_json::Value, String> 
         .arg(url)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    hide_window(&mut command);
     let output = command
         .output()
-        .map_err(|err| format!("无法查询中转站额度：{err}"))?;
+        .map_err(|err| format!("无法连接中转站：{err}"))?;
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
-        return Err(format!("中转站额度接口 HTTP {code}"));
+        return Err(format!("中转站接口 HTTP {code}"));
     }
-    serde_json::from_slice(&output.stdout).map_err(|err| format!("中转站额度无法解析：{err}"))
+    serde_json::from_slice(&output.stdout).map_err(|err| format!("中转站响应无法解析：{err}"))
 }
 
 fn backup_if_exists(path: &Path) -> io::Result<Option<PathBuf>> {
@@ -681,6 +994,46 @@ mod tests {
     fn official_xai_endpoints_are_skipped() {
         assert!(is_official_endpoint("https://api.x.ai/v1"));
         assert!(!is_official_endpoint("https://api.xiaohaweb.com/v1"));
+    }
+
+    #[test]
+    fn parses_openai_and_grok_model_lists() {
+        let openai = parse_model_catalog(&serde_json::json!({
+            "object": "list",
+            "data": [
+                { "id": "gpt-4.1", "object": "model" },
+                { "id": "grok-4.5", "display_name": "Grok 4.5", "context_window": 500000 },
+                { "id": "grok-4.6" }
+            ]
+        }));
+        assert_eq!(openai[0].id, "grok-4.6");
+        assert_eq!(openai[1].id, "grok-4.5");
+        assert_eq!(openai[1].name, "Grok 4.5");
+        assert_eq!(openai[1].context_window, Some(500_000));
+        assert_eq!(openai[2].id, "gpt-4.1");
+
+        let patched = set_models_default(
+            "[models]\ndefault = \"grok-4.5\"\ndefault_reasoning_effort = \"xhigh\"\n",
+            "grok-4.6",
+        );
+        assert!(patched.contains("default = \"grok-4.6\""));
+        assert!(patched.contains("default_reasoning_effort = \"xhigh\""));
+    }
+
+    #[test]
+    fn render_includes_grok_46() {
+        let cfg = render_config(
+            &RelayImport {
+                endpoint: "https://api.xiaohaweb.com/v1".into(),
+                api_key: "sk-test".into(),
+                model: "grok-4.6".into(),
+                name: "小哈AI".into(),
+            }
+            .normalized()
+            .unwrap(),
+        );
+        assert!(cfg.contains("[model.\"grok-4.6\"]"));
+        assert!(cfg.contains("default = \"grok-4.6\""));
     }
 
     #[test]

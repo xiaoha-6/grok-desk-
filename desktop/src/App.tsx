@@ -38,19 +38,21 @@ import { isRedundantExtension, jsonText } from "./timeline";
 import {
   defaultSettings,
   EFFORTS,
-  MODELS,
+  mergeModelOptions,
   PERMISSION_MODES,
   type AccountRecord,
   type AccountState,
   type AcpTurnDone,
   type AcpUpdate,
   type AppSettings,
+  type CatalogModel,
   type ChatMessage,
   type ContextUsage,
   type Conversation,
   type ImportResult,
   type Lang,
   type MessageMedia,
+  type ModelCatalog,
   type PendingPermission,
   type PendingPlan,
   type PendingQuestion,
@@ -282,6 +284,7 @@ type PersistShape = {
   form?: Partial<RelayImport>;
   sidebarWidth?: number;
   settings?: Partial<AppSettings>;
+  availableModels?: CatalogModel[];
 };
 
 function loadPersist(): PersistShape {
@@ -326,9 +329,15 @@ export default function App() {
   const [form, setForm] = useState<RelayImport>({
     endpoint: saved.form?.endpoint || "https://api.xiaohaweb.com/v1",
     apiKey: "",
-    model: saved.form?.model || "grok-4.5",
+    model: saved.form?.model || saved.model || "grok-4.5",
     name: saved.form?.name || "小哈AI",
   });
+  const [availableModels, setAvailableModels] = useState<CatalogModel[]>(
+    Array.isArray(saved.availableModels) ? saved.availableModels : [],
+  );
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState("");
+  const [modelsMessage, setModelsMessage] = useState("");
   const [settings, setSettings] = useState<AppSettings>(() => migrateSettings(saved.settings));
   const [conversations, setConversations] = useState<Conversation[]>(() => {
     return (saved.conversations || []).map((item) => ({
@@ -385,6 +394,8 @@ export default function App() {
   const accountsRef = useRef(accounts);
   const pendingImagesRef = useRef(pendingImages);
   const pasteHandledRef = useRef(false);
+  const formRef = useRef(form);
+  const availableModelsRef = useRef(availableModels);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -395,6 +406,8 @@ export default function App() {
   settingsRef.current = settings;
   accountsRef.current = accounts;
   pendingImagesRef.current = pendingImages;
+  formRef.current = form;
+  availableModelsRef.current = availableModels;
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
@@ -440,6 +453,7 @@ export default function App() {
   }, [conversations, homeDir, t.home]);
 
   const effortLabel = EFFORTS.find((item) => item.id === settings.reasoningEffort)?.label || settings.reasoningEffort;
+  const modelOptions = useMemo(() => mergeModelOptions(availableModels, model), [availableModels, model]);
   const usagePercent = Math.round(
     Math.min(100, Math.max(0, usage.totalTokens ? (usage.usedTokens / usage.totalTokens) * 100 : 0)),
   );
@@ -462,9 +476,10 @@ export default function App() {
         sidebarWidth,
         settings,
         form: { ...form, apiKey: "" },
+        availableModels,
       }),
     );
-  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings]);
+  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings, availableModels]);
 
   useEffect(() => {
     setUsage((current) =>
@@ -837,6 +852,50 @@ export default function App() {
     }
   }, []);
 
+  const selectModel = useCallback((id: string) => {
+    const next = id.trim();
+    if (!next) return;
+    setModel(next);
+    setForm((current) => (current.model === next ? current : { ...current, model: next }));
+    const item = availableModelsRef.current.find((entry) => entry.id === next);
+    void invoke("set_active_model", {
+      model: next,
+      contextWindow: item?.contextWindow ?? null,
+    }).catch(() => undefined);
+  }, []);
+
+  const loadRelayModels = useCallback(
+    async (fromForm = false) => {
+      setModelsLoading(true);
+      setModelsError("");
+      setModelsMessage("");
+      try {
+        const currentForm = formRef.current;
+        const payload =
+          fromForm && currentForm.endpoint.trim()
+            ? { endpoint: currentForm.endpoint.trim(), apiKey: currentForm.apiKey.trim() }
+            : null;
+        const catalog = await invoke<ModelCatalog>("list_relay_models", { payload });
+        const models = catalog.models || [];
+        setAvailableModels(models);
+        if (!models.length) {
+          setModelsError(tRef.current.modelsEmpty);
+          return;
+        }
+        setModelsMessage(`${tRef.current.modelsFetched} (${models.length})`);
+        const current = modelRef.current || currentForm.model;
+        if (!models.some((item) => item.id === current)) {
+          selectModel(models[0].id);
+        }
+      } catch (error) {
+        setModelsError(String(error));
+      } finally {
+        setModelsLoading(false);
+      }
+    },
+    [selectModel],
+  );
+
   const addPendingImages = useCallback((items: PromptAttachment[]) => {
     setPendingImages((current) => {
       const next = [...current];
@@ -895,6 +954,7 @@ export default function App() {
         setImportMessage(`${tRef.current.wrote} ${result.configPath}${backup}\n${tRef.current.imported}`);
         await refresh();
         await loadRelayQuota();
+        await loadRelayModels(false);
         setView("chat");
         setStatusText(tRef.current.imported);
         try {
@@ -910,7 +970,7 @@ export default function App() {
         setImporting(false);
       }
     },
-    [loadRelayQuota, refresh],
+    [loadRelayModels, loadRelayQuota, refresh],
   );
 
   const consumeDeeplink = useCallback(
@@ -975,6 +1035,7 @@ export default function App() {
       const runtime = await refresh();
       await loadAccounts();
       void loadRelayQuota();
+      void loadRelayModels(false);
       await refreshSkills();
       const path = cwdRef.current || runtime?.homeDir || "";
       const ensured = ensureConversation(conversationsRef.current, selectedIdRef.current, path);
@@ -1038,7 +1099,7 @@ export default function App() {
       alive = false;
       stops.forEach((stop) => stop());
     };
-  }, [ensureConversation, loadAccounts, loadRelayQuota, refresh, refreshQuotas, refreshSkills]);
+  }, [ensureConversation, loadAccounts, loadRelayModels, loadRelayQuota, refresh, refreshQuotas, refreshSkills]);
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
@@ -1452,7 +1513,12 @@ export default function App() {
           }
         }}
         model={model}
-        setModel={setModel}
+        setModel={selectModel}
+        availableModels={availableModels}
+        modelsLoading={modelsLoading}
+        modelsError={modelsError}
+        modelsMessage={modelsMessage}
+        onRefreshModels={(fromForm) => void loadRelayModels(Boolean(fromForm))}
         cwd={cwd}
         applyCwd={applyCwd}
         status={status}
@@ -1801,13 +1867,13 @@ export default function App() {
               <span className="hint inline">{`${model} · ${effortLabel}`}</span>
               <select
                 className="model-mini"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
+                value={modelOptions.some((item) => item.id === model) ? model : modelOptions[0]?.id || model}
+                onChange={(event) => selectModel(event.target.value)}
                 disabled={running}
               >
-                {MODELS.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
+                {modelOptions.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name && item.name !== item.id ? `${item.name} · ${item.id}` : item.id}
                   </option>
                 ))}
               </select>

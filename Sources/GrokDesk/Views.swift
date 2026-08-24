@@ -2435,9 +2435,9 @@ struct SettingsView: View {
                     Text("ACP").foregroundStyle(.secondary)
                 }
                 Divider()
-                SettingsRow(title: "Context window", detail: "Grok Build 上下文窗口上限；默认 225k，新连接生效") {
+                SettingsRow(title: "Context window", detail: "Grok Build 上下文窗口上限；默认 500k，与 CLI 一致，新连接生效") {
                     HStack(spacing: 6) {
-                        TextField("225000", value: contextWindowTokens, format: .number.grouping(.never))
+                        TextField("500000", value: contextWindowTokens, format: .number.grouping(.never))
                             .multilineTextAlignment(.trailing).frame(width: 100)
                         Text("tokens").foregroundStyle(.secondary)
                     }

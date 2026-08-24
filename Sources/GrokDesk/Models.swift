@@ -189,7 +189,7 @@ struct AppSettings: Codable, Hashable {
     /// an explicit language choice before entering the workspace.
     var hasCompletedLanguageOnboarding: Bool?
 
-    var effectiveContextWindowTokens: Int { max(contextWindowTokens ?? 225_000, 16_000) }
+    var effectiveContextWindowTokens: Int { max(contextWindowTokens ?? 500_000, 16_000) }
     var effectiveAutoCompactThresholdPercent: Int {
         min(max(autoCompactThresholdPercent ?? 85, 50), 99)
     }

@@ -1,6 +1,6 @@
 Unicode True
 !define PRODUCT_NAME "GrokDesk"
-!define PRODUCT_VERSION "0.6.2"
+!define PRODUCT_VERSION "0.6.3"
 !define PRODUCT_PUBLISHER "小哈AI"
 !define PRODUCT_EXE "GrokDesk.exe"
 !define PROTOCOL "grokdesk"

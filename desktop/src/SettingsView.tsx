@@ -12,9 +12,10 @@ import {
 } from "./icons";
 import type { Copy } from "./i18n";
 import {
-  MODELS,
+  mergeModelOptions,
   type AccountRecord,
   type AppSettings,
+  type CatalogModel,
   type Lang,
   type RelayImport,
   type RelayQuota,
@@ -40,6 +41,46 @@ export function SettingsRow({
         {detail ? <div className="row-detail">{detail}</div> : null}
       </div>
       {children ? <div className="row-control">{children}</div> : null}
+    </div>
+  );
+}
+
+function ModelSelect({
+  value,
+  options,
+  onChange,
+  onRefresh,
+  loading,
+  refreshLabel,
+  allowCustom,
+}: {
+  value: string;
+  options: CatalogModel[];
+  onChange: (value: string) => void;
+  onRefresh?: () => void;
+  loading?: boolean;
+  refreshLabel?: string;
+  allowCustom?: boolean;
+}) {
+  const current = options.some((item) => item.id === value) ? value : options[0]?.id || value;
+  return (
+    <div className="model-pick">
+      {options.length || !allowCustom ? (
+        <select value={current} onChange={(event) => onChange(event.target.value)} disabled={loading}>
+          {options.map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.name && item.name !== item.id ? `${item.name} · ${item.id}` : item.id}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input value={value} spellCheck={false} onChange={(event) => onChange(event.target.value)} placeholder="grok-4.5" />
+      )}
+      {onRefresh ? (
+        <button className="ghost" type="button" disabled={loading} onClick={onRefresh}>
+          {refreshLabel}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -73,6 +114,11 @@ export function SettingsView(props: {
   patchSettings: (patch: Partial<AppSettings>) => void;
   model: string;
   setModel: (model: string) => void;
+  availableModels: CatalogModel[];
+  modelsLoading: boolean;
+  modelsError: string;
+  modelsMessage: string;
+  onRefreshModels: (fromForm?: boolean) => void;
   cwd: string;
   applyCwd: (path: string) => void;
   status: RuntimeStatus | null;
@@ -133,6 +179,7 @@ export function SettingsView(props: {
         : props.settings.routingMode === "fixed"
           ? copy.routingFixedHint
           : copy.routingQuotaHint;
+  const modelOptions = mergeModelOptions(props.availableModels, props.model || props.form.model);
   const filteredSkills = useMemo(() => {
     const q = props.skillsQuery.trim().toLowerCase();
     if (!q) return props.skills;
@@ -191,13 +238,14 @@ export function SettingsView(props: {
               </section>
               <section className="group">
                 <SettingsRow title={copy.model} detail={copy.modelDetail}>
-                  <select value={props.model} onChange={(event) => props.setModel(event.target.value)}>
-                    {MODELS.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
-                      </option>
-                    ))}
-                  </select>
+                  <ModelSelect
+                    value={props.model}
+                    options={modelOptions}
+                    onChange={props.setModel}
+                    onRefresh={() => props.onRefreshModels(false)}
+                    loading={props.modelsLoading}
+                    refreshLabel={props.modelsLoading ? copy.fetchingModels : copy.fetchModels}
+                  />
                 </SettingsRow>
                 <SettingsRow title={copy.workspace} detail={copy.workspaceDetail}>
                   <input value={props.cwd} spellCheck={false} onChange={(event) => props.applyCwd(event.target.value)} />
@@ -310,10 +358,14 @@ export function SettingsView(props: {
                 <div className="two">
                   <label>
                     {copy.model}
-                    <input
-                      value={props.form.model}
-                      spellCheck={false}
-                      onChange={(event) => props.setForm({ ...props.form, model: event.target.value })}
+                    <ModelSelect
+                      value={props.form.model || props.model}
+                      options={modelOptions}
+                      onChange={props.setModel}
+                      onRefresh={() => props.onRefreshModels(true)}
+                      loading={props.modelsLoading}
+                      refreshLabel={props.modelsLoading ? copy.fetchingModels : copy.fetchModels}
+                      allowCustom
                     />
                   </label>
                   <label>
@@ -325,6 +377,8 @@ export function SettingsView(props: {
                   </label>
                 </div>
               </section>
+              {props.modelsMessage ? <p className="ok-text">{props.modelsMessage}</p> : null}
+              {props.modelsError ? <p className="error">{props.modelsError}</p> : null}
               {props.importMessage ? <p className="ok-text">{props.importMessage}</p> : null}
               {props.importError ? <p className="error">{props.importError}</p> : null}
               <div className="actions">
