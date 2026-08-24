@@ -358,9 +358,21 @@ button { background: none; }
   height: 1px;
   width: 100%;
 }
+.history-more-bar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 14px;
+  background: linear-gradient(var(--chat) 72%, transparent);
+}
 .history-more {
   justify-self: center;
-  margin: 4px 0 12px;
+}
+.history-start {
+  color: var(--text-3);
+  font-size: 12px;
 }
 .timeline-folded {
   color: var(--text-3);

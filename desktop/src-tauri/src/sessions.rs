@@ -29,6 +29,7 @@ pub struct LocalSessionSummary {
     pub cwd: String,
     pub created_at: u64,
     pub updated_at: u64,
+    pub message_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +176,11 @@ fn parse_summary(path: &Path) -> Option<LocalSessionSummary> {
         cwd,
         created_at,
         updated_at,
+        message_count: value
+            .get("num_chat_messages")
+            .and_then(Value::as_u64)
+            .or_else(|| value.get("num_messages").and_then(Value::as_u64))
+            .unwrap_or(0),
     })
 }
 
@@ -246,10 +252,13 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
 fn chat_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
     let kind = value.get("type")?.as_str()?;
     if kind == "user" {
-        if value.get("prompt_index").is_none() {
+        let raw = content_text(value);
+        if value.get("prompt_index").is_none()
+            && !raw.contains("<user_query>")
+        {
             return None;
         }
-        let text = extract_user_query(&content_text(value));
+        let text = extract_user_query(&raw);
         if text.is_empty() {
             return None;
         }
@@ -258,13 +267,23 @@ fn chat_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
             text: truncate_text(&text, 12_000),
         })
     } else if kind == "assistant" {
-        let text = content_text(value);
-        if text.is_empty() {
-            return None;
-        }
+        let raw = content_text(value);
+        let text = if raw.is_empty() {
+            let tools = value
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            if tools == 0 {
+                return None;
+            }
+            format!("调用了 {tools} 个工具")
+        } else {
+            truncate_text(&raw, 16_000)
+        };
         Some(LocalSessionMessage {
             role: "assistant".into(),
-            text: truncate_text(&text, 16_000),
+            text,
         })
     } else {
         None
@@ -445,6 +464,7 @@ mod tests {
         .unwrap();
         let summary = parse_summary(&session.join("summary.json")).unwrap();
         assert_eq!(summary.title, "您好");
+        assert_eq!(summary.message_count, 0);
         assert_eq!(summary.cwd, "/Users/ha");
         let (messages, has_more) = parse_chat_history(&session.join("chat_history.jsonl"), 40, 0);
         assert!(!has_more);

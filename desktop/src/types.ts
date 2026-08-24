@@ -122,6 +122,7 @@ export type LocalSessionSummary = {
   cwd: string;
   createdAt: number;
   updatedAt: number;
+  messageCount?: number;
 };
 
 export type LocalSessionHistory = {

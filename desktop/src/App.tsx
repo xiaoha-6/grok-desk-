@@ -1935,18 +1935,22 @@ export default function App() {
             <div className="messages">
               <div ref={topSentinelRef} className="history-sentinel" />
               {selected.grokSessionId && selected.historyHasMore !== false ? (
-                <button
-                  className="ghost compact history-more"
-                  type="button"
-                  disabled={loadingOlder}
-                  onClick={() => {
-                    setShownCount((count) => Math.max(count, selected.messages.length));
-                    void loadSessionHistory(selected.id, true);
-                  }}
-                >
-                  {loadingOlder ? t.loadingOlder : t.loadOlder}
-                </button>
-              ) : null}
+                <div className="history-more-bar">
+                  <button
+                    className="ghost compact history-more"
+                    type="button"
+                    disabled={loadingOlder}
+                    onClick={() => {
+                      setShownCount((count) => Math.max(count, selected.messages.length));
+                      void loadSessionHistory(selected.id, true);
+                    }}
+                  >
+                    {loadingOlder ? t.loadingOlder : t.loadOlder}
+                  </button>
+                </div>
+              ) : (
+                <div className="history-start">{t.historyStart}</div>
+              )}
               {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (
                 <article key={message.id} className={`row ${message.role}`}>
                   <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
