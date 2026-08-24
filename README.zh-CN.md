@@ -35,23 +35,47 @@ GrokDesk 是 Grok Build 的原生 macOS 体验层，而不是另一套通用 Age
 
 ## 系统要求
 
-- macOS 14 Sonoma 或更高版本
-- 当前预构建版本支持 Apple Silicon
-- Intel Mac 可以从源码构建
-- 可用的 Grok Build 账号
+- **Windows 10/11**（x64）：使用本仓库 `desktop/` 下的 Tauri 桌面端
+- **macOS 14 Sonoma 或更高版本**：SwiftUI ACP 工作台，或同一套 `desktop/` 连接器
+- 可用的 Grok Build（官方 CLI）或小哈中转站 API Key
 
-GrokDesk **不包含 Grok Build 源码或二进制**。首次启动时会检查设置路径、`~/.grok/bin/grok`、Homebrew 常见目录和 `PATH`。若未安装，App 会先征求确认，再按照 [Grok Build 官方仓库](https://github.com/xai-org/grok-build#installing-the-released-binary) 的说明调用 xAI 官方安装器；不会静默下载安装。
-
-也可以手动安装：
+GrokDesk **不包含 Grok Build 源码或二进制**。启动时会检测 `~/.grok/bin/grok`（Windows 为 `%USERPROFILE%\.grok\bin\grok.exe`）、Homebrew 常见目录和 `PATH`。若未安装，可点击「从官方安装」，只拉取 xAI 官方脚本，不会静默安装：
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
-grok --version
+curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux
+```
+
+```powershell
+irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
+```
+
+## 小哈中转站（像 CC Switch 一样导入）
+
+密钥页点击「导入 GrokDesk」会打开 `grokdesk://v1/import?...`。GrokDesk 备份现有 `~/.grok/config.toml` 后写入：
+
+- `[endpoints].models_base_url` → 小哈 `/v1`
+- `[auth].preferred_method = "api_key"`
+- 每个 `[model.*]` 使用 `api_backend = "responses"` 和内联 `api_key`（优先于 `grok login` 会话）
+
+也可在 **设置 → 中转站**（macOS Swift 版）或桌面端右侧表单手动粘贴地址和密钥。
+
+Windows / 跨平台连接器：
+
+```bash
+cd desktop
+pnpm install
+pnpm tauri dev      # 开发
+pnpm tauri build    # 在对应系统上打安装包
 ```
 
 ## 下载与安装
 
-从 [GitHub Releases](https://github.com/KAMIENDER/GrokDesk/releases) 下载 Apple Silicon DMG，打开后将 `GrokDesk.app` 拖到 `Applications` 快捷入口。ZIP 压缩包继续作为便携备用版本提供。
+小哈 fork 的 Windows / macOS 安装包发布在 [xiaoha-6/grok-desk- Releases](https://github.com/xiaoha-6/grok-desk-/releases)：
+
+- Windows x64：`GrokDesk-*-windows-x64-setup.exe`
+- macOS Apple Silicon：`GrokDesk-*-macos-arm64.dmg`
+
+上游 [KAMIENDER/GrokDesk](https://github.com/KAMIENDER/GrokDesk/releases) 的 ACP 工作台 **不会** 注册 `grokdesk://` 导入链接。要用密钥页一键导入小哈中转站，请安装本 fork。
 
 首次安装后，GrokDesk 会通过 Sparkle 从 GitHub Releases 检查新版本。可以在 **GrokDesk → 检查更新…** 手动检查，也可以在 **设置 → 通用 → 软件更新** 中启用定期检查和后台自动下载安装。更新压缩包在安装前会验证项目专用的 Sparkle EdDSA 签名。
 

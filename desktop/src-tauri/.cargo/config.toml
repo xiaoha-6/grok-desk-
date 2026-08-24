@@ -1,0 +1,7 @@
+# This machine (and some developer setups) put a non-compiler `cc` earlier on
+# PATH. Pin Apple clang so Tauri/Rust can link.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/clang"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/clang"

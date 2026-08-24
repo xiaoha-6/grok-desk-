@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   release:
+    # Sparkle/macOS ACP installer is the upstream KAMIENDER flow.
+    # This fork publishes Windows/macOS connectors via desktop.yml.
+    if: github.repository == 'KAMIENDER/GrokDesk'
     # Public repositories can use the standard runner without paid larger-runner
     # capacity. SwiftPM cross-builds arm64 so the published artifact remains
     # aligned with GrokDesk's documented Apple Silicon platform.

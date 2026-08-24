@@ -48,6 +48,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var needsLanguageOnboarding = false
     @Published private(set) var launchMode = AppLaunchMode.current
     @Published var demoWorkspaceRequest: DemoWorkspaceRequest?
+    @Published var pendingRelayImport: RelayImportPayload?
+    @Published var relayEndpoint = "https://api.xiaohaweb.com/v1"
+    @Published var relayApiKey = ""
+    @Published var relayModel = RelayImportPayload.defaultModel
+    @Published var relayName = RelayImportPayload.defaultName
+    @Published var relayImportMessage: String?
+    @Published var relayImportError: String?
 
     private let cli = CLIProcessService()
     private let runtimeInstaller = GrokRuntimeInstaller()
@@ -224,6 +231,47 @@ final class AppModel: ObservableObject {
         }
         if offerInstall { showRuntimeInstallPrompt = true }
         return false
+    }
+
+    func handleOpenURL(_ url: URL) {
+        guard let payload = RelayImportPayload.parse(url) else { return }
+        applyRelayPayload(payload, confirm: true)
+    }
+
+    func applyRelayPayload(_ payload: RelayImportPayload, confirm: Bool) {
+        relayEndpoint = payload.endpoint
+        relayApiKey = payload.apiKey
+        relayModel = payload.model
+        relayName = payload.name
+        sidebarSection = .settings
+        settingsPage = "中转站"
+        if confirm {
+            pendingRelayImport = payload
+        }
+    }
+
+    func importRelayConfig(_ payload: RelayImportPayload? = nil) {
+        let source = payload ?? RelayImportPayload(
+            endpoint: relayEndpoint,
+            apiKey: relayApiKey,
+            model: relayModel,
+            name: relayName
+        )
+        relayImportError = nil
+        relayImportMessage = nil
+        do {
+            let result = try RelayConfigWriter.write(source)
+            var message = localized("已写入 Grok 配置") + "：\(result.configPath.path)"
+            if let backup = result.backupPath {
+                message += "\n" + localized("已备份原配置") + "：\(backup.path)"
+            }
+            relayImportMessage = message
+            pendingRelayImport = nil
+            statusText = localized("中转站配置已导入")
+        } catch {
+            relayImportError = error.localizedDescription
+            statusText = localized("中转站配置导入失败")
+        }
     }
 
     func installLatestRuntime() {

@@ -75,6 +75,9 @@ struct ContentView: View {
         .sheet(item: $model.demoWorkspaceRequest) { request in
             DemoWorkspacePickerView(request: request)
         }
+        .sheet(item: $model.pendingRelayImport) { payload in
+            RelayImportConfirmSheet(payload: payload)
+        }
         .alert("需要安装 Grok Build", isPresented: $model.showRuntimeInstallPrompt) {
             Button("稍后", role: .cancel) { }
             Button("安装最新版") { model.installLatestRuntime() }
@@ -2214,6 +2217,7 @@ struct MessageMediaView: View {
 private enum SettingsSection: String, CaseIterable, Identifiable {
     case general = "通用"
     case runtime = "Grok Runtime"
+    case relay = "中转站"
     case agent = "Agent 能力"
     case compatibility = "兼容性"
     case skills = "Skills"
@@ -2224,6 +2228,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "gearshape"
         case .runtime: return "terminal"
+        case .relay: return "arrow.triangle.2.circlepath"
         case .agent: return "sparkles"
         case .compatibility: return "slider.horizontal.3"
         case .skills: return "shippingbox"
@@ -2443,6 +2448,39 @@ struct SettingsView: View {
                             value: autoCompactThreshold, in: 50...99, step: 1).fixedSize()
                 }
             }
+        case .relay:
+            SettingsGroup(title: "小哈中转站") {
+                SettingsRow(title: "API 地址", detail: "写入 [endpoints].models_base_url，需带 /v1") {
+                    TextField("https://api.xiaohaweb.com/v1", text: $model.relayEndpoint).frame(width: 320)
+                }
+                Divider()
+                SettingsRow(title: "API Key", detail: "写入每个 [model.*] 的 api_key，优先于 grok login 会话") {
+                    SecureField("sk-...", text: $model.relayApiKey).frame(width: 320)
+                }
+                Divider()
+                SettingsRow(title: "默认模型", detail: "写入 [models].default") {
+                    TextField("grok-4.5", text: $model.relayModel).frame(width: 180)
+                }
+                Divider()
+                SettingsRow(title: "显示名称", detail: "出现在模型 description 中") {
+                    TextField("小哈AI", text: $model.relayName).frame(width: 180)
+                }
+                Divider()
+                SettingsRow(title: "导入", detail: "备份 ~/.grok/config.toml 后写入中转站配置") {
+                    Button("写入 Grok 配置") { model.importRelayConfig() }
+                        .disabled(model.relayEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || model.relayApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            if let message = model.relayImportMessage {
+                Text(message).font(GrokTypography.metadata).foregroundStyle(.green).textSelection(.enabled)
+            }
+            if let error = model.relayImportError {
+                Text(error).font(GrokTypography.metadata).foregroundStyle(.red)
+            }
+            Text("也可从密钥页点击「导入 GrokDesk」，通过 grokdesk:// 深链直接填入。导入后运行 grok inspect，再用 /model grok-4.5。")
+                .font(GrokTypography.metadata)
+                .foregroundStyle(.secondary)
         case .agent:
             SettingsGroup(title: "执行与权限") {
                 SettingsRow(title: "权限模式", detail: "控制文件修改和 Shell 命令的确认策略") {
@@ -2480,6 +2518,33 @@ struct SettingsView: View {
 
     private var appLanguage: Binding<String> {
         Binding(get: { model.settings.effectiveLanguage }, set: { model.settings.language = $0 })
+    }
+}
+
+private struct RelayImportConfirmSheet: View {
+    @EnvironmentObject private var model: AppModel
+    let payload: RelayImportPayload
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("从网页导入配置").font(.title2.weight(.semibold))
+            Text("小哈密钥页发来了一条导入请求。确认后会备份现有 config.toml，再写入中转站配置。")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                LabeledContent("API 地址", value: payload.endpoint)
+                LabeledContent("模型", value: payload.model)
+                LabeledContent("名称", value: payload.name)
+            }
+            .font(GrokTypography.item)
+            HStack {
+                Spacer()
+                Button("取消") { model.pendingRelayImport = nil }
+                Button("确认导入") { model.importRelayConfig(payload) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 460)
     }
 }
 

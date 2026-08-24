@@ -1,0 +1,127 @@
+name: GrokDesk desktop
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-rust:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - run: cargo test
+
+  build:
+    needs: test-rust
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+            artifact: windows
+          - os: macos-latest
+            bundles: dmg
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - run: pnpm install --frozen-lockfile
+      - name: Build installers
+        run: pnpm exec tauri build --bundles ${{ matrix.bundles }}
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          mkdir -p dist-upload
+          if [ "${{ matrix.artifact }}" = "windows" ]; then
+            SETUP="$(ls src-tauri/target/release/bundle/nsis/*setup.exe | head -n 1)"
+            cp "$SETUP" "dist-upload/GrokDesk-${VERSION}-windows-x64-setup.exe"
+          else
+            DMG="$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -n 1)"
+            cp "$DMG" "dist-upload/GrokDesk-${VERSION}-macos-arm64.dmg"
+          fi
+          ls -lh dist-upload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grokdesk-${{ matrix.artifact }}
+          path: desktop/dist-upload/*
+          if-no-files-found: error
+
+  release:
+    needs: [test-rust, build]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p upload
+          find artifacts -type f -print -exec cp {} upload/ \;
+          ls -lh upload
+          test "$(ls upload | wc -l)" -ge 1
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
+          TAG="desktop-v${VERSION}"
+          NOTES="$(cat <<'EOF'
+          GrokDesk 小哈版（Windows / macOS）
+
+          - 自动检测本机是否已安装官方 Grok Build
+          - 未安装时可一键运行 xAI 官方安装脚本（Windows：install.ps1，macOS：install.sh）
+          - 支持密钥页 `grokdesk://` 一键导入小哈中转站到 `~/.grok/config.toml`
+          - Windows 下载 `*-windows-x64-setup.exe`；macOS 下载 `*-macos-arm64.dmg`
+
+          原 SwiftUI ACP 工作台源码仍在仓库 `Sources/`。
+          EOF
+          )"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" upload/* --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" upload/* --title "GrokDesk v${VERSION}" --notes "$NOTES"
+          fi

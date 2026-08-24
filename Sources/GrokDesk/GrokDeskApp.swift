@@ -19,6 +19,7 @@ struct GrokDeskApp: App {
             .environment(\.locale, model.settings.appLocale)
             .preferredColorScheme(model.settings.preferredColorScheme)
             .frame(minWidth: 1060, minHeight: 680)
+            .onOpenURL { model.handleOpenURL($0) }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {

@@ -111,6 +111,15 @@
 "要求修改" = "Request changes";
 "批准并执行" = "Approve and run";
 "通用" = "General";
+"中转站" = "Relay";
+"小哈中转站" = "Xiaoha relay";
+"已写入 Grok 配置" = "Wrote Grok config";
+"已备份原配置" = "Previous config backed up";
+"中转站配置已导入" = "Relay config imported";
+"中转站配置导入失败" = "Relay config import failed";
+"从网页导入配置" = "Import from website";
+"写入 Grok 配置" = "Write Grok config";
+"确认导入" = "Import";
 "Grok Runtime" = "Grok Runtime";
 "Agent 能力" = "Agent capabilities";
 "兼容性" = "Compatibility";

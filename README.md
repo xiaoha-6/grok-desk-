@@ -35,23 +35,39 @@ GrokDesk is the native macOS experience layer for Grok Build, not a separate gen
 
 ## Requirements
 
-- macOS 14 Sonoma or later
-- Apple Silicon for the current prebuilt release
-- Intel Macs can build GrokDesk from source
-- A valid Grok Build account
+- **Windows 10/11** (x64): use the Tauri app in `desktop/`
+- **macOS 14 Sonoma or later**: SwiftUI ACP workspace, or the same `desktop/` connector
+- Official Grok Build CLI, or a Xiaoha relay API key
 
-GrokDesk does **not** vendor Grok Build source or binaries. At launch, it checks the configured runtime path, `~/.grok/bin/grok`, common Homebrew locations, and `PATH`. If Grok Build is unavailable, GrokDesk asks for confirmation before running the official xAI installer documented by the [Grok Build repository](https://github.com/xai-org/grok-build#installing-the-released-binary). It never installs the runtime silently.
-
-You can also install Grok Build manually:
+GrokDesk does **not** vendor Grok Build source or binaries. It probes `~/.grok/bin/grok` (`%USERPROFILE%\.grok\bin\grok.exe` on Windows), Homebrew paths, and `PATH`. If the runtime is missing, you can click **Install from official** to run the xAI installer — never a silent install:
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
-grok --version
+curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux
+```
+
+```powershell
+irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
+```
+
+## Xiaoha relay import (CC Switch-style)
+
+The keys page **Import GrokDesk** button opens `grokdesk://v1/import?...`. GrokDesk backs up `~/.grok/config.toml`, then writes the relay base URL, API-key auth, and Responses-backed `[model.*]` entries. Per-model `api_key` wins over a `grok login` session.
+
+```bash
+cd desktop
+pnpm install
+pnpm tauri dev
+pnpm tauri build    # produce NSIS/MSI on Windows, DMG on macOS
 ```
 
 ## Download and install
 
-Download the Apple Silicon DMG from [GitHub Releases](https://github.com/KAMIENDER/GrokDesk/releases), open it, and drag `GrokDesk.app` onto the `Applications` shortcut. The ZIP archive remains available as a portable alternative.
+This Xiaoha fork publishes Windows and macOS installers at [xiaoha-6/grok-desk- Releases](https://github.com/xiaoha-6/grok-desk-/releases):
+
+- Windows x64: `GrokDesk-*-windows-x64-setup.exe`
+- macOS Apple Silicon: `GrokDesk-*-macos-arm64.dmg`
+
+The original Apple Silicon ACP workspace DMG from [KAMIENDER/GrokDesk](https://github.com/KAMIENDER/GrokDesk/releases) does **not** register `grokdesk://` import links. Use this fork if you want one-click Xiaoha relay import.
 
 After the first installation, GrokDesk checks GitHub Releases through Sparkle. You can check manually from **GrokDesk → Check for Updates…**, or configure automatic checks and background downloads in **Settings → General → Software updates**. Update archives are authenticated with a dedicated Sparkle EdDSA signature before installation.
 

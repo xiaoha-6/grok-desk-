@@ -26,6 +26,19 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.xiaoha.grokdesk</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>grokdesk</string>
+			</array>
+		</dict>
+	</array>
 	<key>SUAllowsAutomaticUpdates</key>
 	<true/>
 	<key>SUAutomaticallyUpdate</key>
