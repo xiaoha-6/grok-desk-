@@ -6,232 +6,61 @@ import {
   useState,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { ActivityTimeline } from "./ActivityTimeline";
+import {
+  IconArrowUp,
+  IconChevronDown,
+  IconChevronRight,
+  IconClose,
+  IconCompose,
+  IconFolder,
+  IconGauge,
+  IconGear,
+  IconInspector,
+  IconPerson,
+  IconRefresh,
+  IconShield,
+  IconSidebar,
+  IconSpark,
+  IconStop,
+} from "./icons";
+import { t as translate, type Copy } from "./i18n";
+import { MessageBody } from "./markdown";
+import { SettingsView } from "./SettingsView";
+import { isRedundantExtension, jsonText } from "./timeline";
+import {
+  defaultSettings,
+  EFFORTS,
+  MODELS,
+  PERMISSION_MODES,
+  type AccountRecord,
+  type AccountState,
+  type AcpTurnDone,
+  type AcpUpdate,
+  type AppSettings,
+  type ChatMessage,
+  type ContextUsage,
+  type Conversation,
+  type ImportResult,
+  type Lang,
+  type PendingPermission,
+  type PendingPlan,
+  type PendingQuestion,
+  type RelayImport,
+  type RuntimeStatus,
+  type SessionInfo,
+  type SettingsPage,
+  type SkillRecord,
+  type Theme,
+  type TimelineEvent,
+  type View,
+} from "./types";
 
-type RuntimeStatus = {
-  installed: boolean;
-  path: string | null;
-  version: string | null;
-  grokHome: string;
-  configPath: string;
-  configExists: boolean;
-  homeDir: string;
-  os: string;
-  installerUrl: string;
-};
-
-type RelayImport = {
-  endpoint: string;
-  apiKey: string;
-  model: string;
-  name: string;
-};
-
-type ImportResult = {
-  configPath: string;
-  backupPath: string | null;
-  model: string;
-  endpoint: string;
-};
-
-type SessionInfo = {
-  sessionId: string;
-  model: string;
-  cwd: string;
-};
-
-type TimelineEvent = {
-  id: string;
-  kind: string;
-  title: string;
-  status?: string;
-  detail?: string;
-};
-
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  thought: string;
-  events: TimelineEvent[];
-  streaming: boolean;
-  error?: string;
-};
-
-type Conversation = {
-  id: string;
-  title: string;
-  cwd: string;
-  grokSessionId?: string;
-  messages: ChatMessage[];
-  updatedAt: number;
-};
-
-type AcpUpdate = {
-  method: string;
-  params: Record<string, unknown>;
-  autoAllowed?: boolean;
-};
-
-type AcpTurnDone = {
-  ok: boolean;
-  error?: string;
-};
-
-type Lang = "zh" | "en";
-type Theme = "system" | "light" | "dark";
-type View = "chat" | "settings";
-type SettingsPage = "general" | "runtime" | "relay";
-
-type Copy = typeof zh;
-
-const STORAGE_KEY = "grokdesk.workspace.v2";
-const LEGACY_KEY = "grokdesk.workspace.v1";
-const MODELS = [
-  "grok-4.5",
-  "grok-4.3",
-  "grok-build-0.1",
-  "grok-composer-2.5-fast",
-  "grok-4.20-multi-agent-0309",
-];
-
-const zh = {
-  brand: "GrokDesk",
-  newChat: "新对话",
-  projects: "项目",
-  home: "主目录",
-  settings: "设置",
-  back: "返回 GrokDesk",
-  localCli: "本机 Grok CLI",
-  emptyTitle: "今天想构建什么？",
-  emptyHint: "选择一个工作目录，然后把任务交给 Grok",
-  composer: "描述任务，或让 Grok 修改代码…",
-  sendHint: "Return 发送，⇧ Return 换行",
-  ready: "就绪",
-  connecting: "正在连接 Grok Agent",
-  running: "Grok 正在处理",
-  thinking: "思考过程",
-  thinkingNow: "正在思考…",
-  working: "Grok 正在工作",
-  runtime: "Grok Runtime",
-  general: "通用",
-  relay: "中转站",
-  appearance: "外观",
-  appearanceDetail: "选择应用的显示模式",
-  language: "语言",
-  languageDetail: "切换 GrokDesk 界面语言",
-  followSystem: "跟随系统",
-  light: "浅色",
-  dark: "深色",
-  installed: "已安装",
-  missing: "未安装",
-  install: "从官方安装",
-  installing: "正在安装…",
-  redetect: "重新检测",
-  official: "官方安装说明",
-  path: "路径",
-  dataDir: "数据目录",
-  version: "版本",
-  relayHint:
-    "像 CC Switch 一样，把 API 地址和密钥直接写入 ~/.grok/config.toml。写入后回到这个桌面对话，不会打开 CLI。",
-  endpoint: "API 地址",
-  apiKey: "API Key",
-  model: "默认模型",
-  modelDetail: "新对话使用的 Grok 模型",
-  name: "显示名称",
-  import: "写入 Grok 配置",
-  importing: "正在写入…",
-  backup: "已备份原配置",
-  needRuntime: "需要安装 Grok Build",
-  needRuntimeBody:
-    "GrokDesk 需要本地 Grok Build Runtime 才能运行 Agent。是否使用 xAI 官方安装器安装最新版？",
-  later: "稍后",
-  installLatest: "安装最新版",
-  windowsHint: "Windows 官方安装命令：irm https://x.ai/cli/install.ps1 | iex",
-  unixHint: "macOS / Linux 官方安装命令：curl -fsSL https://x.ai/cli/install.sh | bash",
-  workspace: "工作目录",
-  workspaceDetail: "当前对话使用的本地目录",
-  wrote: "已写入",
-  imported: "配置已写入，可以开始对话",
-  hideSidebar: "隐藏侧栏",
-  showSidebar: "显示侧栏",
-  deleteChat: "删除对话",
-  chooseFolder: "选择文件夹",
-  searchSettings: "搜索设置…",
-  failed: "运行失败",
-  regenerate: "重新生成",
-};
-
-const en: Copy = {
-  brand: "GrokDesk",
-  newChat: "New chat",
-  projects: "Projects",
-  home: "Home",
-  settings: "Settings",
-  back: "Back to GrokDesk",
-  localCli: "Local Grok CLI",
-  emptyTitle: "What do you want to build today?",
-  emptyHint: "Pick a workspace, then hand the task to Grok",
-  composer: "Describe a task, or let Grok edit code…",
-  sendHint: "Return to send, ⇧ Return for a newline",
-  ready: "Ready",
-  connecting: "Connecting Grok Agent",
-  running: "Grok is working",
-  thinking: "Thinking",
-  thinkingNow: "Thinking…",
-  working: "Grok is working",
-  runtime: "Grok Runtime",
-  general: "General",
-  relay: "Relay",
-  appearance: "Appearance",
-  appearanceDetail: "Choose how GrokDesk looks",
-  language: "Language",
-  languageDetail: "Switch the GrokDesk interface language",
-  followSystem: "System",
-  light: "Light",
-  dark: "Dark",
-  installed: "Installed",
-  missing: "Missing",
-  install: "Install from official",
-  installing: "Installing…",
-  redetect: "Recheck",
-  official: "Official install docs",
-  path: "Path",
-  dataDir: "Data directory",
-  version: "Version",
-  relayHint:
-    "Like CC Switch: write the API base URL and key into ~/.grok/config.toml. After import, this desktop chat opens — not the CLI.",
-  endpoint: "API base URL",
-  apiKey: "API key",
-  model: "Default model",
-  modelDetail: "Model used for new conversations",
-  name: "Display name",
-  import: "Write Grok config",
-  importing: "Writing…",
-  backup: "Previous config backed up",
-  needRuntime: "Grok Build is required",
-  needRuntimeBody:
-    "GrokDesk needs the local Grok Build runtime to run the agent. Install the latest official build?",
-  later: "Later",
-  installLatest: "Install latest",
-  windowsHint: "Windows official install: irm https://x.ai/cli/install.ps1 | iex",
-  unixHint: "macOS / Linux official install: curl -fsSL https://x.ai/cli/install.sh | bash",
-  workspace: "Workspace",
-  workspaceDetail: "Local directory used by the current chat",
-  wrote: "Wrote",
-  imported: "Config written. You can start chatting.",
-  hideSidebar: "Hide sidebar",
-  showSidebar: "Show sidebar",
-  deleteChat: "Delete chat",
-  chooseFolder: "Choose folder",
-  searchSettings: "Search settings…",
-  failed: "Run failed",
-  regenerate: "Regenerate",
-};
+const STORAGE_KEY = "grokdesk.workspace.v3";
+const LEGACY_KEYS = ["grokdesk.workspace.v2", "grokdesk.workspace.v1"];
 
 function uid() {
   return crypto.randomUUID();
@@ -249,10 +78,7 @@ function workspaceLabel(path: string, homeDir: string, homeWord: string) {
 
 function friendlyError(raw: string) {
   const text = String(raw || "").trim() || "ACP 请求失败";
-  if (
-    /上游/.test(text) ||
-    /upstream (?:service )?(?:temporarily )?unavailable/i.test(text)
-  ) {
+  if (/上游/.test(text) || /upstream (?:service )?(?:temporarily )?unavailable/i.test(text)) {
     return text;
   }
   if (/502|bad gateway|temporarily unavailable/i.test(text)) {
@@ -268,6 +94,91 @@ function importSig(payload: RelayImport) {
   return `${payload.endpoint}\n${payload.apiKey}\n${payload.model}\n${payload.name}`;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function contentText(update: Record<string, unknown>) {
+  const content = asRecord(update.content);
+  return String(content?.text ?? update.text ?? "");
+}
+
+function toolMeta(update: Record<string, unknown>) {
+  const meta = asRecord(update._meta);
+  return asRecord(meta?.["x.ai/tool"]) || asRecord(meta?.tool);
+}
+
+function upsertEvent(events: TimelineEvent[], event: TimelineEvent) {
+  const index = events.findIndex((item) => item.id === event.id);
+  if (index >= 0) {
+    const next = [...events];
+    next[index] = { ...next[index], ...event, input: event.input ?? next[index].input, output: event.output ?? next[index].output };
+    return next;
+  }
+  return [...events, event];
+}
+
+function extensionKind(method: string) {
+  const value = method.toLowerCase();
+  if (value.includes("hook")) return "hook";
+  if (value.includes("skill") || value.includes("plugin")) return "skill";
+  if (value.includes("memory") || value.includes("compact")) return "context";
+  if (value.includes("retry") || value.includes("session") || value.includes("turn_")) return "system";
+  if (value.includes("task")) return "background_task";
+  return "extension";
+}
+
+function extensionTitle(method: string, params: Record<string, unknown>, lang: Lang) {
+  if (method.toLowerCase().includes("hook")) {
+    const event = String(params.event_name || params.eventName || "hook");
+    const tool = params.tool_name || params.toolName;
+    return `Hook · ${event}${tool ? ` · ${tool}` : ""}`;
+  }
+  const titles: Record<string, [string, string]> = {
+    task_backgrounded: ["任务已转入后台", "Task moved to background"],
+    task_completed: ["后台任务完成", "Background task finished"],
+    retry_state: ["Runtime 正在重试", "Runtime is retrying"],
+    memory_flush_started: ["正在写入 Memory", "Writing memory"],
+    memory_flush_completed: ["Memory 写入完成", "Memory written"],
+    turn_completed: ["本轮执行完成", "Turn completed"],
+    session_recap: ["Session 回顾", "Session recap"],
+  };
+  const pair = titles[method];
+  if (pair) return lang === "en" ? pair[1] : pair[0];
+  return method.replace(/_/g, " ");
+}
+
+function formatTokens(value: number) {
+  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k` : String(value);
+}
+
+function routingScore(account: AccountRecord) {
+  if (account.quota?.weeklyRemainingPercent != null) return account.quota.weeklyRemainingPercent;
+  if (account.quota?.monthlyRemaining != null) return account.quota.monthlyRemaining;
+  return -1;
+}
+
+function pickRoutedAccount(accounts: AccountRecord[], settings: AppSettings, lastId?: string) {
+  const loggedIn = accounts.filter((account) => account.enabled && account.loggedIn);
+  const usable = loggedIn.filter(
+    (account) => !account.quota?.error && (account.quota ? routingScore(account) > 0 : true),
+  );
+  const pool = usable.length ? usable : loggedIn;
+  if (!pool.length) return undefined;
+  if (settings.routingMode === "fixed") {
+    return pool.find((account) => account.id === settings.preferredAccountId) || pool[0];
+  }
+  if (settings.routingMode === "sequential") return pool[0];
+  if (settings.routingMode === "roundRobin") {
+    const index = pool.findIndex((account) => account.id === lastId);
+    if (index < 0) return pool[0];
+    return pool[(index + 1) % pool.length];
+  }
+  return [...pool].sort((a, b) => routingScore(b) - routingScore(a))[0];
+}
+
 type PersistShape = {
   lang?: Lang;
   theme?: Theme;
@@ -277,13 +188,17 @@ type PersistShape = {
   conversations?: Conversation[];
   form?: Partial<RelayImport>;
   sidebarWidth?: number;
+  settings?: Partial<AppSettings>;
 };
 
 function loadPersist(): PersistShape {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw) as PersistShape;
+    for (const key of [STORAGE_KEY, ...LEGACY_KEYS]) {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      return JSON.parse(raw) as PersistShape;
+    }
+    return {};
   } catch {
     return {};
   }
@@ -295,11 +210,11 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(saved.theme || "system");
   const [view, setView] = useState<View>("chat");
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("general");
-  const [settingsQuery, setSettingsQuery] = useState("");
   const [showSidebar, setShowSidebar] = useState(true);
-  const [sidebarWidth, setSidebarWidth] = useState(
-    Math.min(400, Math.max(220, saved.sidebarWidth || 280)),
-  );
+  const [showInspector, setShowInspector] = useState(false);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
+  const [showUsageCard, setShowUsageCard] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(Math.min(400, Math.max(220, saved.sidebarWidth || 280)));
   const [model, setModel] = useState(saved.model || "grok-4.5");
   const [cwd, setCwd] = useState(saved.cwd || "");
   const [prompt, setPrompt] = useState("");
@@ -321,17 +236,43 @@ export default function App() {
     model: saved.form?.model || "grok-4.5",
     name: saved.form?.name || "小哈AI",
   });
+  const [settings, setSettings] = useState<AppSettings>({ ...defaultSettings(), ...saved.settings });
   const [conversations, setConversations] = useState<Conversation[]>(() => {
-    const items = (saved.conversations || []).map((item) => ({
+    return (saved.conversations || []).map((item) => ({
       ...item,
-      messages: (item.messages || []).map((message) => ({ ...message, streaming: false })),
+      messages: (item.messages || []).map((message) => ({
+        ...message,
+        events: message.events || [],
+        media: message.media || [],
+        streaming: false,
+      })),
     }));
-    return items;
   });
   const [selectedId, setSelectedId] = useState<string | null>(saved.selectedId || null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [accounts, setAccounts] = useState<AccountRecord[]>([]);
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [refreshingQuota, setRefreshingQuota] = useState(false);
+  const [loginLog, setLoginLog] = useState("");
+  const [skills, setSkills] = useState<SkillRecord[]>([]);
+  const [skillsQuery, setSkillsQuery] = useState("");
+  const [selectedSkill, setSelectedSkill] = useState<SkillRecord | null>(null);
+  const [usage, setUsage] = useState<ContextUsage>({
+    usedTokens: 0,
+    totalTokens: saved.settings?.contextWindowTokens || 225000,
+    compactionCount: 0,
+  });
+  const [rawEvents, setRawEvents] = useState<Array<{ method: string; payload: string }>>([]);
+  const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
+  const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
+  const [showContext, setShowContext] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<"tools" | "plan" | "events">("tools");
+  const [questionNotes, setQuestionNotes] = useState<Record<string, string>>({});
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string[]>>({});
+  const [planFeedback, setPlanFeedback] = useState("");
 
-  const t = lang === "en" ? en : zh;
+  const t: Copy = translate(lang);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLElement | null>(null);
   const followRef = useRef(true);
@@ -343,6 +284,8 @@ export default function App() {
   const cwdRef = useRef(cwd);
   const statusRef = useRef(status);
   const tRef = useRef(t);
+  const settingsRef = useRef(settings);
+  const accountsRef = useRef(accounts);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -350,16 +293,25 @@ export default function App() {
   cwdRef.current = cwd;
   statusRef.current = status;
   tRef.current = t;
+  settingsRef.current = settings;
+  accountsRef.current = accounts;
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
-  const runtimeOk = Boolean(status?.installed);
   const homeDir = status?.homeDir || "";
   const projectName = workspaceLabel(selected?.cwd || cwd, homeDir, t.home);
   const canSend = prompt.trim().length > 0 && !installing && !running;
+  const routed = pickRoutedAccount(accounts, settings);
+  const activeAccount =
+    accounts.find((account) => account.id === selected?.accountId) || routed;
+  const quotaText = activeAccount?.quota?.weeklyRemainingPercent != null
+    ? lang === "en"
+      ? `${Math.round(activeAccount.quota.weeklyRemainingPercent)}% weekly remaining`
+      : `本周剩余 ${Math.round(activeAccount.quota.weeklyRemainingPercent)}%`
+    : t[accounts.length ? "quotaPending" : "notConfigured"];
 
   const projects = useMemo(() => {
     const groups = new Map<string, Conversation[]>();
-    for (const item of conversations) {
+    for (const item of conversations.filter((conversation) => !conversation.archivedAt)) {
       const key = item.cwd || homeDir || "";
       const list = groups.get(key) || [];
       list.push(item);
@@ -374,28 +326,61 @@ export default function App() {
       .sort((a, b) => (b.items[0]?.updatedAt || 0) - (a.items[0]?.updatedAt || 0));
   }, [conversations, homeDir, t.home]);
 
+  const effortLabel = EFFORTS.find((item) => item.id === settings.reasoningEffort)?.label || settings.reasoningEffort;
+  const usagePercent = Math.round(
+    Math.min(100, Math.max(0, usage.totalTokens ? (usage.usedTokens / usage.totalTokens) * 100 : 0)),
+  );
+
   useEffect(() => {
     document.documentElement.lang = lang === "en" ? "en" : "zh-CN";
     document.documentElement.dataset.theme = theme;
   }, [lang, theme]);
 
   useEffect(() => {
-    const payload = {
-      lang,
-      theme,
-      model,
-      cwd,
-      selectedId,
-      conversations,
-      sidebarWidth,
-      form: { ...form, apiKey: "" },
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form]);
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        lang,
+        theme,
+        model,
+        cwd,
+        selectedId,
+        conversations,
+        sidebarWidth,
+        settings,
+        form: { ...form, apiKey: "" },
+      }),
+    );
+  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, form, settings]);
+
+  const patchSettings = useCallback((patch: Partial<AppSettings>) => {
+    setSettings((current) => ({ ...current, ...patch }));
+  }, []);
+
+  const persistAccounts = useCallback(async (next: AccountRecord[], extra?: Partial<AppSettings>) => {
+    const merged = extra ? { ...settingsRef.current, ...extra } : settingsRef.current;
+    try {
+      const state = await invoke<AccountState>("save_account_state", {
+        payload: {
+          accounts: next,
+          routingMode: merged.routingMode,
+          preferredAccountId: merged.preferredAccountId,
+        },
+      });
+      setAccounts(state.accounts);
+      patchSettings({
+        routingMode: state.routingMode,
+        preferredAccountId: state.preferredAccountId,
+      });
+    } catch {
+      setAccounts(next);
+    }
+  }, [patchSettings]);
 
   const ensureConversation = useCallback(
     (list: Conversation[], id: string | null, path: string) => {
-      if (list.length === 0) {
+      const live = list.filter((item) => !item.archivedAt);
+      if (live.length === 0) {
         const created: Conversation = {
           id: uid(),
           title: tRef.current.newChat,
@@ -403,10 +388,10 @@ export default function App() {
           messages: [],
           updatedAt: Date.now(),
         };
-        return { list: [created], id: created.id };
+        return { list: [created, ...list.filter((item) => item.archivedAt)], id: created.id };
       }
-      if (!id || !list.some((item) => item.id === id)) {
-        return { list, id: list[0].id };
+      if (!id || !list.some((item) => item.id === id && !item.archivedAt)) {
+        return { list, id: live[0].id };
       }
       return { list, id };
     },
@@ -420,6 +405,28 @@ export default function App() {
     el.scrollTop = el.scrollHeight;
   }, []);
 
+  const mutateAssistant = useCallback(
+    (mutator: (assistant: ChatMessage, conversation: Conversation) => Conversation | void) => {
+      setConversations((list) => {
+        const currentId = selectedIdRef.current;
+        return list.map((conversation) => {
+          if (conversation.id !== currentId) return conversation;
+          const messages = [...conversation.messages];
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            if (messages[i].role === "assistant" && messages[i].streaming) {
+              const assistant = { ...messages[i], events: [...messages[i].events], media: [...messages[i].media] };
+              messages[i] = assistant;
+              const next = mutator(assistant, { ...conversation, messages });
+              return next || { ...conversation, messages, updatedAt: Date.now() };
+            }
+          }
+          return conversation;
+        });
+      });
+    },
+    [],
+  );
+
   const finishTurn = useCallback((error?: string) => {
     const err = error ? friendlyError(error) : undefined;
     setConversations((list) =>
@@ -428,9 +435,7 @@ export default function App() {
         return {
           ...item,
           messages: item.messages.map((message) =>
-            message.streaming
-              ? { ...message, streaming: false, error: err || message.error }
-              : message,
+            message.streaming ? { ...message, streaming: false, error: err || message.error } : message,
           ),
         };
       }),
@@ -442,86 +447,237 @@ export default function App() {
   const handleAcpUpdate = useCallback(
     (payload: AcpUpdate) => {
       const params = payload.params || {};
-      const update =
-        (params.update as Record<string, unknown> | undefined) ||
-        (params.sessionUpdate ? params : undefined);
+      const meta = asRecord(params._meta);
+      if (payload.method === "x.ai/models/update" || payload.method === "_x.ai/models/update") {
+        const current = String(params.currentModelId || params.current_model_id || "");
+        if (current) setModel(current);
+        return;
+      }
+      const tokens = Number(meta?.totalTokens ?? meta?.total_tokens ?? 0);
+      if (tokens > 0) {
+        setUsage((current) => ({
+          ...current,
+          usedTokens: tokens,
+          totalTokens: settingsRef.current.contextWindowTokens,
+        }));
+      }
+      setRawEvents((rows) => {
+        const next = [...rows, { method: payload.method, payload: jsonText(params) || "{}" }];
+        return next.slice(-200);
+      });
 
-      setConversations((list) => {
-        const currentId = selectedIdRef.current;
-        return list.map((conversation) => {
-          if (conversation.id !== currentId) return conversation;
-          const messages = [...conversation.messages];
-          let assistant: ChatMessage | undefined;
-          for (let i = messages.length - 1; i >= 0; i -= 1) {
-            if (messages[i].role === "assistant" && messages[i].streaming) {
-              assistant = { ...messages[i] };
-              messages[i] = assistant;
-              break;
-            }
+      const update = asRecord(params.update) || (params.sessionUpdate || params.session_update ? params : undefined);
+      if (!update) {
+        if (payload.method === "session/request_permission" && payload.autoAllowed) {
+          mutateAssistant((assistant) => {
+            assistant.events = upsertEvent(assistant.events, {
+              id: `permission-${Date.now()}`,
+              kind: "permission",
+              title: lang === "en" ? "Allowed automatically" : "已自动允许操作",
+              status: "approved",
+            });
+          });
+        } else if (payload.method !== "session/update" && !isRedundantExtension(payload.method)) {
+          const kind = extensionKind(payload.method);
+          if (kind !== "system") {
+            mutateAssistant((assistant) => {
+              assistant.events = upsertEvent(assistant.events, {
+                id: `extension-${Date.now()}`,
+                kind,
+                title: extensionTitle(payload.method, params, lang),
+                output: jsonText(params),
+              });
+            });
           }
-          if (!update) {
-            if (payload.method === "session/request_permission" && payload.autoAllowed && assistant) {
-              assistant.events = [
-                ...assistant.events,
-                {
-                  id: `permission-${Date.now()}`,
-                  kind: "permission",
-                  title: lang === "en" ? "Allowed automatically" : "已自动允许操作",
-                  status: "approved",
-                },
-              ];
-            }
-            return { ...conversation, messages };
+        }
+        return;
+      }
+
+      const type = String(update.sessionUpdate || update.session_update || "unknown");
+      mutateAssistant((assistant, conversation) => {
+        if (type === "agent_message_chunk") {
+          const content = asRecord(update.content) || {};
+          const chunkType = String(content.type || "text");
+          if (chunkType === "text" || !chunkType) {
+            assistant.text += contentText(update);
+          } else {
+            assistant.media = [
+              ...assistant.media,
+              {
+                id: uid(),
+                type: chunkType,
+                mimeType: content.mimeType ? String(content.mimeType) : undefined,
+                data: content.data ? String(content.data) : undefined,
+                uri: content.uri ? String(content.uri) : undefined,
+                name: content.name ? String(content.name) : undefined,
+              },
+            ];
           }
-          if (!assistant) return conversation;
-          const type = String(update.sessionUpdate || "unknown");
-          if (type === "agent_message_chunk") {
-            const content = (update.content as Record<string, unknown> | undefined) || {};
-            assistant.text += String(content.text ?? update.text ?? "");
-          } else if (type === "agent_thought_chunk") {
-            const content = (update.content as Record<string, unknown> | undefined) || {};
-            assistant.thought += String(content.text ?? update.text ?? "");
-          } else if (type === "tool_call" || type === "tool_call_update") {
-            const id = String(update.toolCallId || update.tool_call_id || uid());
-            const event: TimelineEvent = {
-              id: `tool-${id}`,
-              kind: String(update.kind || "tool"),
-              title: String(update.title || update.name || (lang === "en" ? "Tool" : "工具调用")),
-              status: String(update.status || "pending"),
-            };
-            const index = assistant.events.findIndex((item) => item.id === event.id);
-            if (index >= 0) assistant.events[index] = { ...assistant.events[index], ...event };
-            else assistant.events = [...assistant.events, event];
-          } else if (type === "plan") {
-            const entries = (update.entries as Array<Record<string, unknown>> | undefined) || [];
-            const event: TimelineEvent = {
-              id: "plan",
-              kind: "plan",
-              title: lang === "en" ? "Plan" : "执行计划",
-              detail: entries
-                .map((entry) => `[${entry.status || "pending"}] ${entry.content || entry.text || ""}`)
-                .join("\n"),
-            };
-            const index = assistant.events.findIndex((item) => item.id === "plan");
-            if (index >= 0) assistant.events[index] = event;
-            else assistant.events = [...assistant.events, event];
-          } else if (type === "session_summary_generated") {
-            const title = String(update.sessionSummary || update.session_summary || "");
-            if (title) {
-              return { ...conversation, messages, title, updatedAt: Date.now() };
-            }
+        } else if (type === "agent_thought_chunk") {
+          assistant.thought += contentText(update);
+          assistant.events = upsertEvent(assistant.events, {
+            id: "thought",
+            kind: "thought",
+            title: lang === "en" ? "Thinking" : "思考过程",
+            output: assistant.thought,
+          });
+        } else if (type === "tool_call" || type === "tool_call_update") {
+          const id = String(update.toolCallId || update.tool_call_id || uid());
+          const metaTool = toolMeta(update);
+          const kind = String(update.kind || metaTool?.kind || metaTool?.name || "other");
+          const title = String(
+            update.title || metaTool?.label || metaTool?.name || update.name || (lang === "en" ? "Tool" : "工具调用"),
+          );
+          const input = jsonText(update.rawInput ?? update.input ?? update.raw_input);
+          const output = jsonText(update.content ?? update.output ?? update.rawOutput);
+          assistant.events = upsertEvent(assistant.events, {
+            id: `tool-${id}`,
+            kind,
+            title,
+            status: String(update.status || "pending"),
+            input,
+            output,
+          });
+        } else if (type === "plan") {
+          const entries = (update.entries as Array<Record<string, unknown>> | undefined) || [];
+          assistant.events = upsertEvent(assistant.events, {
+            id: "plan",
+            kind: "plan",
+            title: lang === "en" ? "Plan" : "执行计划",
+            output: entries
+              .map((entry) => `[${entry.status || "pending"}] ${entry.content || entry.text || ""}`)
+              .join("\n"),
+          });
+        } else if (type === "auto_compact_started") {
+          assistant.events = upsertEvent(assistant.events, {
+            id: "active-compaction",
+            kind: "compaction",
+            title: lang === "en" ? "Auto-compacting context" : "正在自动压缩上下文",
+            status: `${update.percentage || usagePercent}%`,
+          });
+        } else if (type === "auto_compact_completed") {
+          const after = Number(update.tokens_after ?? update.tokensAfter ?? 0);
+          setUsage((current) => ({
+            ...current,
+            usedTokens: after || current.usedTokens,
+            compactionCount: current.compactionCount + 1,
+          }));
+          assistant.events = upsertEvent(assistant.events, {
+            id: "active-compaction",
+            kind: "compaction",
+            title: lang === "en" ? "Context compacted" : "上下文已自动压缩",
+            status: "completed",
+            input: update.tokens_before || update.tokensBefore
+              ? `${lang === "en" ? "Before" : "压缩前"}：${formatTokens(Number(update.tokens_before ?? update.tokensBefore))} tokens`
+              : undefined,
+            output: `${lang === "en" ? "After" : "压缩后"}：${formatTokens(after)} tokens`,
+          });
+        } else if (type === "auto_compact_failed") {
+          assistant.events = upsertEvent(assistant.events, {
+            id: "active-compaction",
+            kind: "compaction",
+            title: lang === "en" ? "Auto-compact failed" : "自动压缩失败",
+            status: "failed",
+            output: String(update.error || ""),
+          });
+        } else if (type === "session_summary_generated") {
+          const title = String(update.sessionSummary || update.session_summary || "");
+          if (title) return { ...conversation, title, updatedAt: Date.now() };
+        } else if (type !== "user_message_chunk" && type !== "user_message" && !isRedundantExtension(type)) {
+          const kind = extensionKind(type);
+          if (kind !== "system") {
+            assistant.events = upsertEvent(assistant.events, {
+              id: `extension-${String(meta?.eventId || Date.now())}`,
+              kind,
+              title: extensionTitle(type, update, lang),
+              status: update.status ? String(update.status) : undefined,
+              output: jsonText(update),
+            });
           }
-          return { ...conversation, messages, updatedAt: Date.now() };
-        });
+        }
+        return { ...conversation, updatedAt: Date.now() };
       });
       scrollToBottom();
     },
-    [lang, scrollToBottom],
+    [lang, mutateAssistant, scrollToBottom, usagePercent],
   );
+
+  const handleInteraction = useCallback((payload: {
+    method: string;
+    requestId: string;
+    params: Record<string, unknown>;
+  }) => {
+    const params = payload.params || {};
+    if (payload.method === "x.ai/ask_user_question") {
+      const questions = ((params.questions as Array<Record<string, unknown>>) || []).map((value) => ({
+        question: String(value.question || ""),
+        multiSelect: Boolean(value.multiSelect),
+        options: ((value.options as Array<Record<string, unknown>>) || []).map((option) => ({
+          label: String(option.label || ""),
+          description: String(option.description || ""),
+          preview: option.preview ? String(option.preview) : undefined,
+        })),
+      }));
+      setPendingQuestion({
+        id: payload.requestId,
+        questions,
+        planMode: params.mode === "plan",
+      });
+      mutateAssistant((assistant) => {
+        assistant.events = upsertEvent(assistant.events, {
+          id: `interaction-${payload.requestId}`,
+          kind: "question",
+          title: lang === "en" ? "Grok needs more information" : "Grok 请求补充信息",
+          status: "pending",
+          input: jsonText(params),
+        });
+      });
+      return;
+    }
+    if (payload.method === "x.ai/exit_plan_mode") {
+      setPendingPlan({
+        id: payload.requestId,
+        content: String(params.planContent || params.plan_content || ""),
+      });
+      mutateAssistant((assistant) => {
+        assistant.events = upsertEvent(assistant.events, {
+          id: `interaction-${payload.requestId}`,
+          kind: "interaction",
+          title: lang === "en" ? "Review the plan" : "Grok 请求确认计划",
+          status: "pending",
+          input: jsonText(params),
+        });
+      });
+      return;
+    }
+    const tool = asRecord(params.toolCall) || asRecord(params.tool_call) || {};
+    const options = ((params.options as Array<Record<string, unknown>>) || []).map((option) => ({
+      id: String(option.optionId || option.option_id || option.id || ""),
+      name: String(option.name || (lang === "en" ? "Allow" : "允许")),
+      kind: String(option.kind || ""),
+    }));
+    setPendingPermission({
+      id: payload.requestId,
+      title: String(tool.title || (lang === "en" ? "Grok wants to run an action" : "Grok 请求执行操作")),
+      options,
+    });
+    mutateAssistant((assistant) => {
+      assistant.events = upsertEvent(assistant.events, {
+        id: `interaction-${payload.requestId}`,
+        kind: "permission",
+        title: String(tool.title || (lang === "en" ? "Permission request" : "Grok 请求执行操作")),
+        status: "pending",
+        input: jsonText(params),
+      });
+    });
+  }, [lang, mutateAssistant]);
+
   const handleAcpUpdateRef = useRef(handleAcpUpdate);
   handleAcpUpdateRef.current = handleAcpUpdate;
   const finishTurnRef = useRef(finishTurn);
   finishTurnRef.current = finishTurn;
+  const handleInteractionRef = useRef(handleInteraction);
+  handleInteractionRef.current = handleInteraction;
 
   const refresh = useCallback(async () => {
     setStatusError("");
@@ -529,15 +685,50 @@ export default function App() {
       const next = await invoke<RuntimeStatus>("get_runtime_status");
       setStatus(next);
       setCwd((value) => value || next.homeDir);
-      setConversations((list) =>
-        list.map((item) => (item.cwd ? item : { ...item, cwd: next.homeDir })),
-      );
+      setConversations((list) => list.map((item) => (item.cwd ? item : { ...item, cwd: next.homeDir })));
       return next;
     } catch (error) {
       setStatusError(String(error));
       return null;
     }
   }, []);
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      const state = await invoke<AccountState>("list_accounts");
+      setAccounts(state.accounts);
+      patchSettings({
+        routingMode: state.routingMode || "quota",
+        preferredAccountId: state.preferredAccountId,
+      });
+    } catch {
+      // ignore
+    }
+  }, [patchSettings]);
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      const next = await invoke<SkillRecord[]>("list_skills", { cwd: cwdRef.current || null });
+      setSkills(next);
+    } catch {
+      setSkills([]);
+    }
+  }, []);
+
+  const refreshQuotas = useCallback(async () => {
+    setRefreshingQuota(true);
+    try {
+      const next: AccountRecord[] = [];
+      for (const account of accountsRef.current.filter((item) => item.enabled && item.loggedIn)) {
+        next.push(await invoke<AccountRecord>("refresh_account_quota", { account }));
+      }
+      const merged = accountsRef.current.map((account) => next.find((item) => item.id === account.id) || account);
+      await persistAccounts(merged);
+      setStatusText(tRef.current.refreshQuota);
+    } finally {
+      setRefreshingQuota(false);
+    }
+  }, [persistAccounts]);
 
   const applyImport = useCallback(
     async (payload: RelayImport) => {
@@ -632,79 +823,53 @@ export default function App() {
       if (!alive) stop();
       else stops.push(stop);
     };
-
     (async () => {
       const runtime = await refresh();
+      await loadAccounts();
+      await refreshSkills();
       const path = cwdRef.current || runtime?.homeDir || "";
       const ensured = ensureConversation(conversationsRef.current, selectedIdRef.current, path);
       setConversations(ensured.list);
       setSelectedId(ensured.id);
       setStatusText(runtime?.installed ? tRef.current.ready : tRef.current.needRuntime);
       if (runtime && !runtime.installed) setShowInstallPrompt(true);
-
+      await add(listen<string>("install-log", (event) => setInstallLog((log) => `${log}${event.payload}\n`)));
+      await add(listen<AcpUpdate>("acp-update", (event) => handleAcpUpdateRef.current(event.payload)));
+      await add(listen<AcpTurnDone>("acp-turn-done", (event) => finishTurnRef.current(event.payload.ok ? undefined : event.payload.error)));
       await add(
-        listen<string>("install-log", (event) => {
-          setInstallLog((log) => `${log}${event.payload}\n`);
+        listen<{ method: string; requestId: string; params: Record<string, unknown> }>("acp-interaction", (event) =>
+          handleInteractionRef.current(event.payload),
+        ),
+      );
+      await add(listen<string>("account-login-log", (event) => setLoginLog((log) => `${log}${event.payload}\n`)));
+      await add(
+        listen<{ ok: boolean; error?: string }>("account-login-done", async (event) => {
+          setAddingAccount(false);
+          setLoginLog((log) => `${log}${event.payload.ok ? tRef.current.login : event.payload.error || tRef.current.failed}\n`);
+          await loadAccounts();
+          if (event.payload.ok) await refreshQuotas();
         }),
       );
-      await add(
-        listen<RelayImport>("relay-import", (event) => {
-          void consumeDeeplinkRef.current(event.payload);
-        }),
-      );
-      await add(
-        listen<string>("relay-import-error", (event) => {
-          setImportError(event.payload);
-          setView("settings");
-          setSettingsPage("relay");
-        }),
-      );
-      await add(
-        listen<AcpUpdate>("acp-update", (event) => {
-          handleAcpUpdateRef.current(event.payload);
-        }),
-      );
-      await add(
-        listen<string>("acp-diagnostic", (event) => {
-          if (/error|fail|502|503|unavailable|denied/i.test(event.payload || "")) {
-            setStatusText(event.payload);
-          }
-        }),
-      );
-      await add(
-        listen<AcpTurnDone>("acp-turn-done", (event) => {
-          finishTurnRef.current(event.payload.ok ? undefined : event.payload.error);
-        }),
-      );
-      await add(
-        listen("acp-exit", () => {
-          if (runningRef.current) finishTurnRef.current("Grok Agent 已退出");
-        }),
-      );
-
+      await add(listen<RelayImport>("relay-import", (event) => void consumeDeeplinkRef.current(event.payload)));
       try {
-        const queued = await invoke<RelayImport | null>("take_pending_import");
-        if (queued) await consumeDeeplinkRef.current(queued);
+        const pending = await invoke<RelayImport | null>("take_pending_import");
+        if (pending) await consumeDeeplinkRef.current(pending);
       } catch {
-        // no queued deeplink
+        // ignore
       }
     })();
-
     return () => {
       alive = false;
       stops.forEach((stop) => stop());
-      void invoke("stop_session");
     };
-    // Boot once. Handlers stay current through refs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [ensureConversation, loadAccounts, refresh, refreshQuotas, refreshSkills]);
 
   useEffect(() => {
     const onKey = (event: globalThis.KeyboardEvent) => {
       const meta = event.metaKey || event.ctrlKey;
       if (meta && event.key.toLowerCase() === "n") {
         event.preventDefault();
-        const blank = conversationsRef.current.find((item) => item.messages.length === 0);
+        const blank = conversationsRef.current.find((item) => item.messages.length === 0 && !item.archivedAt);
         if (blank) {
           setSelectedId(blank.id);
           setView("chat");
@@ -731,9 +896,9 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  function newConversation() {
-    const blank = conversations.find((item) => item.messages.length === 0);
-    if (blank) {
+  function newConversation(account?: AccountRecord) {
+    const blank = conversations.find((item) => item.messages.length === 0 && !item.archivedAt);
+    if (blank && !account) {
       setSelectedId(blank.id);
       setView("chat");
       return;
@@ -742,6 +907,7 @@ export default function App() {
       id: uid(),
       title: t.newChat,
       cwd: cwd || homeDir,
+      accountId: account?.id || activeAccount?.id,
       messages: [],
       updatedAt: Date.now(),
     };
@@ -749,6 +915,7 @@ export default function App() {
     setSelectedId(created.id);
     setView("chat");
     setPrompt("");
+    setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
   }
 
   function selectConversation(id: string) {
@@ -768,9 +935,7 @@ export default function App() {
     const trimmed = path.trim();
     setCwd(trimmed);
     setConversations((list) =>
-      list.map((item) =>
-        item.id === selectedId && item.messages.length === 0 ? { ...item, cwd: trimmed } : item,
-      ),
+      list.map((item) => (item.id === selectedId && item.messages.length === 0 ? { ...item, cwd: trimmed } : item)),
     );
   }
 
@@ -781,59 +946,48 @@ export default function App() {
       setShowInstallPrompt(true);
       return;
     }
-
     setPrompt("");
-    if (composerRef.current) {
-      composerRef.current.style.height = "30px";
-    }
+    if (composerRef.current) composerRef.current.style.height = "30px";
     setRunning(true);
     setStatusText(t.connecting);
     followRef.current = true;
-
     const title =
-      conversation.title === zh.newChat || conversation.title === en.newChat
+      conversation.title === translate("zh").newChat || conversation.title === translate("en").newChat
         ? text.trim().slice(0, 28)
         : conversation.title;
-    const user: ChatMessage = {
-      id: uid(),
-      role: "user",
-      text: text.trim(),
-      thought: "",
-      events: [],
-      streaming: false,
-    };
-    const assistant: ChatMessage = {
-      id: uid(),
-      role: "assistant",
-      text: "",
-      thought: "",
-      events: [],
-      streaming: true,
-    };
+    const user: ChatMessage = { id: uid(), role: "user", text: text.trim(), thought: "", events: [], media: [], streaming: false };
+    const assistant: ChatMessage = { id: uid(), role: "assistant", text: "", thought: "", events: [], media: [], streaming: true };
     setConversations((list) =>
       list.map((item) =>
         item.id === conversation.id
-          ? {
-              ...item,
-              title,
-              messages: [...item.messages, user, assistant],
-              updatedAt: Date.now(),
-            }
+          ? { ...item, title, messages: [...item.messages, user, assistant], updatedAt: Date.now() }
           : item,
       ),
     );
     requestAnimationFrame(() => scrollToBottom(true));
-
+    const account =
+      accountsRef.current.find((item) => item.id === conversation.accountId) ||
+      pickRoutedAccount(accountsRef.current, settingsRef.current);
     try {
       const session = await invoke<SessionInfo>("ensure_session", {
-        model: modelRef.current,
-        cwd: conversation.cwd || cwdRef.current,
-        existingSessionId: conversation.grokSessionId ?? null,
+        options: {
+          model: modelRef.current,
+          cwd: conversation.cwd || cwdRef.current,
+          existingSessionId: conversation.grokSessionId ?? null,
+          grokHome: account?.homePath || null,
+          permissionMode: settingsRef.current.permissionMode,
+          reasoningEffort: settingsRef.current.reasoningEffort,
+          contextWindowTokens: settingsRef.current.contextWindowTokens,
+          autoCompactThresholdPercent: settingsRef.current.autoCompactThresholdPercent,
+          enableMemory: settingsRef.current.enableMemory,
+          enableWebSearch: settingsRef.current.enableWebSearch,
+          enableSubagents: settingsRef.current.enableSubagents,
+        },
       });
       setConversations((list) =>
         list.map((item) =>
           item.id === conversation.id
-            ? { ...item, grokSessionId: session.sessionId, cwd: session.cwd }
+            ? { ...item, grokSessionId: session.sessionId, cwd: session.cwd, accountId: account?.id }
             : item,
         ),
       );
@@ -866,8 +1020,7 @@ export default function App() {
       list.map((item) => {
         if (item.id !== conversation.id) return item;
         const messages = [...item.messages];
-        const last = messages[messages.length - 1];
-        if (last?.role === "assistant") messages.pop();
+        if (messages[messages.length - 1]?.role === "assistant") messages.pop();
         return { ...item, messages };
       }),
     );
@@ -908,214 +1061,175 @@ export default function App() {
     window.addEventListener("pointerup", up);
   }
 
+  async function answerPermission(optionId: string | null) {
+    if (!pendingPermission) return;
+    try {
+      await invoke("answer_interaction", {
+        requestId: pendingPermission.id,
+        result: optionId
+          ? { outcome: { outcome: "selected", optionId } }
+          : { outcome: { outcome: "cancelled" } },
+      });
+      mutateAssistant((assistant) => {
+        assistant.events = upsertEvent(assistant.events, {
+          id: `interaction-${pendingPermission.id}`,
+          kind: "permission",
+          title: pendingPermission.title,
+          status: optionId ? "approved" : "cancelled",
+        });
+      });
+    } catch (error) {
+      setStatusText(String(error));
+    }
+    setPendingPermission(null);
+  }
+
+  async function answerQuestions(action: string) {
+    if (!pendingQuestion) return;
+    const answers = questionAnswers;
+    try {
+      await invoke("answer_interaction", {
+        requestId: pendingQuestion.id,
+        result: {
+          outcome: action,
+          answers,
+          annotations: Object.fromEntries(
+            Object.entries(questionNotes)
+              .filter(([, value]) => value.trim())
+              .map(([key, value]) => [key, { notes: value }]),
+          ),
+        },
+      });
+    } catch (error) {
+      setStatusText(String(error));
+    }
+    setPendingQuestion(null);
+    setQuestionAnswers({});
+    setQuestionNotes({});
+  }
+
+  async function answerPlan(approved: boolean) {
+    if (!pendingPlan) return;
+    try {
+      await invoke("answer_interaction", {
+        requestId: pendingPlan.id,
+        result: {
+          outcome: approved ? "approved" : "cancelled",
+          feedback: planFeedback || undefined,
+        },
+      });
+    } catch (error) {
+      setStatusText(String(error));
+    }
+    setPendingPlan(null);
+    setPlanFeedback("");
+  }
+
+  async function onAddAccount(name: string) {
+    setAddingAccount(true);
+    setLoginLog(`${t.waitingLogin}\n`);
+    try {
+      await invoke("add_account", { name });
+    } catch (error) {
+      setAddingAccount(false);
+      setLoginLog((log) => `${log}${String(error)}\n`);
+    }
+  }
+
+  async function onLogin(account: AccountRecord) {
+    setLoginLog(`${t.waitingLogin}\n`);
+    try {
+      await invoke("login_account", { account });
+    } catch (error) {
+      setLoginLog((log) => `${log}${String(error)}\n`);
+    }
+  }
+
   const osLabel =
     status?.os === "windows" ? "Windows" : status?.os === "macos" ? "macOS" : status?.os === "linux" ? "Linux" : "";
-
-  const settingsItems: Array<{ id: SettingsPage; title: string; icon: ReactNode }> = [
-    { id: "general", title: t.general, icon: <IconGear /> },
-    { id: "runtime", title: t.runtime, icon: <IconTerminal /> },
-    { id: "relay", title: t.relay, icon: <IconRelay /> },
-  ];
-  const visibleSettings = settingsItems.filter((item) =>
-    item.title.toLowerCase().includes(settingsQuery.trim().toLowerCase()),
-  );
+  const lastAssistant = [...(selected?.messages || [])].reverse().find((item) => item.role === "assistant");
+  const toolEvents = lastAssistant?.events.filter((event) => event.id.startsWith("tool-")) || [];
+  const planEvent = lastAssistant?.events.find((event) => event.kind === "plan");
 
   if (view === "settings") {
     return (
-      <div className="app settings-app">
-        <aside className="sidebar settings-nav" style={{ width: sidebarWidth }}>
-          <button className="back-row" type="button" onClick={() => setView("chat")}>
-            <IconChevronLeft />
-            <span>{t.back}</span>
-          </button>
-          <input
-            className="settings-search"
-            value={settingsQuery}
-            placeholder={t.searchSettings}
-            onChange={(event) => setSettingsQuery(event.target.value)}
-          />
-          <div className="section-label">{t.settings}</div>
-          {visibleSettings.map((item) => (
-            <button
-              key={item.id}
-              className={settingsPage === item.id ? "nav-item on" : "nav-item"}
-              type="button"
-              onClick={() => setSettingsPage(item.id)}
-            >
-              <span className="nav-icon">{item.icon}</span>
-              {item.title}
-            </button>
-          ))}
-        </aside>
-        <div className="resize" onPointerDown={beginResize} />
-        <main className="settings-main">
-          <div className="settings-canvas">
-            <h1>
-              {settingsPage === "general" ? t.general : settingsPage === "runtime" ? t.runtime : t.relay}
-            </h1>
-            {settingsPage === "general" && (
-              <>
-                <section className="group">
-                  <SettingsRow title={t.appearance} detail={t.appearanceDetail}>
-                    <select value={theme} onChange={(event) => setTheme(event.target.value as Theme)}>
-                      <option value="system">{t.followSystem}</option>
-                      <option value="light">{t.light}</option>
-                      <option value="dark">{t.dark}</option>
-                    </select>
-                  </SettingsRow>
-                  <SettingsRow title={t.language} detail={t.languageDetail}>
-                    <select value={lang} onChange={(event) => setLang(event.target.value as Lang)}>
-                      <option value="zh">简体中文</option>
-                      <option value="en">English</option>
-                    </select>
-                  </SettingsRow>
-                </section>
-                <section className="group">
-                  <SettingsRow title={t.model} detail={t.modelDetail}>
-                    <select value={model} onChange={(event) => setModel(event.target.value)}>
-                      {MODELS.map((item) => (
-                        <option key={item} value={item}>
-                          {item}
-                        </option>
-                      ))}
-                    </select>
-                  </SettingsRow>
-                  <SettingsRow title={t.workspace} detail={t.workspaceDetail}>
-                    <input
-                      value={cwd}
-                      spellCheck={false}
-                      onChange={(event) => applyCwd(event.target.value)}
-                    />
-                  </SettingsRow>
-                </section>
-              </>
-            )}
-            {settingsPage === "runtime" && (
-              <>
-                <section className="group">
-                  <SettingsRow
-                    title="Grok Build"
-                    detail={status?.installed ? t.installed : t.missing}
-                  >
-                    <span className={status?.installed ? "pill ok" : "pill warn"}>
-                      {status?.installed ? t.installed : t.missing}
-                    </span>
-                  </SettingsRow>
-                  <SettingsRow title={t.path} detail={status?.path || "—"} />
-                  <SettingsRow title={t.version} detail={status?.version || "—"} />
-                  <SettingsRow title={t.dataDir} detail={status?.grokHome || "—"} />
-                </section>
-                <p className="hint left">{status?.os === "windows" ? t.windowsHint : t.unixHint}</p>
-                {installLog ? <pre className="log">{installLog}</pre> : null}
-                {installError || statusError ? (
-                  <p className="error">{installError || statusError}</p>
-                ) : null}
-                <div className="actions">
-                  {!status?.installed ? (
-                    <button className="primary" type="button" disabled={installing} onClick={() => void installOfficial()}>
-                      {installing ? t.installing : t.install}
-                    </button>
-                  ) : null}
-                  <button className="ghost" type="button" disabled={installing} onClick={() => void refresh()}>
-                    {t.redetect}
-                  </button>
-                  <button
-                    className="ghost"
-                    type="button"
-                    onClick={() => void openUrl("https://docs.x.ai/docs/overview")}
-                  >
-                    {t.official}
-                  </button>
-                </div>
-              </>
-            )}
-            {settingsPage === "relay" && (
-              <>
-                <p className="lede">{t.relayHint}</p>
-                <section className="group stacked">
-                  <label>
-                    {t.endpoint}
-                    <input
-                      value={form.endpoint}
-                      spellCheck={false}
-                      placeholder="https://api.xiaohaweb.com/v1"
-                      onChange={(event) => setForm({ ...form, endpoint: event.target.value })}
-                    />
-                  </label>
-                  <label>
-                    {t.apiKey}
-                    <input
-                      type="password"
-                      value={form.apiKey}
-                      spellCheck={false}
-                      placeholder="sk-..."
-                      onChange={(event) => setForm({ ...form, apiKey: event.target.value })}
-                    />
-                  </label>
-                  <div className="two">
-                    <label>
-                      {t.model}
-                      <input
-                        value={form.model}
-                        spellCheck={false}
-                        onChange={(event) => setForm({ ...form, model: event.target.value })}
-                      />
-                    </label>
-                    <label>
-                      {t.name}
-                      <input
-                        value={form.name}
-                        onChange={(event) => setForm({ ...form, name: event.target.value })}
-                      />
-                    </label>
-                  </div>
-                </section>
-                {importMessage ? <p className="ok-text">{importMessage}</p> : null}
-                {importError ? <p className="error">{importError}</p> : null}
-                <div className="actions">
-                  <button
-                    className="primary"
-                    type="button"
-                    disabled={importing || !form.endpoint || !form.apiKey}
-                    onClick={() => void applyImport(form)}
-                  >
-                    {importing ? t.importing : t.import}
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </main>
-      </div>
+      <SettingsView
+        t={t}
+        lang={lang}
+        theme={theme}
+        setLang={setLang}
+        setTheme={setTheme}
+        sidebarWidth={sidebarWidth}
+        beginResize={beginResize}
+        settingsPage={settingsPage}
+        setSettingsPage={setSettingsPage}
+        onBack={() => setView("chat")}
+        settings={settings}
+        patchSettings={(patch) => {
+          patchSettings(patch);
+          if (patch.routingMode != null || patch.preferredAccountId !== undefined) {
+            void persistAccounts(accounts, patch);
+          }
+        }}
+        model={model}
+        setModel={setModel}
+        cwd={cwd}
+        applyCwd={applyCwd}
+        status={status}
+        statusError={statusError}
+        installing={installing}
+        installLog={installLog}
+        installError={installError}
+        installOfficial={() => void installOfficial()}
+        refreshRuntime={() => void refresh()}
+        form={form}
+        setForm={setForm}
+        importing={importing}
+        importMessage={importMessage}
+        importError={importError}
+        applyImport={(payload) => void applyImport(payload)}
+        accounts={accounts}
+        setAccounts={(next) => void persistAccounts(next)}
+        loginLog={loginLog}
+        addingAccount={addingAccount}
+        refreshingQuota={refreshingQuota}
+        onAddAccount={(name) => void onAddAccount(name)}
+        onLogin={(account) => void onLogin(account)}
+        onRefreshQuotas={() => void refreshQuotas()}
+        onOpenAccount={(account) => newConversation(account)}
+        onRemoveAccount={(id) => void persistAccounts(accounts.filter((account) => account.id !== id))}
+        routedAccountId={routed?.id}
+        skills={skills}
+        skillsQuery={skillsQuery}
+        setSkillsQuery={setSkillsQuery}
+        onRefreshSkills={() => void refreshSkills()}
+        selectedSkill={selectedSkill}
+        setSelectedSkill={setSelectedSkill}
+        archived={conversations.filter((item) => item.archivedAt).map((item) => ({ id: item.id, title: item.title, cwd: item.cwd }))}
+        onDeleteArchived={deleteConversation}
+      />
     );
   }
 
   return (
-    <div className="app">
+    <div className="app" onClick={() => setShowAccountMenu(false)}>
       {showSidebar ? (
         <>
           <aside className="sidebar" style={{ width: sidebarWidth }}>
             <div className="brand-row">
               <img className="brand-mark" src="/app-icon.png" alt="" />
               <div className="brand-name">{t.brand}</div>
-              <button
-                className="icon-btn"
-                type="button"
-                title={t.hideSidebar}
-                onClick={() => setShowSidebar(false)}
-              >
+              <button className="icon-btn" type="button" title={t.hideSidebar} onClick={() => setShowSidebar(false)}>
                 <IconSidebar />
               </button>
-              <button className="icon-btn" type="button" title={t.newChat} onClick={newConversation}>
+              <button className="icon-btn" type="button" title={t.newChat} onClick={() => newConversation()}>
                 <IconCompose />
               </button>
             </div>
-
-            <button className="new-chat" type="button" onClick={newConversation}>
+            <button className="new-chat" type="button" onClick={() => newConversation()}>
               <IconCompose />
               {t.newChat}
             </button>
-
             <div className="section-label">{t.projects}</div>
             <div className="session-list">
               {projects.map((project) => {
@@ -1125,12 +1239,7 @@ export default function App() {
                     <button
                       className="project-head"
                       type="button"
-                      onClick={() =>
-                        setCollapsed((current) => ({
-                          ...current,
-                          [project.path]: !current[project.path],
-                        }))
-                      }
+                      onClick={() => setCollapsed((current) => ({ ...current, [project.path]: !current[project.path] }))}
                     >
                       <span className={open ? "chevron open" : "chevron"}>
                         <IconChevronRight />
@@ -1165,18 +1274,53 @@ export default function App() {
                 );
               })}
             </div>
-
-            <div className="sidebar-foot">
-              <div className="account">
-                <span className={runtimeOk ? "dot on" : "dot"} />
-                <div>
-                  <div className="account-model">{model}</div>
-                  <div className="account-name">{t.localCli}</div>
-                </div>
-              </div>
-              <button className="icon-btn" type="button" title={t.settings} onClick={() => setView("settings")}>
-                <IconGear />
+            <div className="sidebar-foot account-foot" onClick={(event) => event.stopPropagation()}>
+              <button
+                className="account-btn"
+                type="button"
+                onClick={() => setShowAccountMenu((value) => !value)}
+              >
+                <span className="avatar">{(activeAccount?.name || "G").slice(0, 1)}</span>
+                <span className="account">
+                  <span className="account-model">{activeAccount?.name || t.askAccount}</span>
+                  <span className="account-name">{quotaText}</span>
+                </span>
+                <span className={showAccountMenu ? "chevron open" : "chevron"}>
+                  <IconChevronRight />
+                </span>
               </button>
+              {showAccountMenu ? (
+                <div className="account-menu">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowUsageCard(true);
+                      setShowAccountMenu(false);
+                    }}
+                  >
+                    <IconGauge /> {t.accounts}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void refreshQuotas();
+                      setShowAccountMenu(false);
+                    }}
+                  >
+                    <IconRefresh /> {t.refreshQuota}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setView("settings");
+                      setSettingsPage("accounts");
+                      setShowAccountMenu(false);
+                    }}
+                  >
+                    <IconGear /> {t.settings}
+                  </button>
+                </div>
+              ) : null}
             </div>
           </aside>
           <div className="resize" onPointerDown={beginResize} />
@@ -1187,12 +1331,7 @@ export default function App() {
         <header className="chat-header">
           <div className="crumb">
             {!showSidebar ? (
-              <button
-                className="icon-btn"
-                type="button"
-                title={t.showSidebar}
-                onClick={() => setShowSidebar(true)}
-              >
+              <button className="icon-btn" type="button" title={t.showSidebar} onClick={() => setShowSidebar(true)}>
                 <IconSidebar />
               </button>
             ) : null}
@@ -1203,21 +1342,27 @@ export default function App() {
             </span>
             <span className="muted">{selected?.title || t.newChat}</span>
           </div>
-          {running ? (
-            <div className="live">
-              <span className="spinner" />
-              {statusText || t.running}
-            </div>
-          ) : osLabel ? (
-            <div className="live quiet">{osLabel}</div>
-          ) : null}
+          <div className="live-row">
+            {running ? (
+              <div className="live">
+                <span className="spinner" />
+                {statusText || t.running}
+              </div>
+            ) : osLabel ? (
+              <div className="live quiet">{osLabel}</div>
+            ) : null}
+            <button
+              className="icon-btn"
+              type="button"
+              title={t.inspector}
+              onClick={() => setShowInspector((value) => !value)}
+            >
+              <IconInspector />
+            </button>
+          </div>
         </header>
 
-        <section
-          ref={transcriptRef}
-          className="transcript"
-          onScroll={onTranscriptScroll}
-        >
+        <section ref={transcriptRef} className="transcript" onScroll={onTranscriptScroll}>
           {!selected?.messages.length ? (
             <div className="empty">
               <div className="spark">
@@ -1225,38 +1370,48 @@ export default function App() {
               </div>
               <h1>{t.emptyTitle}</h1>
               <p>{projectName || t.emptyHint}</p>
+              {!accounts.some((account) => account.loggedIn) ? (
+                <button
+                  className="primary"
+                  type="button"
+                  onClick={() => {
+                    setView("settings");
+                    setSettingsPage("accounts");
+                  }}
+                >
+                  {t.addAccount}
+                </button>
+              ) : null}
             </div>
           ) : (
             <div className="messages">
               {selected.messages.map((message) => (
                 <article key={message.id} className={`row ${message.role}`}>
                   <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
-                    {message.thought ? (
+                    {message.role === "assistant" && message.events.length ? (
+                      <ActivityTimeline events={message.events} lang={lang} defaultOpen={message.streaming} />
+                    ) : message.thought ? (
                       <details className="thought" open={message.streaming && !message.text}>
                         <summary>{t.thinking}</summary>
                         <pre>{message.thought}</pre>
                       </details>
                     ) : null}
-                    {message.events.length ? (
-                      <div className="events">
-                        {message.events.map((event) => (
-                          <div key={event.id} className="event">
-                            <span>{event.title}</span>
-                            {event.status ? <span className="event-status">{event.status}</span> : null}
-                            {event.detail ? <pre>{event.detail}</pre> : null}
-                          </div>
-                        ))}
-                      </div>
-                    ) : null}
                     {message.text || message.streaming ? (
                       <MessageBody
-                        text={
-                          message.text || (message.streaming ? t.thinkingNow : "")
-                        }
+                        text={message.text || (message.streaming && !message.events.length ? t.thinkingNow : "")}
                         streaming={message.streaming && Boolean(message.text)}
                       />
                     ) : null}
-                    {message.streaming && !message.text ? (
+                    {message.media.map((item) =>
+                      item.type === "image" && item.data ? (
+                        <img key={item.id} className="chat-media" src={`data:${item.mimeType || "image/png"};base64,${item.data}`} alt={item.name || ""} />
+                      ) : (
+                        <a key={item.id} className="media-link" href={item.uri} target="_blank" rel="noreferrer">
+                          {item.name || item.uri || item.type}
+                        </a>
+                      ),
+                    )}
+                    {message.streaming ? (
                       <div className="working">
                         <span className="spinner" />
                         {t.working}
@@ -1313,26 +1468,134 @@ export default function App() {
               onKeyDown={onComposerKey}
             />
             <div className="composer-bar">
-              <span className="hint inline">{t.sendHint}</span>
+              <label className="perm-chip">
+                <IconShield />
+                <select
+                  value={settings.permissionMode}
+                  onChange={(event) => patchSettings({ permissionMode: event.target.value })}
+                >
+                  {PERMISSION_MODES.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {lang === "en" ? item.labelEn : item.labelZh}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button className="icon-btn context-btn" type="button" onClick={() => setShowContext((value) => !value)}>
+                <span className="context-ring" style={{ background: `conic-gradient(currentColor ${usagePercent}%, var(--hairline) 0)` }} />
+              </button>
+              <span className="hint inline">{`${model} · ${effortLabel}`}</span>
+              <select
+                className="model-mini"
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                disabled={running}
+              >
+                {MODELS.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="model-mini"
+                value={settings.reasoningEffort}
+                onChange={(event) => patchSettings({ reasoningEffort: event.target.value })}
+                disabled={running}
+              >
+                {EFFORTS.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
               {running ? (
                 <button className="send stop" type="button" title="Stop" onClick={() => void stopTurn()}>
                   <IconStop />
                 </button>
               ) : (
-                <button
-                  className="send"
-                  type="button"
-                  disabled={!canSend}
-                  title={t.sendHint}
-                  onClick={() => void send()}
-                >
+                <button className="send" type="button" disabled={!canSend} title={t.sendHint} onClick={() => void send()}>
                   <IconArrowUp />
                 </button>
               )}
             </div>
+            {showContext ? (
+              <div className="context-pop">
+                <strong>{t.contextWindow}</strong>
+                <div className="quota-row">
+                  <span>{t.usage}</span>
+                  <span>{usagePercent}%</span>
+                </div>
+                <div className="quota-bar">
+                  <i style={{ width: `${usagePercent}%` }} />
+                </div>
+                <p>
+                  {formatTokens(usage.usedTokens)} / {formatTokens(usage.totalTokens)} tokens
+                </p>
+                <p>
+                  {t.compactAt} {settings.autoCompactThresholdPercent}%
+                </p>
+                {usage.compactionCount ? (
+                  <p>
+                    {t.compacted} {usage.compactionCount}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </footer>
       </main>
+
+      {showInspector ? (
+        <aside className="inspector">
+          <header>
+            <strong>{t.inspector}</strong>
+            <div className="insp-tabs">
+              <button className={inspectorTab === "tools" ? "on" : ""} type="button" onClick={() => setInspectorTab("tools")}>
+                {t.tools}
+              </button>
+              <button className={inspectorTab === "plan" ? "on" : ""} type="button" onClick={() => setInspectorTab("plan")}>
+                {t.plan}
+              </button>
+              <button className={inspectorTab === "events" ? "on" : ""} type="button" onClick={() => setInspectorTab("events")}>
+                {t.events}
+              </button>
+            </div>
+          </header>
+          <div className="insp-body">
+            {inspectorTab === "tools" &&
+              (toolEvents.length ? (
+                toolEvents.map((event) => (
+                  <details key={event.id} className="insp-card">
+                    <summary>
+                      {event.title} <em>{event.status}</em>
+                    </summary>
+                    {event.input ? <pre>{event.input}</pre> : null}
+                    {event.output ? <pre>{event.output}</pre> : null}
+                  </details>
+                ))
+              ) : (
+                <p className="hint">{t.noTools}</p>
+              ))}
+            {inspectorTab === "plan" && (planEvent?.output ? <pre className="log">{planEvent.output}</pre> : <p className="hint">{t.noPlan}</p>)}
+            {inspectorTab === "events" &&
+              (rawEvents.length ? (
+                rawEvents
+                  .slice()
+                  .reverse()
+                  .slice(0, 40)
+                  .map((event, index) => (
+                    <details key={`${event.method}-${index}`} className="insp-card">
+                      <summary>{event.method}</summary>
+                      <pre>{event.payload}</pre>
+                    </details>
+                  ))
+              ) : (
+                <p className="hint">{t.noEvents}</p>
+              ))}
+          </div>
+        </aside>
+      ) : null}
 
       {showInstallPrompt && !status?.installed ? (
         <div className="overlay" onClick={() => setShowInstallPrompt(false)}>
@@ -1350,184 +1613,150 @@ export default function App() {
           </div>
         </div>
       ) : null}
+
+      {showUsageCard ? (
+        <div className="overlay" onClick={() => setShowUsageCard(false)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <h3>{t.usageTitle}</h3>
+            <div className="usage-list">
+              {accounts.filter((account) => account.enabled).map((account) => (
+                <div key={account.id} className="usage-row">
+                  <header>
+                    <span className={account.loggedIn ? "dot on" : "dot"} />
+                    <strong>{account.name}</strong>
+                    {routed?.id === account.id ? <span className="pill ok">{t.currentPreferred}</span> : null}
+                  </header>
+                  {account.quota?.weeklyRemainingPercent != null ? (
+                    <>
+                      <div className="quota-row">
+                        <span>{t.weeklyLeft}</span>
+                        <span>{Math.round(account.quota.weeklyRemainingPercent)}%</span>
+                      </div>
+                      <div className="quota-bar">
+                        <i style={{ width: `${account.quota.weeklyRemainingPercent}%` }} />
+                      </div>
+                    </>
+                  ) : (
+                    <p className="hint left">{account.loggedIn ? t.quotaPending : t.notLoggedIn}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="actions">
+              <button
+                className="ghost"
+                type="button"
+                onClick={() => {
+                  setShowUsageCard(false);
+                  setView("settings");
+                  setSettingsPage("accounts");
+                }}
+              >
+                <IconPerson /> {t.manageAccounts}
+              </button>
+              <button className="primary" type="button" disabled={refreshingQuota} onClick={() => void refreshQuotas()}>
+                {refreshingQuota ? t.refreshing : t.refreshQuota}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingPermission ? (
+        <div className="overlay">
+          <div className="modal">
+            <h3>{t.needApprove}</h3>
+            <p>{pendingPermission.title}</p>
+            <div className="actions">
+              <button className="ghost" type="button" onClick={() => void answerPermission(null)}>
+                {t.reject}
+              </button>
+              {pendingPermission.options.map((option) => (
+                <button
+                  key={option.id}
+                  className={option.kind.includes("allow") ? "primary" : "ghost"}
+                  type="button"
+                  onClick={() => void answerPermission(option.id)}
+                >
+                  {option.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingQuestion ? (
+        <div className="overlay">
+          <div className="modal wide">
+            <h3>{t.grokNeedsChoice}</h3>
+            {pendingQuestion.questions.map((question) => (
+              <div key={question.question} className="question">
+                <strong>{question.question}</strong>
+                {question.options.map((option) => {
+                  const selectedOpts = questionAnswers[question.question] || [];
+                  const on = selectedOpts.includes(option.label);
+                  return (
+                    <label key={option.label} className="check">
+                      <input
+                        type={question.multiSelect ? "checkbox" : "radio"}
+                        checked={on}
+                        onChange={() => {
+                          setQuestionAnswers((current) => {
+                            const prev = current[question.question] || [];
+                            if (question.multiSelect) {
+                              return {
+                                ...current,
+                                [question.question]: on ? prev.filter((item) => item !== option.label) : [...prev, option.label],
+                              };
+                            }
+                            return { ...current, [question.question]: [option.label] };
+                          });
+                        }}
+                      />
+                      <span>
+                        {option.label}
+                        <em>{option.description}</em>
+                      </span>
+                    </label>
+                  );
+                })}
+                <input
+                  placeholder={lang === "en" ? "Optional notes" : "补充说明（可选）"}
+                  value={questionNotes[question.question] || ""}
+                  onChange={(event) => setQuestionNotes((current) => ({ ...current, [question.question]: event.target.value }))}
+                />
+              </div>
+            ))}
+            <div className="actions">
+              <button className="ghost" type="button" onClick={() => void answerQuestions("cancelled")}>
+                {t.cancel}
+              </button>
+              <button className="primary" type="button" onClick={() => void answerQuestions("accepted")}>
+                {t.submit}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {pendingPlan ? (
+        <div className="overlay">
+          <div className="modal wide">
+            <h3>{t.reviewPlan}</h3>
+            <pre className="log">{pendingPlan.content}</pre>
+            <input value={planFeedback} placeholder={lang === "en" ? "Feedback" : "修改意见"} onChange={(event) => setPlanFeedback(event.target.value)} />
+            <div className="actions">
+              <button className="ghost" type="button" onClick={() => void answerPlan(false)}>
+                {t.requestChanges}
+              </button>
+              <button className="primary" type="button" onClick={() => void answerPlan(true)}>
+                {t.approvePlan}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
-  );
-}
-
-function SettingsRow({
-  title,
-  detail,
-  children,
-}: {
-  title: string;
-  detail?: string;
-  children?: ReactNode;
-}) {
-  return (
-    <div className="settings-row">
-      <div>
-        <div className="row-title">{title}</div>
-        {detail ? <div className="row-detail">{detail}</div> : null}
-      </div>
-      {children ? <div className="row-control">{children}</div> : null}
-    </div>
-  );
-}
-
-function MessageBody({ text, streaming }: { text: string; streaming?: boolean }) {
-  const blocks = splitBlocks(text);
-  return (
-    <div className={streaming ? "md streaming" : "md"}>
-      {blocks.map((block, index) => {
-        if (block.type === "code") {
-          return (
-            <pre key={index} className="md-code">
-              <code>{block.text}</code>
-            </pre>
-          );
-        }
-        const lines = block.text.split("\n");
-        const listed = lines.every((line) => !line.trim() || line.trim().startsWith("- ") || line.trim().startsWith("* "));
-        if (listed && lines.some((line) => line.trim().startsWith("- ") || line.trim().startsWith("* "))) {
-          return (
-            <ul key={index} className="md-list">
-              {lines
-                .filter((line) => line.trim())
-                .map((line, lineIndex) => (
-                  <li key={lineIndex}>{renderInline(line.replace(/^\s*[-*]\s+/, ""))}</li>
-                ))}
-            </ul>
-          );
-        }
-        return (
-          <p key={index} className="md-p">
-            {renderInline(block.text)}
-          </p>
-        );
-      })}
-    </div>
-  );
-}
-
-function splitBlocks(text: string) {
-  const chunks = text.split(/```/);
-  return chunks.map((chunk, index) => {
-    if (index % 2 === 1) {
-      const next = chunk.replace(/^[^\n]*\n/, "");
-      return { type: "code" as const, text: next.replace(/\n$/, "") };
-    }
-    return { type: "text" as const, text: chunk };
-  }).filter((block) => block.text.length > 0);
-}
-
-function renderInline(text: string): ReactNode {
-  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
-  return parts.map((part, index) => {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return <code key={index}>{part.slice(1, -1)}</code>;
-    }
-    if (part.startsWith("**") && part.endsWith("**")) {
-      return <strong key={index}>{part.slice(2, -2)}</strong>;
-    }
-    return <span key={index}>{part}</span>;
-  });
-}
-
-function IconSidebar() {
-  return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7">
-      <rect x="3.5" y="4.5" width="17" height="15" rx="2.2" />
-      <path d="M9 4.5v15" />
-    </svg>
-  );
-}
-function IconCompose() {
-  return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7">
-      <path d="M4 20h4l10.2-10.2a2 2 0 0 0 0-2.8L16 5a2 2 0 0 0-2.8 0L3 15.2V20z" />
-      <path d="M12.5 6.5l5 5" />
-    </svg>
-  );
-}
-function IconFolder() {
-  return (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.7">
-      <path d="M3.5 8.5h6l2 2H20.5v8.2a1.8 1.8 0 0 1-1.8 1.8H5.3a1.8 1.8 0 0 1-1.8-1.8z" />
-      <path d="M3.5 8.5V6.8A1.8 1.8 0 0 1 5.3 5h4.1l2 2" />
-    </svg>
-  );
-}
-function IconGear() {
-  return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7">
-      <circle cx="12" cy="12" r="3" />
-      <path d="M12 3.5v2.2M12 18.3V21M4.8 7.2l1.9 1.1M17.3 15.7l1.9 1.1M4.8 16.8l1.9-1.1M17.3 8.3l1.9-1.1M3.5 12H5.7M18.3 12H21" />
-    </svg>
-  );
-}
-function IconTerminal() {
-  return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7">
-      <rect x="3.5" y="5" width="17" height="14" rx="2" />
-      <path d="M7 10l3 2-3 2M12 14h5" />
-    </svg>
-  );
-}
-function IconRelay() {
-  return (
-    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7">
-      <path d="M7 7h8a4 4 0 1 1 0 8h-1" />
-      <path d="M17 17H9a4 4 0 1 1 0-8h1" />
-      <path d="M15 5l2 2-2 2M9 15l-2 2 2 2" />
-    </svg>
-  );
-}
-function IconSpark() {
-  return (
-    <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="1.5">
-      <path d="M12 3l1.4 6.1L20 10.5 13.4 12.9 12 21l-1.4-8.1L4 10.5l6.6-1.4z" />
-    </svg>
-  );
-}
-function IconChevronRight() {
-  return (
-    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M9 6l6 6-6 6" />
-    </svg>
-  );
-}
-function IconChevronLeft() {
-  return (
-    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M15 6l-6 6 6 6" />
-    </svg>
-  );
-}
-function IconChevronDown() {
-  return (
-    <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M6 9l6 6 6-6" />
-    </svg>
-  );
-}
-function IconArrowUp() {
-  return (
-    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2.2">
-      <path d="M12 19V6M6.5 11.5 12 6l5.5 5.5" />
-    </svg>
-  );
-}
-function IconStop() {
-  return (
-    <svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor">
-      <rect x="7" y="7" width="10" height="10" rx="1.4" />
-    </svg>
-  );
-}
-function IconClose() {
-  return (
-    <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M6 6l12 12M18 6L6 18" />
-    </svg>
   );
 }

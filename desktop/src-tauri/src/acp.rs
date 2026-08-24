@@ -1,5 +1,5 @@
 use crate::runtime::{grok_home, resolve_binary};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -12,9 +12,25 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.5.0";
+const CLIENT_VERSION: &str = "0.6.0";
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOptions {
+    pub model: Option<String>,
+    pub cwd: Option<String>,
+    pub existing_session_id: Option<String>,
+    pub grok_home: Option<String>,
+    pub permission_mode: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub context_window_tokens: Option<u64>,
+    pub auto_compact_threshold_percent: Option<u8>,
+    pub enable_memory: Option<bool>,
+    pub enable_web_search: Option<bool>,
+    pub enable_subagents: Option<bool>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +118,8 @@ struct AgentProcess {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: Arc<AtomicU64>,
     pending: Arc<PendingMap>,
+    permission_mode: Arc<Mutex<String>>,
+    pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 impl Drop for AgentProcess {
@@ -115,6 +133,7 @@ impl Drop for AgentProcess {
 pub struct AcpClient {
     agent: Option<AgentProcess>,
     session: Option<SessionInfo>,
+    spawn_fingerprint: Option<String>,
 }
 
 impl Default for AcpClient {
@@ -122,6 +141,7 @@ impl Default for AcpClient {
         Self {
             agent: None,
             session: None,
+            spawn_fingerprint: None,
         }
     }
 }
@@ -139,6 +159,50 @@ impl AcpClient {
     pub fn stop(&mut self) {
         self.agent = None;
         self.session = None;
+        self.spawn_fingerprint = None;
+    }
+
+    pub fn answer_interaction(&self, request_id: String, result: Value) -> Result<(), String> {
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| "Agent 尚未连接".to_string())?;
+        let rpc_id = agent
+            .pending_interactions
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&request_id))
+            .unwrap_or(Value::String(request_id));
+        write_message(
+            &agent.stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": result
+            }),
+        )
+    }
+
+    pub fn call_extension(&self, method: String, mut params: Value) -> Result<Value, String> {
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| "Agent 尚未连接".to_string())?;
+        if params.get("sessionId").and_then(Value::as_str).is_none() {
+            if let Some(session) = &self.session {
+                if let Some(object) = params.as_object_mut() {
+                    object.insert("sessionId".into(), json!(session.session_id));
+                }
+            }
+        }
+        rpc_request(
+            &agent.stdin,
+            &agent.next_id,
+            &agent.pending,
+            &method,
+            params,
+            Duration::from_secs(30),
+        )
     }
 
     pub fn cancel(&self) -> Result<(), String> {
@@ -161,39 +225,55 @@ impl AcpClient {
     pub fn ensure_session(
         &mut self,
         app: &AppHandle,
-        model: Option<String>,
-        cwd: Option<String>,
-        existing_session_id: Option<String>,
+        options: SessionOptions,
     ) -> Result<SessionInfo, String> {
-        let model = model
-            .map(|value| value.trim().to_string())
+        let model = options
+            .model
+            .as_deref()
+            .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "grok-4.5".to_string());
-        let cwd = resolve_cwd(cwd)?;
+            .unwrap_or("grok-4.5")
+            .to_string();
+        let cwd = resolve_cwd(options.cwd.clone())?;
+        let fingerprint = spawn_fingerprint(&options, &model);
+        let existing_session_id = options.existing_session_id.clone();
 
         if let Some(current) = &self.session {
             if self.agent.is_some()
+                && self.spawn_fingerprint.as_deref() == Some(&fingerprint)
                 && current.model == model
                 && current.cwd == cwd
                 && existing_session_id.as_ref() == Some(&current.session_id)
             {
+                if let Some(agent) = &self.agent {
+                    if let Ok(mut mode) = agent.permission_mode.lock() {
+                        *mode = options
+                            .permission_mode
+                            .clone()
+                            .unwrap_or_else(|| "default".to_string());
+                    }
+                }
                 return Ok(current.clone());
             }
         }
 
-        let restart_agent = self.agent.is_none()
-            || self
-                .session
-                .as_ref()
-                .map(|current| current.model != model)
-                .unwrap_or(true);
+        let restart_agent =
+            self.agent.is_none() || self.spawn_fingerprint.as_deref() != Some(&fingerprint);
         if restart_agent {
             self.stop();
-            self.spawn_agent(app, &model, &cwd)?;
+            self.spawn_agent(app, &options, &model, &cwd)?;
             self.initialize(app)?;
+            self.spawn_fingerprint = Some(fingerprint);
+        } else if let Some(agent) = &self.agent {
+            if let Ok(mut mode) = agent.permission_mode.lock() {
+                *mode = options
+                    .permission_mode
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+            }
         }
 
-        let session = self.open_session(&cwd, existing_session_id.as_deref())?;
+        let session = self.open_session(&cwd, existing_session_id.as_deref(), &options)?;
         let info = SessionInfo {
             session_id: session,
             model,
@@ -247,8 +327,21 @@ impl AcpClient {
         Ok(())
     }
 
-    fn spawn_agent(&mut self, app: &AppHandle, model: &str, cwd: &str) -> Result<(), String> {
+    fn spawn_agent(
+        &mut self,
+        app: &AppHandle,
+        options: &SessionOptions,
+        model: &str,
+        cwd: &str,
+    ) -> Result<(), String> {
         let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
+        let home = options
+            .grok_home
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(grok_home);
         let mut command = Command::new(&binary);
         command.arg("agent");
         if !model.is_empty() {
@@ -260,8 +353,30 @@ impl AcpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("GROK_HOME", grok_home())
-            .env("GROK_MEMORY", "1");
+            .env("GROK_HOME", &home)
+            .env(
+                "GROK_MEMORY",
+                if options.enable_memory.unwrap_or(false) {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
+            .env(
+                "GROK_DEBUG_CONTEXT_WINDOW",
+                options.context_window_tokens.unwrap_or(225_000).to_string(),
+            )
+            .env(
+                "GROK_AUTO_COMPACT_THRESHOLD_PERCENT",
+                options
+                    .auto_compact_threshold_percent
+                    .unwrap_or(85)
+                    .clamp(50, 99)
+                    .to_string(),
+            );
+        if options.enable_web_search == Some(false) {
+            command.env("GROK_WEB_FETCH", "0");
+        }
 
         let bin_dir = binary
             .parent()
@@ -302,11 +417,20 @@ impl AcpClient {
         let next_id = Arc::new(AtomicU64::new(1));
         let pending = PendingMap::new();
         let diagnostics = DiagnosticBuffer::new();
+        let permission_mode = Arc::new(Mutex::new(
+            options
+                .permission_mode
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        ));
+        let pending_interactions = Arc::new(Mutex::new(HashMap::new()));
         spawn_stdout_reader(
             app.clone(),
             Arc::clone(&stdin),
             Arc::clone(&pending),
             Arc::clone(&diagnostics),
+            Arc::clone(&permission_mode),
+            Arc::clone(&pending_interactions),
             stdout,
         );
         spawn_stderr_reader(app.clone(), stderr, Arc::clone(&diagnostics));
@@ -316,6 +440,8 @@ impl AcpClient {
             stdin,
             next_id,
             pending,
+            permission_mode,
+            pending_interactions,
         });
         Ok(())
     }
@@ -355,21 +481,19 @@ impl AcpClient {
         authenticate_if_needed(&agent.stdin, &agent.next_id, &agent.pending, &result)
     }
 
-    fn open_session(&self, cwd: &str, existing_session_id: Option<&str>) -> Result<String, String> {
+    fn open_session(
+        &self,
+        cwd: &str,
+        existing_session_id: Option<&str>,
+        options: &SessionOptions,
+    ) -> Result<String, String> {
         let agent = self.agent.as_ref().ok_or_else(|| "Agent 尚未连接".to_string())?;
         let method = if existing_session_id.is_some() {
             "session/load"
         } else {
             "session/new"
         };
-        let mut params = json!({
-            "cwd": cwd,
-            "mcpServers": [],
-            "_meta": {
-                "yoloMode": true,
-                "autoMode": true
-            }
-        });
+        let mut params = session_params(cwd, options);
         if let Some(session_id) = existing_session_id {
             params["sessionId"] = json!(session_id);
         }
@@ -389,14 +513,7 @@ impl AcpClient {
                     &agent.next_id,
                     &agent.pending,
                     "session/new",
-                    json!({
-                        "cwd": cwd,
-                        "mcpServers": [],
-                        "_meta": {
-                            "yoloMode": true,
-                            "autoMode": true
-                        }
-                    }),
+                    session_params(cwd, options),
                     SESSION_TIMEOUT,
                 )?;
                 session_id_from(&created, None).map_err(|_| error)
@@ -404,6 +521,48 @@ impl AcpClient {
             Err(error) => Err(error),
         }
     }
+}
+
+fn spawn_fingerprint(options: &SessionOptions, model: &str) -> String {
+    format!(
+        "{model}|{}|{}|{}|{}|{}",
+        options.grok_home.clone().unwrap_or_default(),
+        options.context_window_tokens.unwrap_or(225_000),
+        options.auto_compact_threshold_percent.unwrap_or(85),
+        options.enable_memory.unwrap_or(false),
+        options.enable_web_search.unwrap_or(true)
+    )
+}
+
+fn session_params(cwd: &str, options: &SessionOptions) -> Value {
+    let mode = options
+        .permission_mode
+        .as_deref()
+        .unwrap_or("default");
+    let mut meta = json!({
+        "yoloMode": mode == "bypassPermissions",
+        "autoMode": mode == "auto"
+    });
+    if mode == "plan" {
+        meta["agentProfile"] = if options.enable_subagents.unwrap_or(true) {
+            json!("grok-build-plan")
+        } else {
+            json!("grok-build-plan-no-subagents")
+        };
+    }
+    if let Some(effort) = options
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        meta["reasoningEffort"] = json!(effort);
+    }
+    json!({
+        "cwd": cwd,
+        "mcpServers": [],
+        "_meta": meta
+    })
 }
 
 fn resolve_cwd(cwd: Option<String>) -> Result<String, String> {
@@ -424,6 +583,8 @@ fn spawn_stdout_reader(
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<PendingMap>,
     diagnostics: Arc<DiagnosticBuffer>,
+    permission_mode: Arc<Mutex<String>>,
+    pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
     stdout: impl std::io::Read + Send + 'static,
 ) {
     thread::spawn(move || {
@@ -437,7 +598,15 @@ fn spawn_stdout_reader(
             let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            dispatch_message(&app, &stdin, &pending, &diagnostics, json);
+            dispatch_message(
+                &app,
+                &stdin,
+                &pending,
+                &diagnostics,
+                &permission_mode,
+                &pending_interactions,
+                json,
+            );
         }
         pending.fail_all("Grok Agent 已退出");
         let _ = app.emit("acp-exit", json!({ "ok": false }));
@@ -465,6 +634,8 @@ fn dispatch_message(
     stdin: &Arc<Mutex<ChildStdin>>,
     pending: &PendingMap,
     diagnostics: &DiagnosticBuffer,
+    permission_mode: &Mutex<String>,
+    pending_interactions: &Mutex<HashMap<String, Value>>,
     json: Value,
 ) {
     let id = json.get("id").cloned();
@@ -506,7 +677,14 @@ fn dispatch_message(
             || method == "x.ai/ask_user_question"
             || method == "x.ai/exit_plan_mode"
         {
-            if method == "session/request_permission" {
+            let mode = permission_mode
+                .lock()
+                .ok()
+                .map(|value| value.clone())
+                .unwrap_or_else(|| "default".to_string());
+            if method == "session/request_permission"
+                && should_auto_allow(&mode, &params)
+            {
                 if let Some(option_id) = pick_permission_option(&params) {
                     let _ = write_message(
                         stdin,
@@ -532,25 +710,18 @@ fn dispatch_message(
                     return;
                 }
             }
+            let request_id = stringify_id(&id);
+            if let Ok(mut map) = pending_interactions.lock() {
+                map.insert(request_id.clone(), id.clone());
+            }
             let _ = app.emit(
                 "acp-interaction",
                 json!({
                     "method": method,
-                    "requestId": stringify_id(&id),
+                    "requestId": request_id,
                     "params": params
                 }),
             );
-            // Keep the agent unblocked if the UI does not answer.
-            if method == "x.ai/exit_plan_mode" {
-                let _ = write_message(
-                    stdin,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "outcome": { "outcome": "approved" } }
-                    }),
-                );
-            }
             return;
         }
     }
@@ -721,10 +892,27 @@ pub fn session_update_from(params: &Value) -> Option<Value> {
     if let Some(update) = params.get("update").cloned() {
         return Some(update);
     }
-    if params.get("sessionUpdate").is_some() {
+    if params.get("sessionUpdate").is_some() || params.get("session_update").is_some() {
         return Some(params.clone());
     }
     None
+}
+
+fn should_auto_allow(permission_mode: &str, params: &Value) -> bool {
+    match permission_mode {
+        "bypassPermissions" | "auto" => true,
+        "acceptEdits" => {
+            let kind = params
+                .get("toolCall")
+                .or_else(|| params.get("tool_call"))
+                .and_then(|tool| tool.get("kind").or_else(|| tool.get("title")))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            kind.contains("edit") || kind.contains("write")
+        }
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]
@@ -884,6 +1072,26 @@ mod tests {
             Some("agent_message_chunk")
         );
         assert_eq!(content_text(&update), "hello");
+    }
+
+    #[test]
+    fn reads_snake_case_session_update() {
+        let params = json!({ "session_update": "tool_call", "title": "Edit" });
+        let update = session_update_from(&params).unwrap();
+        assert_eq!(
+            update.get("session_update").and_then(Value::as_str),
+            Some("tool_call")
+        );
+    }
+
+    #[test]
+    fn auto_allows_edits_only_in_accept_edits_mode() {
+        let edit = json!({ "toolCall": { "kind": "edit", "title": "Edit file" } });
+        let shell = json!({ "toolCall": { "kind": "execute", "title": "Run" } });
+        assert!(should_auto_allow("acceptEdits", &edit));
+        assert!(!should_auto_allow("acceptEdits", &shell));
+        assert!(should_auto_allow("bypassPermissions", &shell));
+        assert!(!should_auto_allow("default", &edit));
     }
 
     #[test]
