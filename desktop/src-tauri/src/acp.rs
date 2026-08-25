@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.13";
+const CLIENT_VERSION: &str = "0.6.18";
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;
@@ -353,11 +353,12 @@ impl AcpClient {
         );
         let cwd = resolve_cwd(options.cwd.clone())?;
         let fingerprint = spawn_fingerprint(&options, &model);
-        let existing_session_id = if crate::config::is_relay_configured(&grok_home()) {
-            None
-        } else {
-            options.existing_session_id.clone()
-        };
+        let existing_session_id = options
+            .existing_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
 
         let (agent, need_init, generation) = {
             let mut this = lock_client(shared)?;

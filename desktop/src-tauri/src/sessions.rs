@@ -1,6 +1,7 @@
 use crate::runtime::grok_home;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,7 +71,13 @@ pub fn list_local_sessions() -> Vec<LocalSessionSummary> {
     let root = grok_home().join("sessions");
     let mut out = Vec::new();
     visit_summaries(&root, &mut out);
+    unique_sessions(out)
+}
+
+fn unique_sessions(mut out: Vec<LocalSessionSummary>) -> Vec<LocalSessionSummary> {
     out.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let mut seen = HashSet::new();
+    out.retain(|item| seen.insert(item.grok_session_id.clone()));
     out.truncate(400);
     out
 }
@@ -682,5 +689,40 @@ mod tests {
         assert!(more);
         assert_eq!(latest[0].text, "你好，我是 Grok");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_sessions_keeps_newest_of_duplicate_ids() {
+        let older = LocalSessionSummary {
+            id: "sess".into(),
+            grok_session_id: "sess".into(),
+            title: "old".into(),
+            cwd: "/tmp".into(),
+            created_at: 1,
+            updated_at: 1,
+            message_count: 1,
+        };
+        let newer = LocalSessionSummary {
+            id: "sess".into(),
+            grok_session_id: "sess".into(),
+            title: "new".into(),
+            cwd: "/tmp".into(),
+            created_at: 1,
+            updated_at: 2,
+            message_count: 2,
+        };
+        let other = LocalSessionSummary {
+            id: "other".into(),
+            grok_session_id: "other".into(),
+            title: "other".into(),
+            cwd: "/tmp".into(),
+            created_at: 1,
+            updated_at: 3,
+            message_count: 1,
+        };
+        let out = unique_sessions(vec![older, newer, other]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].grok_session_id, "other");
+        assert_eq!(out[1].title, "new");
     }
 }

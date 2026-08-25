@@ -234,8 +234,82 @@ function migrateSettings(saved?: Partial<AppSettings>): AppSettings {
   return merged;
 }
 
+function isGenericTitle(title: string) {
+  const value = (title || "").trim();
+  return !value || value === "Grok Session" || value === "新对话" || value === "New chat";
+}
+
+function betterConversation(current: Conversation, incoming: Conversation) {
+  const currentMsgs = current.messages?.length || 0;
+  const incomingMsgs = incoming.messages?.length || 0;
+  if (incomingMsgs !== currentMsgs) return incomingMsgs > currentMsgs;
+  const currentGeneric = isGenericTitle(current.title);
+  const incomingGeneric = isGenericTitle(incoming.title);
+  if (currentGeneric !== incomingGeneric) return currentGeneric && !incomingGeneric;
+  if ((incoming.updatedAt || 0) !== (current.updatedAt || 0)) {
+    return (incoming.updatedAt || 0) > (current.updatedAt || 0);
+  }
+  return Boolean(incoming.grokSessionId) && !current.grokSessionId;
+}
+
+function combineConversations(current: Conversation, incoming: Conversation): Conversation {
+  const winner = betterConversation(current, incoming) ? incoming : current;
+  const loser = winner === incoming ? current : incoming;
+  const sessionId = winner.grokSessionId || loser.grokSessionId || "";
+  const stableId =
+    (current.id && current.id !== sessionId ? current.id : "") ||
+    (incoming.id && incoming.id !== sessionId ? incoming.id : "") ||
+    current.id ||
+    incoming.id;
+  return {
+    ...loser,
+    ...winner,
+    id: stableId,
+    title: isGenericTitle(winner.title) && !isGenericTitle(loser.title) ? loser.title : winner.title,
+    cwd: winner.cwd || loser.cwd,
+    grokSessionId: sessionId || winner.grokSessionId || loser.grokSessionId,
+    accountId: winner.accountId || loser.accountId,
+    messages: (winner.messages?.length || 0) >= (loser.messages?.length || 0) ? winner.messages : loser.messages,
+    updatedAt: Math.max(winner.updatedAt || 0, loser.updatedAt || 0),
+    archivedAt: winner.archivedAt ?? loser.archivedAt,
+  };
+}
+
+function keepBetter(map: Map<string, Conversation>, key: string, item: Conversation) {
+  const prev = map.get(key);
+  map.set(key, prev ? combineConversations(prev, item) : item);
+}
+
+function hydrateConversation(item: Conversation): Conversation {
+  return {
+    ...item,
+    title: item.title || "Grok Session",
+    cwd: item.cwd || "",
+    messages: (item.messages || []).map((message) => ({
+      ...message,
+      events: message.events || [],
+      media: message.media || [],
+      streaming: false,
+    })),
+  };
+}
+
+function dedupeConversations(list: Conversation[]): Conversation[] {
+  const byId = new Map<string, Conversation>();
+  for (const item of list) {
+    const id = String(item?.id || "").trim();
+    if (!id) continue;
+    keepBetter(byId, id, item);
+  }
+  const byKey = new Map<string, Conversation>();
+  for (const item of byId.values()) {
+    keepBetter(byKey, item.grokSessionId || item.id, item);
+  }
+  return [...byKey.values()].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+}
+
 function persistConversations(list: Conversation[]): Conversation[] {
-  return list.map((item) => ({
+  return dedupeConversations(list).map((item) => ({
     ...item,
     messages: item.grokSessionId
       ? []
@@ -248,6 +322,29 @@ function persistConversations(list: Conversation[]): Conversation[] {
   }));
 }
 
+function resolveSelectedId(list: Conversation[], id: string | null) {
+  if (id && list.some((item) => item.id === id && !item.archivedAt)) return id;
+  if (id) {
+    const match = list.find(
+      (item) => !item.archivedAt && (item.grokSessionId === id || item.id === id),
+    );
+    if (match) return match.id;
+  }
+  return list.find((item) => !item.archivedAt)?.id ?? null;
+}
+
+function applyConversationUpdate(
+  current: Conversation[],
+  update: Conversation[] | ((list: Conversation[]) => Conversation[]),
+) {
+  const next = typeof update === "function" ? update(current) : update;
+  const unique = dedupeConversations(next);
+  if (unique.length === current.length && unique.every((item, index) => item === current[index])) {
+    return current;
+  }
+  return unique;
+}
+
 function mergeHistoryMessages(existing: ChatMessage[], incoming: ChatMessage[], prepend: boolean) {
   if (!incoming.length) return existing;
   if (!existing.length) return incoming;
@@ -258,23 +355,35 @@ function mergeHistoryMessages(existing: ChatMessage[], incoming: ChatMessage[], 
 }
 
 function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary[]): Conversation[] {
-  const known = new Set(list.map((item) => item.grokSessionId).filter(Boolean) as string[]);
-  const extras: Conversation[] = summaries
-    .filter((item) => !known.has(item.grokSessionId))
-    .map((item) => ({
-      id: item.grokSessionId,
+  const unique = dedupeConversations(list);
+  const known = new Set<string>();
+  for (const item of unique) {
+    if (item.id) known.add(item.id);
+    if (item.grokSessionId) known.add(item.grokSessionId);
+  }
+  const seen = new Set<string>();
+  const extras: Conversation[] = [];
+  for (const item of summaries) {
+    const sessionId = String(item.grokSessionId || item.id || "").trim();
+    if (!sessionId || known.has(sessionId) || seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    extras.push({
+      id: sessionId,
       title: item.title || "Grok Session",
       cwd: item.cwd,
-      grokSessionId: item.grokSessionId,
+      grokSessionId: sessionId,
       messages: [],
       updatedAt: item.updatedAt,
       historyHasMore: true,
       historySkip: 0,
-    }));
-  const merged = list.map((item) => {
-    const summary = summaries.find((entry) => entry.grokSessionId === item.grokSessionId);
+    });
+  }
+  const merged = unique.map((item) => {
+    const summary = summaries.find(
+      (entry) => entry.grokSessionId === item.grokSessionId || entry.grokSessionId === item.id,
+    );
     if (!summary) return item;
-    const untitled = !item.title || item.title === "新对话" || item.title === "New chat" || item.title === "Grok Session";
+    const untitled = isGenericTitle(item.title);
     return {
       ...item,
       title: untitled ? summary.title : item.title,
@@ -284,7 +393,7 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
       historyHasMore: item.historyHasMore !== false,
     };
   });
-  return [...merged, ...extras].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  return dedupeConversations([...merged, ...extras]);
 }
 
 function formatAmount(value: number) {
@@ -439,18 +548,21 @@ export default function App() {
   const [modelsMessage, setModelsMessage] = useState("");
   const [relayReady, setRelayReady] = useState(Boolean(saved.relayReady));
   const [settings, setSettings] = useState<AppSettings>(() => migrateSettings(saved.settings));
-  const [conversations, setConversations] = useState<Conversation[]>(() => {
-    return (saved.conversations || []).map((item) => ({
-      ...item,
-      messages: (item.messages || []).map((message) => ({
-        ...message,
-        events: message.events || [],
-        media: message.media || [],
-        streaming: false,
-      })),
-    }));
-  });
-  const [selectedId, setSelectedId] = useState<string | null>(saved.selectedId || null);
+  const [conversations, setConversationsRaw] = useState<Conversation[]>(() =>
+    dedupeConversations((saved.conversations || []).map(hydrateConversation)),
+  );
+  const setConversations = useCallback(
+    (update: Conversation[] | ((list: Conversation[]) => Conversation[])) => {
+      setConversationsRaw((current) => applyConversationUpdate(current, update));
+    },
+    [],
+  );
+  const [selectedId, setSelectedId] = useState<string | null>(() =>
+    resolveSelectedId(
+      dedupeConversations((saved.conversations || []).map(hydrateConversation)),
+      saved.selectedId || null,
+    ),
+  );
   const [shownCount, setShownCount] = useState(VIEW_PAGE);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -520,6 +632,11 @@ export default function App() {
   relayReadyRef.current = relayReady;
   shownCountRef.current = shownCount;
 
+  useEffect(() => {
+    const next = resolveSelectedId(conversations, selectedId);
+    if (next !== selectedId) setSelectedId(next);
+  }, [conversations, selectedId]);
+
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
   const sessionCwd = selected?.cwd || cwd;
@@ -557,7 +674,7 @@ export default function App() {
 
   const projects = useMemo(() => {
     const groups = new Map<string, Conversation[]>();
-    for (const item of conversations.filter((conversation) => !conversation.archivedAt)) {
+    for (const item of dedupeConversations(conversations).filter((conversation) => !conversation.archivedAt)) {
       const key = item.cwd || homeDir || "";
       const list = groups.get(key) || [];
       list.push(item);
@@ -567,7 +684,7 @@ export default function App() {
       .map(([path, items]) => ({
         path,
         name: workspaceLabel(path, homeDir, t.home),
-        items: [...items].sort((a, b) => b.updatedAt - a.updatedAt),
+        items: dedupeConversations(items),
       }))
       .sort((a, b) => (b.items[0]?.updatedAt || 0) - (a.items[0]?.updatedAt || 0));
   }, [conversations, homeDir, t.home]);
@@ -637,7 +754,8 @@ export default function App() {
 
   const ensureConversation = useCallback(
     (list: Conversation[], id: string | null, path: string) => {
-      const live = list.filter((item) => !item.archivedAt);
+      const unique = dedupeConversations(list);
+      const live = unique.filter((item) => !item.archivedAt);
       if (live.length === 0) {
         const created: Conversation = {
           id: uid(),
@@ -646,12 +764,13 @@ export default function App() {
           messages: [],
           updatedAt: Date.now(),
         };
-        return { list: [created, ...list.filter((item) => item.archivedAt)], id: created.id };
+        return { list: [created, ...unique.filter((item) => item.archivedAt)], id: created.id };
       }
-      if (!id || !list.some((item) => item.id === id && !item.archivedAt)) {
-        return { list, id: live[0].id };
+      if (id && live.some((item) => item.id === id)) {
+        return { list: unique, id };
       }
-      return { list, id };
+      const bySession = id ? live.find((item) => item.grokSessionId === id) : undefined;
+      return { list: unique, id: bySession?.id || live[0].id };
     },
     [],
   );
@@ -1349,7 +1468,9 @@ export default function App() {
       const meta = event.metaKey || event.ctrlKey;
       if (meta && event.key.toLowerCase() === "n") {
         event.preventDefault();
-        const blank = conversationsRef.current.find((item) => item.messages.length === 0 && !item.archivedAt);
+        const blank = conversationsRef.current.find(
+          (item) => item.messages.length === 0 && !item.archivedAt && !item.grokSessionId,
+        );
         if (blank) {
           setSelectedId(blank.id);
           setView("chat");
@@ -1377,7 +1498,7 @@ export default function App() {
   }, []);
 
   function newConversation(account?: AccountRecord) {
-    const blank = conversations.find((item) => item.messages.length === 0 && !item.archivedAt);
+    const blank = conversations.find((item) => item.messages.length === 0 && !item.archivedAt && !item.grokSessionId);
     if (blank && !account) {
       setSelectedId(blank.id);
       setView("chat");
@@ -1916,7 +2037,7 @@ export default function App() {
                     {open
                       ? project.items.map((item) => (
                           <button
-                            key={item.id}
+                            key={item.grokSessionId || item.id}
                             className={item.id === selectedId ? "session on" : "session"}
                             type="button"
                             onClick={() => selectConversation(item.id)}
