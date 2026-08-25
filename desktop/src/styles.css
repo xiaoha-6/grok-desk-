@@ -322,6 +322,13 @@ button { background: none; }
 .mini-spin { width: 10px; height: 10px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.transcript-shell {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .transcript {
   flex: 1;
   min-height: 0;
@@ -500,8 +507,40 @@ button { background: none; }
 .fail pre { font-size: 13px; margin-bottom: 10px; }
 
 .composer-wrap {
+  position: relative;
+  z-index: 6;
+  overflow: visible;
   padding: 0 28px 18px;
   min-width: 0;
+}
+.jump-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  z-index: 12;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px 0 10px;
+  border: 1px solid var(--composer-border);
+  border-radius: 999px;
+  background: var(--composer);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+.jump-bottom:hover {
+  color: var(--text);
+  background: var(--group);
+}
+.jump-bottom svg {
+  flex: 0 0 auto;
 }
 .composer {
   max-width: 780px;
@@ -669,6 +708,11 @@ button { background: none; }
   flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
+}
+.row-control .app-select.field,
+.settings-row.bare > .app-select.field {
+  min-width: min(168px, 100%);
+  max-width: min(280px, 100%);
 }
 .model-pick {
   display: flex;
@@ -1443,9 +1487,10 @@ button.ws-row { padding: 4px 8px; }
   flex: 0 0 auto;
   min-width: 0;
 }
-.perm-chip select,
-.model-mini,
-.effort-mini {
+.model-mini {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(22em, 52%);
   border: 0;
   background: transparent;
   outline: none;
@@ -1453,33 +1498,141 @@ button.ws-row { padding: 4px 8px; }
   cursor: pointer;
   white-space: nowrap;
 }
-.perm-chip select {
-  max-width: 8.5em;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.model-mini {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: min(22em, 52%);
-}
-.effort-mini {
-  flex: 0 0 auto;
-  max-width: 6.5em;
-}
 .composer-bar > .send,
 .composer-bar > .icon-btn {
   flex: 0 0 auto;
 }
-.composer-bar > .model-picker.inline {
+.composer-bar > .model-picker.inline,
+.composer-bar > .app-select.inline {
   flex: 0 1 auto;
   width: fit-content;
+  min-width: 0;
+}
+.composer-bar > .model-picker.inline {
   min-width: 4.5rem;
   max-width: min(16rem, 42%);
 }
-.model-picker.inline .model-picker-trigger {
+.composer-bar > .app-select.perm-chip {
+  max-width: min(10.5rem, 34%);
+}
+.composer-bar > .app-select.effort-mini {
+  max-width: 6.8em;
+}
+.model-picker.inline .model-picker-trigger,
+.app-select.inline .app-select-trigger {
   width: auto;
+}
+.app-select {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+}
+.app-select.inline {
+  display: flex;
+  min-width: 0;
+}
+.app-select.field {
+  display: block;
+  width: min(220px, 100%);
+}
+.app-select-trigger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 4px 0 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  overflow: hidden;
+}
+.app-select.field .app-select-trigger {
+  width: 100%;
+  height: auto;
+  min-height: 34px;
+  padding: 7px 10px;
+  background: var(--input);
+  border: 1px solid var(--hairline);
+  color: var(--text);
+}
+.app-select-trigger:hover { background: var(--hover); color: var(--text); }
+.app-select.field .app-select-trigger:hover { background: var(--input); }
+.app-select-trigger.on { background: var(--active); color: var(--text); }
+.app-select-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+.app-select-prefix {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: var(--text-2);
+}
+.app-select-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+}
+.app-select-trigger svg {
+  flex: 0 0 auto;
+  color: var(--text-3);
+}
+.app-select-menu {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--group);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  isolation: isolate;
+}
+.app-select-list {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  overscroll-behavior: contain;
+}
+.app-select-option {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.app-select-option:hover,
+.app-select-option.active { background: var(--hover); }
+.app-select-option.on { background: var(--active); }
+.app-select-option-name,
+.app-select-option-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-select-option-name { font-size: var(--item); }
+.app-select-option-id { font-size: 12px; color: var(--text-3); }
+.app-select-empty {
+  padding: 14px 10px;
+  color: var(--text-3);
+  font-size: 13px;
+  text-align: center;
 }
 .model-picker {
   position: relative;
@@ -1609,16 +1762,16 @@ button.ws-row { padding: 4px 8px; }
   text-align: center;
 }
 @container composer (max-width: 560px) {
-  .perm-chip select { max-width: 6.8em; }
+  .composer-bar > .app-select.perm-chip { max-width: min(8.5rem, 40%); }
   .composer-bar > .model-picker.inline { max-width: min(12rem, 36%); }
-  .effort-mini { max-width: 5.2em; }
+  .composer-bar > .app-select.effort-mini { max-width: 5.2em; }
 }
 @container composer (max-width: 420px) {
   .composer-bar { gap: 6px; flex-wrap: wrap; }
   .composer-bar-spacer { flex-basis: 100%; height: 0; min-width: 0; }
-  .perm-chip select { max-width: 5.4em; }
+  .composer-bar > .app-select.perm-chip { max-width: none; flex: 1 1 8rem; }
   .composer-bar > .model-picker.inline { max-width: none; flex: 1 1 10rem; min-width: 6rem; width: auto; }
-  .effort-mini { max-width: 5em; }
+  .composer-bar > .app-select.effort-mini { max-width: none; flex: 0 1 6rem; }
 }
 @container settings-group (max-width: 540px) {
   .settings-row {
@@ -1628,7 +1781,9 @@ button.ws-row { padding: 4px 8px; }
   }
   .row-control,
   .model-pick,
-  .model-pick .model-picker {
+  .model-pick .model-picker,
+  .row-control .app-select,
+  .settings-row.bare > .app-select {
     width: 100%;
     max-width: none;
   }
@@ -1681,7 +1836,9 @@ button.ws-row { padding: 4px 8px; }
   }
   .row-control,
   .model-pick,
-  .model-pick .model-picker {
+  .model-pick .model-picker,
+  .row-control .app-select,
+  .settings-row.bare > .app-select {
     width: 100%;
     max-width: none;
   }

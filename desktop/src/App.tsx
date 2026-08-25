@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -10,6 +11,7 @@ import {
   type DragEvent as ReactDragEvent,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -37,6 +39,7 @@ import {
 import { t as translate, type Copy } from "./i18n";
 import { MessageBody } from "./markdown";
 import { ModelPicker } from "./ModelPicker";
+import { Select } from "./Select";
 import { SettingsView } from "./SettingsView";
 import { isRedundantExtension, jsonText } from "./timeline";
 import {
@@ -585,6 +588,7 @@ export default function App() {
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [pendingPlan, setPendingPlan] = useState<PendingPlan | null>(null);
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<"tools" | "plan" | "events">("tools");
   const [questionNotes, setQuestionNotes] = useState<Record<string, string>>({});
@@ -775,12 +779,29 @@ export default function App() {
     [],
   );
 
+  const syncJumpButton = useCallback((el: HTMLElement) => {
+    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setShowJumpToBottom(gap > 48 && el.scrollHeight > el.clientHeight + 8);
+  }, []);
+
+  const updateFollowState = useCallback((el: HTMLElement) => {
+    const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+    followRef.current = gap < 72;
+    syncJumpButton(el);
+  }, [syncJumpButton]);
+
   const scrollToBottom = useCallback((force = false) => {
     const el = transcriptRef.current;
     if (!el) return;
     if (!force && !followRef.current) return;
     el.scrollTop = el.scrollHeight;
+    followRef.current = true;
+    setShowJumpToBottom(false);
   }, []);
+
+  const jumpToBottom = useCallback(() => {
+    scrollToBottom(true);
+  }, [scrollToBottom]);
 
   const mutateAssistant = useCallback(
     (mutator: (assistant: ChatMessage, conversation: Conversation) => Conversation | void) => {
@@ -1148,6 +1169,13 @@ export default function App() {
       );
       if (!older) {
         setShownCount(Math.max(VIEW_PAGE, incoming.length));
+        requestAnimationFrame(() => {
+          const box = transcriptRef.current;
+          if (!box) return;
+          box.scrollTop = box.scrollHeight;
+          followRef.current = true;
+          setShowJumpToBottom(false);
+        });
       }
       if (older || skip > 0) {
         setShownCount((count) => count + incoming.length);
@@ -1155,6 +1183,7 @@ export default function App() {
           const box = transcriptRef.current;
           if (!box) return;
           box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+          updateFollowState(box);
         });
       }
       if (!older && history.usedTokens != null) {
@@ -1170,7 +1199,34 @@ export default function App() {
       historyBusyRef.current = false;
       setLoadingOlder(false);
     }
-  }, []);
+  }, [updateFollowState]);
+
+  useLayoutEffect(() => {
+    followRef.current = true;
+    setShowJumpToBottom(false);
+    scrollToBottom(true);
+  }, [selectedId, scrollToBottom]);
+
+  useLayoutEffect(() => {
+    const el = transcriptRef.current;
+    if (el) syncJumpButton(el);
+  }, [selected?.messages, shownCount, running, syncJumpButton]);
+
+  useEffect(() => {
+    const root = transcriptRef.current;
+    if (!root) return;
+    const sync = () => syncJumpButton(root);
+    const observer = new ResizeObserver(sync);
+    observer.observe(root);
+    Array.from(root.children).forEach((child) => observer.observe(child));
+    window.addEventListener("resize", sync);
+    const frame = requestAnimationFrame(sync);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", sync);
+    };
+  }, [selectedId, selected?.messages.length, shownCount, syncJumpButton]);
 
   useEffect(() => {
     const root = transcriptRef.current;
@@ -1500,6 +1556,8 @@ export default function App() {
   function newConversation(account?: AccountRecord) {
     const blank = conversations.find((item) => item.messages.length === 0 && !item.archivedAt && !item.grokSessionId);
     if (blank && !account) {
+      followRef.current = true;
+      setShowJumpToBottom(false);
       setSelectedId(blank.id);
       setView("chat");
       return;
@@ -1518,6 +1576,8 @@ export default function App() {
     setPrompt("");
     setPendingImages([]);
     setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
+    followRef.current = true;
+    setShowJumpToBottom(false);
   }
 
   function selectConversation(id: string) {
@@ -1526,6 +1586,7 @@ export default function App() {
     setShownCount(VIEW_PAGE);
     setView("chat");
     followRef.current = true;
+    setShowJumpToBottom(false);
     if (item?.cwd) setCwd(item.cwd);
     void loadSessionHistory(id);
   }
@@ -1590,6 +1651,7 @@ export default function App() {
     setRunning(true);
     setStatusText(t.connecting);
     followRef.current = true;
+    setShowJumpToBottom(false);
     const title =
       conversation.title === translate("zh").newChat || conversation.title === translate("en").newChat
         ? (text.trim() || attachments[0]?.name || t.newChat).slice(0, 28)
@@ -1781,6 +1843,7 @@ export default function App() {
         const box = transcriptRef.current;
         if (!box) return;
         box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+        updateFollowState(box);
       });
       return;
     }
@@ -1792,9 +1855,16 @@ export default function App() {
   function onTranscriptScroll() {
     const el = transcriptRef.current;
     if (!el) return;
-    followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
+    updateFollowState(el);
     if (el.scrollTop > 80) return;
     if (selectedIdRef.current) revealOlder(selectedIdRef.current);
+  }
+
+  function onTranscriptWheel(event: ReactWheelEvent<HTMLElement>) {
+    if (event.deltaY < 0) followRef.current = false;
+    const el = transcriptRef.current;
+    if (!el) return;
+    requestAnimationFrame(() => updateFollowState(el));
   }
 
   function beginResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -2170,98 +2240,117 @@ export default function App() {
           </div>
         </header>
 
-        <section ref={transcriptRef} className="transcript" onScroll={onTranscriptScroll}>
-          {selected?.grokSessionId || selected?.messages.length ? (
-            <div className="history-more-bar">
-              {selected.messages.length > shownCount || (selected.grokSessionId && selected.historyHasMore !== false) ? (
-                <button
-                  className="ghost compact history-more"
-                  type="button"
-                  disabled={loadingOlder}
-                  onClick={() => revealOlder(selected.id)}
-                >
-                  {loadingOlder ? t.loadingOlder : t.loadOlder}
-                </button>
-              ) : (
-                <span className="history-start">{t.historyStart}</span>
-              )}
-            </div>
-          ) : null}
-          {!selected?.messages.length ? (
-            <div className="empty">
-              <div className="empty-hero">
-                <GrokMark size={72} className="empty-mark" />
-                <div className="empty-wordmark">{t.emptyWordmark}</div>
+        <div className="transcript-shell">
+          <section
+            ref={transcriptRef}
+            className="transcript"
+            onScroll={onTranscriptScroll}
+            onWheel={onTranscriptWheel}
+          >
+            {selected?.grokSessionId || selected?.messages.length ? (
+              <div className="history-more-bar">
+                {selected.messages.length > shownCount || (selected.grokSessionId && selected.historyHasMore !== false) ? (
+                  <button
+                    className="ghost compact history-more"
+                    type="button"
+                    disabled={loadingOlder}
+                    onClick={() => revealOlder(selected.id)}
+                  >
+                    {loadingOlder ? t.loadingOlder : t.loadOlder}
+                  </button>
+                ) : (
+                  <span className="history-start">{t.historyStart}</span>
+                )}
               </div>
-              <h1>{t.emptyTitle}</h1>
-              <p>{projectName || t.emptyHint}</p>
-              {!accounts.some((account) => account.loggedIn) && !status?.credentialsReady ? (
-                <button
-                  className="primary"
-                  type="button"
-                  onClick={() => {
-                    setView("settings");
-                    setSettingsPage("relay");
-                  }}
-                >
-                  {t.xiaohaRelay}
-                </button>
-              ) : null}
-            </div>
-          ) : (
-            <div className="messages">
-              <div ref={topSentinelRef} className="history-sentinel" />
-              {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (
-                <article key={message.id} className={`row ${message.role}`}>
-                  <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
-                    {message.role === "assistant" && message.events.length ? (
-                      <ActivityTimeline
-                        events={message.events}
-                        lang={lang}
-                        defaultOpen={message.streaming || message.events.length > 0}
-                      />
-                    ) : message.thought ? (
-                      <details className="thought" open={message.streaming && !message.text}>
-                        <summary>{t.thinking}</summary>
-                        <pre>{message.thought}</pre>
-                      </details>
-                    ) : null}
-                    {message.text || message.streaming ? (
-                      <MessageBody
-                        text={message.text || (message.streaming && !message.events.length ? t.thinkingNow : "")}
-                        streaming={message.streaming && Boolean(message.text)}
-                      />
-                    ) : null}
-                    {message.media.map((item) =>
-                      item.type === "image" && item.data ? (
-                        <img key={item.id} className="chat-media" src={`data:${item.mimeType || "image/png"};base64,${item.data}`} alt={item.name || ""} />
-                      ) : (
-                        <a key={item.id} className="media-link" href={item.uri} target="_blank" rel="noreferrer">
-                          {item.name || item.uri || item.type}
-                        </a>
-                      ),
-                    )}
-                    {message.streaming ? (
-                      <div className="working">
-                        <span className="spinner" />
-                        {t.working}
-                      </div>
-                    ) : null}
-                    {message.error ? (
-                      <div className="fail">
-                        <div className="fail-title">{t.failed}</div>
-                        <pre>{message.error}</pre>
-                        <button className="ghost compact" type="button" onClick={() => void regenerate()}>
-                          {t.regenerate}
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
+            ) : null}
+            {!selected?.messages.length ? (
+              <div className="empty">
+                <div className="empty-hero">
+                  <GrokMark size={72} className="empty-mark" />
+                  <div className="empty-wordmark">{t.emptyWordmark}</div>
+                </div>
+                <h1>{t.emptyTitle}</h1>
+                <p>{projectName || t.emptyHint}</p>
+                {!accounts.some((account) => account.loggedIn) && !status?.credentialsReady ? (
+                  <button
+                    className="primary"
+                    type="button"
+                    onClick={() => {
+                      setView("settings");
+                      setSettingsPage("relay");
+                    }}
+                  >
+                    {t.xiaohaRelay}
+                  </button>
+                ) : null}
+              </div>
+            ) : (
+              <div className="messages">
+                <div ref={topSentinelRef} className="history-sentinel" />
+                {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (
+                  <article key={message.id} className={`row ${message.role}`}>
+                    <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
+                      {message.role === "assistant" && message.events.length ? (
+                        <ActivityTimeline
+                          events={message.events}
+                          lang={lang}
+                          defaultOpen={message.streaming || message.events.length > 0}
+                        />
+                      ) : message.thought ? (
+                        <details className="thought" open={message.streaming && !message.text}>
+                          <summary>{t.thinking}</summary>
+                          <pre>{message.thought}</pre>
+                        </details>
+                      ) : null}
+                      {message.text || message.streaming ? (
+                        <MessageBody
+                          text={message.text || (message.streaming && !message.events.length ? t.thinkingNow : "")}
+                          streaming={message.streaming && Boolean(message.text)}
+                        />
+                      ) : null}
+                      {message.media.map((item) =>
+                        item.type === "image" && item.data ? (
+                          <img key={item.id} className="chat-media" src={`data:${item.mimeType || "image/png"};base64,${item.data}`} alt={item.name || ""} />
+                        ) : (
+                          <a key={item.id} className="media-link" href={item.uri} target="_blank" rel="noreferrer">
+                            {item.name || item.uri || item.type}
+                          </a>
+                        ),
+                      )}
+                      {message.streaming ? (
+                        <div className="working">
+                          <span className="spinner" />
+                          {t.working}
+                        </div>
+                      ) : null}
+                      {message.error ? (
+                        <div className="fail">
+                          <div className="fail-title">{t.failed}</div>
+                          <pre>{message.error}</pre>
+                          <button className="ghost compact" type="button" onClick={() => void regenerate()}>
+                            {t.regenerate}
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+          {showJumpToBottom && selected?.messages.length ? (
+            <button
+              className="jump-bottom"
+              type="button"
+              title={t.scrollToBottom}
+              aria-label={t.scrollToBottom}
+              onClick={jumpToBottom}
+            >
+              <IconChevronDown />
+              <span>{t.scrollToBottom}</span>
+            </button>
+          ) : null}
+        </div>
 
         <footer className="composer-wrap">
           <div
@@ -2340,19 +2429,19 @@ export default function App() {
               onKeyDown={onComposerKey}
             />
             <div className="composer-bar">
-              <label className="perm-chip">
-                <IconShield />
-                <select
-                  value={settings.permissionMode}
-                  onChange={(event) => patchSettings({ permissionMode: event.target.value })}
-                >
-                  {PERMISSION_MODES.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {lang === "en" ? item.labelEn : item.labelZh}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <Select
+                className="perm-chip"
+                value={settings.permissionMode}
+                onChange={(value) => patchSettings({ permissionMode: value })}
+                variant="inline"
+                align="start"
+                ariaLabel={t.permissionMode}
+                prefix={<IconShield />}
+                options={PERMISSION_MODES.map((item) => ({
+                  id: item.id,
+                  label: lang === "en" ? item.labelEn : item.labelZh,
+                }))}
+              />
               <button className="icon-btn context-btn" type="button" onClick={() => setShowContext((value) => !value)}>
                 <span className="context-ring" style={{ background: `conic-gradient(currentColor ${usagePercent}%, var(--hairline) 0)` }} />
               </button>
@@ -2367,18 +2456,16 @@ export default function App() {
                 searchPlaceholder={t.searchModels}
                 emptyLabel={t.noMatchingModels}
               />
-              <select
+              <Select
                 className="effort-mini"
                 value={settings.reasoningEffort}
-                onChange={(event) => patchSettings({ reasoningEffort: event.target.value })}
+                onChange={(value) => patchSettings({ reasoningEffort: value })}
                 disabled={running}
-              >
-                {EFFORTS.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
+                variant="inline"
+                align="end"
+                ariaLabel={t.effort}
+                options={EFFORTS.map((item) => ({ id: item.id, label: item.label }))}
+              />
               {running ? (
                 <button className="send stop" type="button" title="Stop" onClick={() => void stopTurn()}>
                   <IconStop />

@@ -12,7 +12,10 @@ import {
 } from "./icons";
 import type { Copy } from "./i18n";
 import { ModelPicker } from "./ModelPicker";
+import { Select } from "./Select";
 import {
+  EFFORTS,
+  PERMISSION_MODES,
   mergeModelOptions,
   type AccountRecord,
   type AppSettings,
@@ -230,17 +233,31 @@ export function SettingsView(props: {
             <>
               <section className="group">
                 <SettingsRow title={copy.appearance} detail={copy.appearanceDetail}>
-                  <select value={props.theme} onChange={(event) => props.setTheme(event.target.value as Theme)}>
-                    <option value="system">{copy.followSystem}</option>
-                    <option value="light">{copy.light}</option>
-                    <option value="dark">{copy.dark}</option>
-                  </select>
+                  <Select
+                    variant="field"
+                    align="end"
+                    ariaLabel={copy.appearance}
+                    value={props.theme}
+                    onChange={(value) => props.setTheme(value as Theme)}
+                    options={[
+                      { id: "system", label: copy.followSystem },
+                      { id: "light", label: copy.light },
+                      { id: "dark", label: copy.dark },
+                    ]}
+                  />
                 </SettingsRow>
                 <SettingsRow title={copy.language} detail={copy.languageDetail}>
-                  <select value={props.lang} onChange={(event) => props.setLang(event.target.value as Lang)}>
-                    <option value="zh">简体中文</option>
-                    <option value="en">English</option>
-                  </select>
+                  <Select
+                    variant="field"
+                    align="end"
+                    ariaLabel={copy.language}
+                    value={props.lang}
+                    onChange={(value) => props.setLang(value as Lang)}
+                    options={[
+                      { id: "zh", label: "简体中文" },
+                      { id: "en", label: "English" },
+                    ]}
+                  />
                 </SettingsRow>
               </section>
               <section className="group">
@@ -267,16 +284,14 @@ export function SettingsView(props: {
                   </div>
                 </SettingsRow>
                 <SettingsRow title={copy.effort} detail={copy.modelDetail}>
-                  <select
+                  <Select
+                    variant="field"
+                    align="end"
+                    ariaLabel={copy.effort}
                     value={props.settings.reasoningEffort}
-                    onChange={(event) => props.patchSettings({ reasoningEffort: event.target.value })}
-                  >
-                    <option value="minimal">Minimal</option>
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                    <option value="xhigh">X-High</option>
-                  </select>
+                    onChange={(value) => props.patchSettings({ reasoningEffort: value })}
+                    options={EFFORTS.map((item) => ({ id: item.id, label: item.label }))}
+                  />
                 </SettingsRow>
               </section>
             </>
@@ -431,16 +446,17 @@ export function SettingsView(props: {
           {props.settingsPage === "agent" && (
             <section className="group">
               <SettingsRow title={copy.permissionMode} detail={copy.permissionDetail}>
-                <select
+                <Select
+                  variant="field"
+                  align="end"
+                  ariaLabel={copy.permissionMode}
                   value={props.settings.permissionMode}
-                  onChange={(event) => props.patchSettings({ permissionMode: event.target.value })}
-                >
-                  <option value="default">{copy.confirmEach}</option>
-                  <option value="acceptEdits">{copy.acceptEdits}</option>
-                  <option value="auto">{copy.autoRun}</option>
-                  <option value="plan">{copy.planMode}</option>
-                  <option value="bypassPermissions">{copy.bypass}</option>
-                </select>
+                  onChange={(value) => props.patchSettings({ permissionMode: value })}
+                  options={PERMISSION_MODES.map((item) => ({
+                    id: item.id,
+                    label: props.lang === "en" ? item.labelEn : item.labelZh,
+                  }))}
+                />
               </SettingsRow>
               <SettingsRow title={copy.memory} detail={copy.memoryDetail}>
                 <Toggle
@@ -542,34 +558,36 @@ export function SettingsView(props: {
                     <div className="row-title">{copy.routing}</div>
                     <div className="row-detail">{routingHint}</div>
                   </div>
-                  <select
+                  <Select
+                    variant="field"
+                    align="end"
+                    ariaLabel={copy.routing}
                     value={props.settings.routingMode}
-                    onChange={(event) => props.patchSettings({ routingMode: event.target.value })}
-                  >
-                    <option value="quota">{copy.routingQuota}</option>
-                    <option value="sequential">{copy.routingSequential}</option>
-                    <option value="roundRobin">{copy.routingRoundRobin}</option>
-                    <option value="fixed">{copy.routingFixed}</option>
-                  </select>
+                    onChange={(value) => props.patchSettings({ routingMode: value })}
+                    options={[
+                      { id: "quota", label: copy.routingQuota },
+                      { id: "sequential", label: copy.routingSequential },
+                      { id: "roundRobin", label: copy.routingRoundRobin },
+                      { id: "fixed", label: copy.routingFixed },
+                    ]}
+                  />
                 </div>
                 {props.settings.routingMode === "fixed" ? (
                   <div className="settings-row bare">
                     <div className="row-title">{copy.preferredAccount}</div>
-                    <select
+                    <Select
+                      variant="field"
+                      align="end"
+                      ariaLabel={copy.preferredAccount}
                       value={props.settings.preferredAccountId || ""}
-                      onChange={(event) =>
-                        props.patchSettings({ preferredAccountId: event.target.value || null })
-                      }
-                    >
-                      <option value="">{copy.autoFallback}</option>
-                      {props.accounts
-                        .filter((account) => account.enabled)
-                        .map((account) => (
-                          <option key={account.id} value={account.id}>
-                            {account.name}
-                          </option>
-                        ))}
-                    </select>
+                      onChange={(value) => props.patchSettings({ preferredAccountId: value || null })}
+                      options={[
+                        { id: "", label: copy.autoFallback },
+                        ...props.accounts
+                          .filter((account) => account.enabled)
+                          .map((account) => ({ id: account.id, label: account.name })),
+                      ]}
+                    />
                   </div>
                 ) : null}
               </section>
