@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "grokdesk"
-version = "0.6.26"
+version = "0.6.27"
 dependencies = [
  "arboard",
  "base64 0.22.1",

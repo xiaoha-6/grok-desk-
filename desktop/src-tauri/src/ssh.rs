@@ -1,4 +1,4 @@
-use crate::workspace::{WorkspaceEntry, WorkspaceFile, SKIP_DIRS, MAX_ENTRIES, MAX_FILE_BYTES, language_for_name};
+use crate::workspace::{WorkspaceEntry, WorkspaceFile, SKIP_DIRS, MAX_FILE_BYTES, language_for_name};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -159,7 +159,16 @@ pub fn probe(target: &SshTarget) -> Result<SshProbe, String> {
     let mut probe = parse_probe(&stdout, browse)?;
     let mut listing = target.clone();
     listing.remote_path = probe.remote_path.clone();
-    probe.entries = list_remote_workspace(&listing, None).unwrap_or_default();
+    match list_remote_workspace(&listing, None) {
+        Ok(entries) => probe.entries = entries,
+        Err(err) => {
+            if probe.message.is_empty() {
+                probe.message = err;
+            } else {
+                probe.message = format!("{}（{err}）", probe.message);
+            }
+        }
+    }
     Ok(probe)
 }
 
@@ -179,83 +188,58 @@ pub fn list_remote_dir(target: &SshTarget, path: Option<&str>) -> Result<Vec<Wor
 pub fn list_remote_workspace(target: &SshTarget, rel: Option<&str>) -> Result<Vec<WorkspaceEntry>, String> {
     let rel = sanitize_rel(rel.unwrap_or(""))?;
     let remote = join_remote(&target.remote_path, &rel);
+    let quoted = sh_single(&remote);
     let script = format!(
-        r#"python3 -c "import json,os,sys
-root=os.path.expanduser(sys.argv[1])
-skip=set({skip})
-max_entries={max_entries}
-try:
-    names=os.listdir(root)
-except FileNotFoundError:
-    print('ERR:not_found'); raise SystemExit(2)
-except NotADirectoryError:
-    print('ERR:not_dir'); raise SystemExit(2)
-except PermissionError:
-    print('ERR:denied'); raise SystemExit(2)
-out=[]
-for name in names:
-    if name in ('.','..'):
-        continue
-    path=os.path.join(root,name)
-    is_dir=os.path.isdir(path)
-    if is_dir and (name.startswith('.') or name in skip):
-        continue
-    out.append({{'name':name,'isDir':bool(is_dir)}})
-    if len(out)>=max_entries:
-        break
-out.sort(key=lambda item:(not item['isDir'], item['name'].lower()))
-print('OK')
-print(json.dumps(out,ensure_ascii=False))
-" {remote}"#,
-        remote = sh_single(&remote),
-        skip = serde_json::to_string(&SKIP_DIRS).unwrap_or_else(|_| "[]".into()),
-        max_entries = MAX_ENTRIES,
+        "root={quoted}; case \"$root\" in ~|~/ *) root=\"$HOME${{root#~}}\";; esac; if [ ! -e \"$root\" ]; then echo ERR:not_found; exit 2; fi; if [ ! -d \"$root\" ]; then echo ERR:not_dir; exit 2; fi; if [ ! -r \"$root\" ]; then echo ERR:denied; exit 2; fi; printf 'OK\\n'; ls -1A \"$root\" | while IFS= read -r name; do [ -n \"$name\" ] || continue; if [ -d \"$root/$name\" ]; then printf 'D\\t%s\\n' \"$name\"; else printf 'F\\t%s\\n' \"$name\"; fi; done",
+        quoted = quoted,
     );
     let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout.contains("ERR:not_found") {
+        return Err("远程路径不存在".into());
+    }
+    if stdout.contains("ERR:not_dir") {
+        return Err("不是文件夹".into());
+    }
+    if stdout.contains("ERR:denied") {
+        return Err("没有权限读取该目录".into());
+    }
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
         return Err(ssh_error(&stderr, &stdout, output.status.code()));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('[') || line.starts_with("ERR:"))
-        .unwrap_or("");
-    if json_line.starts_with("ERR:") {
-        return Err(match json_line {
-            "ERR:not_found" => "远程路径不存在".into(),
-            "ERR:not_dir" => "不是文件夹".into(),
-            "ERR:denied" => "没有权限读取该目录".into(),
-            other => format!("无法列出远程目录：{other}"),
-        });
-    }
-    let raw: Vec<serde_json::Value> =
-        serde_json::from_str(json_line).map_err(|err| format!("无法解析远程目录：{err}"))?;
+    let skip: std::collections::HashSet<&str> = SKIP_DIRS.iter().copied().collect();
     let mut entries = Vec::new();
-    for item in raw {
-        let name = item
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+    for line in stdout.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line == "OK" {
+            continue;
+        }
+        let Some((kind, name)) = line.split_once('\t') else {
+            continue;
+        };
+        let name = name.trim();
         if name.is_empty() {
             continue;
         }
-        let is_dir = item.get("isDir").and_then(|value| value.as_bool()).unwrap_or(false);
+        let is_dir = kind == "D";
+        if is_dir && (name.starts_with('.') || skip.contains(name)) {
+            continue;
+        }
         let path = if rel.is_empty() {
-            name.clone()
+            name.to_string()
         } else {
             format!("{rel}/{name}")
         };
         entries.push(WorkspaceEntry {
-            name,
+            name: name.to_string(),
             path: path.replace('\\', "/"),
             is_dir,
         });
     }
+    entries.sort_by(|left, right| {
+        (!left.is_dir, left.name.to_ascii_lowercase()).cmp(&(!right.is_dir, right.name.to_ascii_lowercase()))
+    });
     Ok(entries)
 }
 
@@ -265,22 +249,10 @@ pub fn read_remote_file(target: &SshTarget, rel: &str) -> Result<WorkspaceFile, 
         return Err("还没有选择文件".into());
     }
     let remote = join_remote(&target.remote_path, &rel);
+    let quoted = sh_single(&remote);
     let script = format!(
-        r#"python3 -c "import os,sys
-path=os.path.expanduser(sys.argv[1])
-limit={limit}
-if os.path.isdir(path):
-    print('ERR:dir'); raise SystemExit(2)
-try:
-    size=os.path.getsize(path)
-except FileNotFoundError:
-    print('ERR:not_found'); raise SystemExit(2)
-except PermissionError:
-    print('ERR:denied'); raise SystemExit(2)
-print('OK %s'%size)
-sys.stdout.buffer.write(open(path,'rb').read(limit))
-" {remote}"#,
-        remote = sh_single(&remote),
+        "path={quoted}; case \"$path\" in ~|~/ *) path=\"$HOME${{path#~}}\";; esac; if [ -d \"$path\" ]; then echo ERR:dir; exit 2; fi; if [ ! -e \"$path\" ]; then echo ERR:not_found; exit 2; fi; if [ ! -r \"$path\" ]; then echo ERR:denied; exit 2; fi; size=$(wc -c < \"$path\" | tr -d ' '); printf 'OK %s\\n' \"$size\"; dd if=\"$path\" bs=1 count={limit} 2>/dev/null",
+        quoted = quoted,
         limit = MAX_FILE_BYTES,
     );
     let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;

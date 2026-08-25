@@ -1763,9 +1763,9 @@ export default function App() {
   }
 
   async function applySshWorkspace(target = sshForm) {
-    const folder = (target.remotePath || sshBrowsePath).trim();
-    if (!folder || folder === "~" || folder === "/" || folder === "/home" || folder === "/root" || folder === "/Users") {
-      setSshError(t.workspaceHomeHint);
+    const folder = (sshBrowsePath || target.remotePath).trim();
+    if (!folder) {
+      setSshError(t.sshConnectedPick);
       return;
     }
     const probe = sshProbe || (await testSsh(target));
@@ -2275,6 +2275,9 @@ export default function App() {
                   ) : null}
                 </div>
                 <div className="ssh-browser-list">
+                  {sshEntries.filter((item) => item.isDir).length === 0 ? (
+                    <div className="hint left" style={{ padding: "8px 12px" }}>{sshBusy ? t.sshConnecting : t.sshConnectedPick}</div>
+                  ) : null}
                   {sshEntries.filter((item) => item.isDir).map((item) => {
                     const base = (sshBrowsePath || sshForm.remotePath || "~").replace(/\/+$/, "");
                     const full = `${base}/${item.name}`.replace(/\/+/g, "/");
@@ -2285,10 +2288,9 @@ export default function App() {
                         className={`ssh-dir${selected ? " selected" : ""}`}
                         type="button"
                         disabled={sshBusy}
-                        onClick={() => setSshForm((current) => ({ ...current, remotePath: full }))}
-                        onDoubleClick={() => void browseSshDir(full)}
+                        onClick={() => void browseSshDir(full)}
                       >
-                        <span>{item.name}</span>
+                        <span>{item.name}/</span>
                       </button>
                     );
                   })}
@@ -2314,7 +2316,7 @@ export default function App() {
               <button className="ghost compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || (sshForm.auth === "password" && !String(sshForm.password || "").trim())} onClick={() => void testSsh()}>
                 {sshBusy ? t.sshConnecting : t.sshTest}
               </button>
-              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshProbe || !sshForm.remotePath.trim()} onClick={() => void applySshWorkspace()}>
+              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshProbe || !(sshBrowsePath || sshForm.remotePath).trim()} onClick={() => void applySshWorkspace()}>
                 {t.sshPickFolder}
               </button>
             </div>
