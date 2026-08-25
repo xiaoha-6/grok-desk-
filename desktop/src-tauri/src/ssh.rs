@@ -109,16 +109,6 @@ impl SshTarget {
     }
 
     pub fn destination(&self) -> String {
-        if let Some(alias) = self
-            .alias
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if !alias.contains('@') && !alias.contains(':') {
-                return alias.to_string();
-            }
-        }
         format!("{}@{}", self.user, self.host)
     }
 
@@ -427,6 +417,7 @@ fn run_ssh(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    apply_no_window(&mut command);
     let mut child = command
         .spawn()
         .map_err(|err| format!("无法启动 SSH：{err}。请确认本机已安装 OpenSSH 客户端。"))?;
@@ -446,15 +437,20 @@ fn spawn_ssh(target: &SshTarget, remote_command: &str) -> Result<std::process::C
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    apply_no_window(&mut command);
+    command
+        .spawn()
+        .map_err(|err| format!("无法启动远程 SSH 会话：{err}"))
+}
+
+fn apply_no_window(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command
-        .spawn()
-        .map_err(|err| format!("无法启动远程 SSH 会话：{err}"))
+    let _ = command;
 }
 
 fn ssh_command(target: &SshTarget) -> Result<Command, String> {
@@ -464,35 +460,27 @@ fn ssh_command(target: &SshTarget) -> Result<Command, String> {
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let use_password = target.auth == "password" || password.is_some();
-    let mut command = if use_password {
-        let sshpass = sshpass_binary()?;
-        let mut command = Command::new(sshpass);
-        command.arg("-e");
-        command.arg(ssh_binary()?);
-        command.env("SSHPASS", password.unwrap_or_default());
-        command
-    } else {
-        Command::new(ssh_binary()?)
-    };
-    if target
-        .alias
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.contains('@') && !value.contains(':'))
-        .is_none()
-    {
-        command.arg("-p").arg(target.port.to_string());
-    }
+    let mut command = Command::new(ssh_binary()?);
+    command.arg("-p").arg(target.port.to_string());
     command.arg("-o").arg("StrictHostKeyChecking=accept-new");
     command.arg("-o").arg("ConnectTimeout=12");
     command.arg("-o").arg("ServerAliveInterval=15");
     command.arg("-o").arg("ServerAliveCountMax=3");
     command.arg("-o").arg("NumberOfPasswordPrompts=1");
     if use_password {
+        let askpass = write_askpass()?;
+        command.env("SSH_ASKPASS", &askpass);
+        command.env("SSH_ASKPASS_REQUIRE", "force");
+        command.env("GROKDESK_SSH_PASSWORD", password.unwrap_or_default());
+        if std::env::var_os("DISPLAY").is_none() {
+            command.env("DISPLAY", ":0");
+        }
+        command.env("SSH_ASKPASS_PROMPT", "none");
         command.arg("-o").arg("PreferredAuthentications=password,keyboard-interactive");
         command.arg("-o").arg("PubkeyAuthentication=no");
         command.arg("-o").arg("KbdInteractiveAuthentication=yes");
         command.arg("-o").arg("PasswordAuthentication=yes");
+        command.arg("-o").arg("BatchMode=no");
     } else {
         command.arg("-o").arg("BatchMode=yes");
         command.arg("-o").arg("PreferredAuthentications=publickey,keyboard-interactive");
@@ -504,24 +492,26 @@ fn ssh_command(target: &SshTarget) -> Result<Command, String> {
     Ok(command)
 }
 
-fn sshpass_binary() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("GROKDESK_SSHPASS") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    let names = if cfg!(windows) {
-        vec!["sshpass.exe", "sshpass"]
+fn write_askpass() -> Result<PathBuf, String> {
+    let dir = crate::runtime::grok_home().join("tmp");
+    fs::create_dir_all(&dir).map_err(|err| format!("无法准备 SSH 密码助手：{err}"))?;
+    let path = dir.join(if cfg!(windows) { "askpass.cmd" } else { "askpass.sh" });
+    if cfg!(windows) {
+        fs::write(
+            &path,
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\necho !GROKDESK_SSH_PASSWORD!\r\n",
+        )
+        .map_err(|err| format!("无法写入 SSH 密码助手：{err}"))?;
     } else {
-        vec!["sshpass"]
-    };
-    for name in names {
-        if let Ok(path) = which(name) {
-            return Ok(path);
+        fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$GROKDESK_SSH_PASSWORD\"\n")
+            .map_err(|err| format!("无法写入 SSH 密码助手：{err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
         }
     }
-    Err("密码登录需要本机安装 sshpass。macOS 可用 brew install sshpass；Linux 用发行版软件包安装。私钥/ssh-agent 不需要它。".into())
+    Ok(path)
 }
 
 fn ssh_binary() -> Result<PathBuf, String> {
@@ -863,6 +853,12 @@ mod tests {
             alias: None,
         };
         assert!(home.normalized().is_err());
+    }
+
+    #[test]
+    fn askpass_script_prints_env_password() {
+        let script = "#!/bin/sh\nprintf '%s\\n' \"$GROKDESK_SSH_PASSWORD\"\n";
+        assert!(script.contains("GROKDESK_SSH_PASSWORD"));
     }
 
     #[test]

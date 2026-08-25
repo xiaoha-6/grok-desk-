@@ -2223,7 +2223,6 @@ export default function App() {
               )}
             </div>
             <p className="hint">{t.sshIdentityHint}</p>
-            {sshForm.auth === "password" ? <p className="hint">{t.sshNeedSshpass}</p> : null}
             {sshHosts.length ? (
               <div className="ssh-recent">
                 <div className="row-title">{t.sshRecent}</div>
