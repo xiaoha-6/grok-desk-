@@ -1617,7 +1617,7 @@ export default function App() {
         options: {
           model: canonicalModelId(modelRef.current),
           cwd: conversation.cwd || cwdRef.current,
-          existingSessionId: relayOn ? null : conversation.grokSessionId ?? null,
+          existingSessionId: conversation.grokSessionId ?? null,
           grokHome: relayOn ? null : account?.homePath || null,
           permissionMode: settingsRef.current.permissionMode,
           reasoningEffort: settingsRef.current.reasoningEffort,
