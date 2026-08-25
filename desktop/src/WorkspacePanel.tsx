@@ -303,13 +303,13 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         </div>
         <div className="workspace-head-actions">
           {onConnectSsh ? (
-            <button className="ghost compact" type="button" onClick={onConnectSsh}>
-              {copy.sshConnect}
+            <button className="ghost compact nowrap" type="button" title={copy.sshConnect} onClick={onConnectSsh}>
+              {copy.sshShort}
             </button>
           ) : null}
           {onPickFolder ? (
-            <button className="ghost compact" type="button" onClick={onPickFolder}>
-              {copy.localFolder}
+            <button className="ghost compact nowrap" type="button" title={copy.localFolder} onClick={onPickFolder}>
+              {copy.localShort}
             </button>
           ) : null}
           <button className="icon-btn" type="button" onClick={onClose} title={copy.close}>
@@ -346,13 +346,13 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
               <div className="workspace-empty">
                 <p className="hint">{copy.workspaceHomeHint}</p>
                 {onPickFolder ? (
-                  <button className="ghost compact" type="button" onClick={onPickFolder}>
-                    {copy.localFolder}
+                  <button className="ghost compact nowrap" type="button" onClick={onPickFolder}>
+                    {copy.localShort}
                   </button>
                 ) : null}
                 {onConnectSsh ? (
-                  <button className="ghost compact" type="button" onClick={onConnectSsh}>
-                    {copy.sshConnect}
+                  <button className="ghost compact nowrap" type="button" onClick={onConnectSsh}>
+                    {copy.sshShort}
                   </button>
                 ) : null}
               </div>

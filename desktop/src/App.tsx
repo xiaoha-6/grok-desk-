@@ -1720,6 +1720,7 @@ export default function App() {
     applyCwd(id, normalized);
     setShowWorkspace(true);
     setShowSshModal(false);
+    setView("chat");
     try {
       const next = [normalized, ...sshHosts.filter((item) => sshWorkspaceId(item) !== id)].slice(0, 12);
       setSshHosts(next);
@@ -2124,8 +2125,70 @@ export default function App() {
     [fileDiffs],
   );
 
+  const sshModal = showSshModal ? (
+        <div className="overlay" onClick={() => !sshBusy && setShowSshModal(false)}>
+          <div className="modal wide" onClick={(event) => event.stopPropagation()}>
+            <h3>{t.sshConnect}</h3>
+            <p>{t.sshDetail}</p>
+            <div className="ssh-grid">
+              <label>
+                {t.sshUser}
+                <input value={sshForm.user} spellCheck={false} placeholder="ubuntu" onChange={(event) => setSshForm((current) => ({ ...current, user: event.target.value }))} />
+              </label>
+              <label>
+                {t.sshHost}
+                <input value={sshForm.host} spellCheck={false} placeholder="10.0.0.8" onChange={(event) => setSshForm((current) => ({ ...current, host: event.target.value }))} />
+              </label>
+              <label>
+                {t.sshPort}
+                <input value={sshForm.port} spellCheck={false} onChange={(event) => setSshForm((current) => ({ ...current, port: Number(event.target.value) || 22 }))} />
+              </label>
+              <label className="ssh-span">
+                {t.sshPath}
+                <input value={sshForm.remotePath} spellCheck={false} placeholder="/home/ubuntu/app" onChange={(event) => setSshForm((current) => ({ ...current, remotePath: event.target.value }))} />
+              </label>
+              <label className="ssh-span">
+                {t.sshIdentity}
+                <div className="model-pick">
+                  <input value={sshForm.identityFile || ""} spellCheck={false} placeholder="~/.ssh/id_ed25519" onChange={(event) => setSshForm((current) => ({ ...current, identityFile: event.target.value }))} />
+                  <button className="ghost compact nowrap" type="button" onClick={() => void pickSshIdentity()}>
+                    {t.sshPickKey}
+                  </button>
+                </div>
+              </label>
+            </div>
+            <p className="hint">{t.sshIdentityHint}</p>
+            <p className="hint">{t.sshWindowsLinux}</p>
+            {sshHosts.length ? (
+              <div className="ssh-recent">
+                <div className="row-title">{t.sshRecent}</div>
+                {sshHosts.map((item) => (
+                  <button key={sshWorkspaceId(item)} className="ghost compact nowrap" type="button" onClick={() => setSshForm({ ...emptySshTarget(), ...item })}>
+                    {sshLabel(item)}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {sshProbe ? <p className="ok-text">{sshProbe.message}</p> : null}
+            {sshError ? <p className="error">{sshError}</p> : null}
+            <div className="actions">
+              <button className="ghost compact nowrap" type="button" disabled={sshBusy} onClick={() => setShowSshModal(false)}>
+                {t.close}
+              </button>
+              <button className="ghost compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void testSsh()}>
+                {sshBusy ? t.sshConnecting : t.sshTest}
+              </button>
+              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void applySshWorkspace()}>
+                {t.sshSave}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null;
+
   if (view === "settings") {
     return (
+      <>
       <SettingsView
         t={t}
         lang={lang}
@@ -2192,6 +2255,8 @@ export default function App() {
         archived={conversations.filter((item) => item.archivedAt).map((item) => ({ id: item.id, title: item.title, cwd: item.cwd }))}
         onDeleteArchived={deleteConversation}
       />
+      {sshModal}
+      </>
     );
   }
 
@@ -2542,8 +2607,8 @@ export default function App() {
               )
             ) : null}
             {!selected?.messages.length ? (
-              <button className="ghost compact" type="button" onClick={() => void openSshModal()}>
-                {t.sshConnect}
+              <button className="ghost compact nowrap" type="button" onClick={() => void openSshModal()}>
+                {t.sshShort}
               </button>
             ) : null}
             {pendingImages.length ? (
@@ -2727,66 +2792,7 @@ export default function App() {
         </aside>
       ) : null}
 
-      {showSshModal ? (
-        <div className="overlay" onClick={() => !sshBusy && setShowSshModal(false)}>
-          <div className="modal wide" onClick={(event) => event.stopPropagation()}>
-            <h3>{t.sshConnect}</h3>
-            <p>{t.sshDetail}</p>
-            <div className="ssh-grid">
-              <label>
-                {t.sshUser}
-                <input value={sshForm.user} spellCheck={false} placeholder="ubuntu" onChange={(event) => setSshForm((current) => ({ ...current, user: event.target.value }))} />
-              </label>
-              <label>
-                {t.sshHost}
-                <input value={sshForm.host} spellCheck={false} placeholder="10.0.0.8" onChange={(event) => setSshForm((current) => ({ ...current, host: event.target.value }))} />
-              </label>
-              <label>
-                {t.sshPort}
-                <input value={sshForm.port} spellCheck={false} onChange={(event) => setSshForm((current) => ({ ...current, port: Number(event.target.value) || 22 }))} />
-              </label>
-              <label className="ssh-span">
-                {t.sshPath}
-                <input value={sshForm.remotePath} spellCheck={false} placeholder="/home/ubuntu/app" onChange={(event) => setSshForm((current) => ({ ...current, remotePath: event.target.value }))} />
-              </label>
-              <label className="ssh-span">
-                {t.sshIdentity}
-                <div className="model-pick">
-                  <input value={sshForm.identityFile || ""} spellCheck={false} placeholder="~/.ssh/id_ed25519" onChange={(event) => setSshForm((current) => ({ ...current, identityFile: event.target.value }))} />
-                  <button className="ghost compact" type="button" onClick={() => void pickSshIdentity()}>
-                    {t.sshPickKey}
-                  </button>
-                </div>
-              </label>
-            </div>
-            <p className="hint">{t.sshIdentityHint}</p>
-            <p className="hint">{t.sshWindowsLinux}</p>
-            {sshHosts.length ? (
-              <div className="ssh-recent">
-                <div className="row-title">{t.sshRecent}</div>
-                {sshHosts.map((item) => (
-                  <button key={sshWorkspaceId(item)} className="ghost compact" type="button" onClick={() => setSshForm({ ...emptySshTarget(), ...item })}>
-                    {sshLabel(item)}
-                  </button>
-                ))}
-              </div>
-            ) : null}
-            {sshProbe ? <p className="ok-text">{sshProbe.message}</p> : null}
-            {sshError ? <p className="error">{sshError}</p> : null}
-            <div className="actions">
-              <button className="ghost" type="button" disabled={sshBusy} onClick={() => setShowSshModal(false)}>
-                {t.close}
-              </button>
-              <button className="ghost" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void testSsh()}>
-                {sshBusy ? t.sshConnecting : t.sshTest}
-              </button>
-              <button className="primary" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void applySshWorkspace()}>
-                {t.sshSave}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      {sshModal}
 
       {showInstallPrompt && !status?.installed ? (
         <div className="overlay" onClick={() => setShowInstallPrompt(false)}>

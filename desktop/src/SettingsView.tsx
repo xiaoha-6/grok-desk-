@@ -312,14 +312,17 @@ export function SettingsView(props: {
               <section className="group">
                 <SettingsRow title={copy.ssh} detail={copy.sshDetail}>
                   {props.onConnectSsh ? (
-                    <button className="primary" type="button" onClick={props.onConnectSsh}>
-                      {copy.sshConnect}
+                    <button className="ghost compact nowrap" type="button" onClick={props.onConnectSsh}>
+                      {copy.sshConnectAction}
                     </button>
                   ) : null}
                 </SettingsRow>
-                <SettingsRow title={copy.workspace} detail={props.ssh ? `${props.ssh.user}@${props.ssh.host}:${props.ssh.remotePath}` : copy.workspaceDetail} />
-                <p className="hint">{copy.sshWindowsLinux}</p>
-                <p className="hint">{copy.sshNeedGrok}</p>
+                <SettingsRow
+                  title={copy.workspace}
+                  detail={props.ssh ? `${props.ssh.user}@${props.ssh.host}:${props.ssh.remotePath}` : copy.workspaceDetail}
+                />
+                <p className="hint left">{copy.sshWindowsLinux}</p>
+                <p className="hint left">{copy.sshNeedGrok}</p>
                 {(props.sshHosts || []).length ? (
                   <div className="ssh-recent">
                     <div className="row-title">{copy.sshRecent}</div>
