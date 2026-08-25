@@ -77,6 +77,7 @@ import {
   type SessionInfo,
   type SettingsPage,
   type SkillRecord,
+  type SshConfigHost,
   type SshProbe,
   type SshTarget,
   type Theme,
@@ -130,7 +131,7 @@ function workspaceLabel(path: string, homeDir: string, homeWord: string) {
 }
 
 function emptySshTarget(): SshTarget {
-  return { host: "", port: 22, user: "", remotePath: "", identityFile: "", auth: "key" };
+  return { host: "", port: 22, user: "", remotePath: "", identityFile: "", auth: "key", password: "", alias: "" };
 }
 
 function sshWorkspaceId(target: SshTarget) {
@@ -156,6 +157,21 @@ function parseSshWorkspace(path: string): SshTarget | null {
     remotePath: `/${match[4]}`.replace(/\/+/g, "/"),
     identityFile: "",
     auth: "key",
+    password: "",
+    alias: "",
+  };
+}
+
+function fromSshConfigHost(item: SshConfigHost): SshTarget {
+  return {
+    host: item.host || item.alias,
+    port: item.port || 22,
+    user: item.user || "root",
+    remotePath: item.remotePath || "",
+    identityFile: item.identityFile || "",
+    auth: "key",
+    password: "",
+    alias: item.alias,
   };
 }
 
@@ -571,6 +587,7 @@ export default function App() {
   const [showSshModal, setShowSshModal] = useState(false);
   const [sshForm, setSshForm] = useState<SshTarget>(emptySshTarget);
   const [sshHosts, setSshHosts] = useState<SshTarget[]>([]);
+  const [sshConfigHosts, setSshConfigHosts] = useState<SshConfigHost[]>([]);
   const [sshProbe, setSshProbe] = useState<SshProbe | null>(null);
   const [sshBusy, setSshBusy] = useState(false);
   const [sshError, setSshError] = useState("");
@@ -1658,10 +1675,15 @@ export default function App() {
 
   async function loadSshHosts() {
     try {
-      const hosts = await invoke<SshTarget[]>("list_ssh_hosts");
+      const [hosts, configHosts] = await Promise.all([
+        invoke<SshTarget[]>("list_ssh_hosts"),
+        invoke<SshConfigHost[]>("list_ssh_config_hosts"),
+      ]);
       setSshHosts(Array.isArray(hosts) ? hosts : []);
+      setSshConfigHosts(Array.isArray(configHosts) ? configHosts : []);
     } catch {
       setSshHosts([]);
+      setSshConfigHosts([]);
     }
   }
 
@@ -1714,7 +1736,9 @@ export default function App() {
       port: target.port || 22,
       remotePath: probe.remotePath || target.remotePath,
       identityFile: target.identityFile || "",
-      auth: "key",
+      auth: target.auth === "password" ? "password" : "key",
+      password: target.auth === "password" ? target.password || "" : "",
+      alias: target.alias || "",
     };
     const id = sshWorkspaceId(normalized);
     applyCwd(id, normalized);
@@ -2131,13 +2155,33 @@ export default function App() {
             <h3>{t.sshConnect}</h3>
             <p>{t.sshDetail}</p>
             <div className="ssh-grid">
+              <label className="ssh-span">
+                {t.sshFromConfig}
+                <Select
+                  variant="field"
+                  align="start"
+                  ariaLabel={t.sshFromConfig}
+                  value={sshForm.alias || ""}
+                  onChange={(value) => {
+                    const found = sshConfigHosts.find((item) => item.alias === value);
+                    if (found) setSshForm({ ...emptySshTarget(), ...fromSshConfigHost(found) });
+                  }}
+                  options={[
+                    { id: "", label: sshConfigHosts.length ? t.sshFromConfig : t.sshConfigEmpty },
+                    ...sshConfigHosts.map((item) => ({
+                      id: item.alias,
+                      label: item.user ? `${item.alias} · ${item.user}@${item.host}` : `${item.alias} · ${item.host}`,
+                    })),
+                  ]}
+                />
+              </label>
               <label>
                 {t.sshUser}
                 <input value={sshForm.user} spellCheck={false} placeholder="ubuntu" onChange={(event) => setSshForm((current) => ({ ...current, user: event.target.value }))} />
               </label>
               <label>
                 {t.sshHost}
-                <input value={sshForm.host} spellCheck={false} placeholder="10.0.0.8" onChange={(event) => setSshForm((current) => ({ ...current, host: event.target.value }))} />
+                <input value={sshForm.host} spellCheck={false} placeholder="10.0.0.8" onChange={(event) => setSshForm((current) => ({ ...current, host: event.target.value, alias: "" }))} />
               </label>
               <label>
                 {t.sshPort}
@@ -2147,24 +2191,45 @@ export default function App() {
                 {t.sshPath}
                 <input value={sshForm.remotePath} spellCheck={false} placeholder="/home/ubuntu/app" onChange={(event) => setSshForm((current) => ({ ...current, remotePath: event.target.value }))} />
               </label>
-              <label className="ssh-span">
-                {t.sshIdentity}
-                <div className="model-pick">
-                  <input value={sshForm.identityFile || ""} spellCheck={false} placeholder="~/.ssh/id_ed25519" onChange={(event) => setSshForm((current) => ({ ...current, identityFile: event.target.value }))} />
-                  <button className="ghost compact nowrap" type="button" onClick={() => void pickSshIdentity()}>
-                    {t.sshPickKey}
-                  </button>
-                </div>
+              <label>
+                {t.sshAuth}
+                <Select
+                  variant="field"
+                  align="start"
+                  ariaLabel={t.sshAuth}
+                  value={sshForm.auth === "password" ? "password" : "key"}
+                  onChange={(value) => setSshForm((current) => ({ ...current, auth: value, password: value === "password" ? current.password || "" : "" }))}
+                  options={[
+                    { id: "key", label: t.sshAuthKey },
+                    { id: "password", label: t.sshAuthPassword },
+                  ]}
+                />
               </label>
+              {sshForm.auth === "password" ? (
+                <label className="ssh-span">
+                  {t.sshPassword}
+                  <input type="password" value={sshForm.password || ""} autoComplete="off" onChange={(event) => setSshForm((current) => ({ ...current, password: event.target.value, auth: "password" }))} />
+                </label>
+              ) : (
+                <label className="ssh-span">
+                  {t.sshIdentity}
+                  <div className="model-pick">
+                    <input value={sshForm.identityFile || ""} spellCheck={false} placeholder="~/.ssh/id_ed25519" onChange={(event) => setSshForm((current) => ({ ...current, identityFile: event.target.value, auth: "key" }))} />
+                    <button className="ghost compact nowrap" type="button" onClick={() => void pickSshIdentity()}>
+                      {t.sshPickKey}
+                    </button>
+                  </div>
+                </label>
+              )}
             </div>
             <p className="hint">{t.sshIdentityHint}</p>
-            <p className="hint">{t.sshWindowsLinux}</p>
+            {sshForm.auth === "password" ? <p className="hint">{t.sshNeedSshpass}</p> : null}
             {sshHosts.length ? (
               <div className="ssh-recent">
                 <div className="row-title">{t.sshRecent}</div>
                 {sshHosts.map((item) => (
-                  <button key={sshWorkspaceId(item)} className="ghost compact nowrap" type="button" onClick={() => setSshForm({ ...emptySshTarget(), ...item })}>
-                    {sshLabel(item)}
+                  <button key={sshWorkspaceId(item)} className="ghost compact nowrap" type="button" onClick={() => setSshForm({ ...emptySshTarget(), ...item, password: "" })}>
+                    {item.alias || sshLabel(item)}
                   </button>
                 ))}
               </div>
@@ -2175,10 +2240,10 @@ export default function App() {
               <button className="ghost compact nowrap" type="button" disabled={sshBusy} onClick={() => setShowSshModal(false)}>
                 {t.close}
               </button>
-              <button className="ghost compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void testSsh()}>
+              <button className="ghost compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || (sshForm.auth === "password" && !String(sshForm.password || "").trim())} onClick={() => void testSsh()}>
                 {sshBusy ? t.sshConnecting : t.sshTest}
               </button>
-              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void applySshWorkspace()}>
+              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || (sshForm.auth === "password" && !String(sshForm.password || "").trim())} onClick={() => void applySshWorkspace()}>
                 {t.sshSave}
               </button>
             </div>
@@ -2575,25 +2640,25 @@ export default function App() {
             onDragLeave={() => setDragOver(false)}
             onDrop={(event) => void onComposerDrop(event)}
           >
-            {!selected?.messages.length ? (
-              editingCwd ? (
-                <input
-                  className="cwd-input"
-                  autoFocus
-                  value={sessionCwd}
-                  spellCheck={false}
-                  onChange={(event) => applyCwd(event.target.value)}
-                  onBlur={() => setEditingCwd(false)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") setEditingCwd(false);
-                    if (event.key === "Escape") setEditingCwd(false);
-                  }}
-                />
-              ) : (
+            {editingCwd ? (
+              <input
+                className="cwd-input"
+                autoFocus
+                value={sessionCwd}
+                spellCheck={false}
+                onChange={(event) => applyCwd(event.target.value)}
+                onBlur={() => setEditingCwd(false)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") setEditingCwd(false);
+                  if (event.key === "Escape") setEditingCwd(false);
+                }}
+              />
+            ) : (
+              <div className="composer-workspace">
                 <button
                   className="workspace-chip"
                   type="button"
-                  title={t.pickWorkspace}
+                  title={t.composerWorkspace}
                   onClick={() => void pickWorkspaceFolder()}
                   onContextMenu={(event) => {
                     event.preventDefault();
@@ -2604,13 +2669,11 @@ export default function App() {
                   <span>{workspaceRoot ? projectName : t.chooseFolder}</span>
                   <IconChevronDown />
                 </button>
-              )
-            ) : null}
-            {!selected?.messages.length ? (
-              <button className="ghost compact nowrap" type="button" onClick={() => void openSshModal()}>
-                {t.sshShort}
-              </button>
-            ) : null}
+                <button className="ghost compact nowrap" type="button" title={t.sshConnect} onClick={() => void openSshModal()}>
+                  {t.sshShort}
+                </button>
+              </div>
+            )}
             {pendingImages.length ? (
               <div className="attach-row">
                 {pendingImages.map((item, index) => (

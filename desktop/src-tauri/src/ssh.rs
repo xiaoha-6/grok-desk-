@@ -18,6 +18,10 @@ pub struct SshTarget {
     pub remote_path: String,
     pub identity_file: Option<String>,
     pub auth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 impl SshTarget {
@@ -41,10 +45,14 @@ impl SshTarget {
             return Err("用户名不合法".into());
         }
         let port = if self.port == 0 { 22 } else { self.port };
-        let remote_path = normalize_remote_path(&self.remote_path);
-        if remote_path.is_empty() {
-            return Err("请填写远程工作目录".into());
-        }
+        let remote_path = {
+            let normalized = normalize_remote_path(&self.remote_path);
+            if normalized.is_empty() {
+                "~/app".to_string()
+            } else {
+                normalized
+            }
+        };
         if looks_like_home(&remote_path) {
             return Err("请选择项目文件夹，不能把用户主目录当作工作区".into());
         }
@@ -53,16 +61,31 @@ impl SshTarget {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(|value| value.to_string());
+            .map(expand_tilde);
         if let Some(path) = &identity_file {
             if !Path::new(path).is_file() {
                 return Err(format!("私钥文件不存在：{path}"));
             }
         }
+        let password = self
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
         let auth = match self.auth.trim().to_ascii_lowercase().as_str() {
             "password" => "password".to_string(),
             _ => "key".to_string(),
         };
+        if auth == "password" && password.is_none() {
+            return Err("请填写 SSH 密码".into());
+        }
+        let alias = self
+            .alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
         Ok(Self {
             host,
             port,
@@ -70,6 +93,8 @@ impl SshTarget {
             remote_path,
             identity_file,
             auth,
+            password,
+            alias,
         })
     }
 
@@ -84,8 +109,35 @@ impl SshTarget {
     }
 
     pub fn destination(&self) -> String {
+        if let Some(alias) = self
+            .alias
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !alias.contains('@') && !alias.contains(':') {
+                return alias.to_string();
+            }
+        }
         format!("{}@{}", self.user, self.host)
     }
+
+    pub fn for_persist(&self) -> Self {
+        let mut clone = self.clone();
+        clone.password = None;
+        clone
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConfigHost {
+    pub alias: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub identity_file: Option<String>,
+    pub remote_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -406,20 +458,70 @@ fn spawn_ssh(target: &SshTarget, remote_command: &str) -> Result<std::process::C
 }
 
 fn ssh_command(target: &SshTarget) -> Result<Command, String> {
-    let program = ssh_binary()?;
-    let mut command = Command::new(program);
-    command.arg("-p").arg(target.port.to_string());
-    command.arg("-o").arg("BatchMode=yes");
+    let password = target
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let use_password = target.auth == "password" || password.is_some();
+    let mut command = if use_password {
+        let sshpass = sshpass_binary()?;
+        let mut command = Command::new(sshpass);
+        command.arg("-e");
+        command.arg(ssh_binary()?);
+        command.env("SSHPASS", password.unwrap_or_default());
+        command
+    } else {
+        Command::new(ssh_binary()?)
+    };
+    if target
+        .alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains('@') && !value.contains(':'))
+        .is_none()
+    {
+        command.arg("-p").arg(target.port.to_string());
+    }
     command.arg("-o").arg("StrictHostKeyChecking=accept-new");
     command.arg("-o").arg("ConnectTimeout=12");
     command.arg("-o").arg("ServerAliveInterval=15");
     command.arg("-o").arg("ServerAliveCountMax=3");
-    command.arg("-o").arg("PreferredAuthentications=publickey,keyboard-interactive");
-    if let Some(identity) = &target.identity_file {
-        command.arg("-i").arg(identity);
-        command.arg("-o").arg("IdentitiesOnly=yes");
+    command.arg("-o").arg("NumberOfPasswordPrompts=1");
+    if use_password {
+        command.arg("-o").arg("PreferredAuthentications=password,keyboard-interactive");
+        command.arg("-o").arg("PubkeyAuthentication=no");
+        command.arg("-o").arg("KbdInteractiveAuthentication=yes");
+        command.arg("-o").arg("PasswordAuthentication=yes");
+    } else {
+        command.arg("-o").arg("BatchMode=yes");
+        command.arg("-o").arg("PreferredAuthentications=publickey,keyboard-interactive");
+        if let Some(identity) = &target.identity_file {
+            command.arg("-i").arg(identity);
+            command.arg("-o").arg("IdentitiesOnly=yes");
+        }
     }
     Ok(command)
+}
+
+fn sshpass_binary() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("GROKDESK_SSHPASS") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    let names = if cfg!(windows) {
+        vec!["sshpass.exe", "sshpass"]
+    } else {
+        vec!["sshpass"]
+    };
+    for name in names {
+        if let Ok(path) = which(name) {
+            return Ok(path);
+        }
+    }
+    Err("密码登录需要本机安装 sshpass。macOS 可用 brew install sshpass；Linux 用发行版软件包安装。私钥/ssh-agent 不需要它。".into())
 }
 
 fn ssh_binary() -> Result<PathBuf, String> {
@@ -485,7 +587,7 @@ fn ssh_error(stderr: &str, stdout: &str, code: Option<i32>) -> String {
     let text = format!("{stderr}\n{stdout}");
     let lower = text.to_ascii_lowercase();
     if lower.contains("permission denied") {
-        "SSH 认证失败。请改用私钥/ssh-agent，或先在终端登录一次确认密钥可用。".into()
+        "SSH 认证失败。请检查私钥、ssh-agent，或改用密码登录。".into()
     } else if lower.contains("connection refused") {
         "SSH 端口被拒绝。请确认远程 sshd 已启动，以及端口是否正确。".into()
     } else if lower.contains("could not resolve") || lower.contains("nodename nor servname") {
@@ -570,11 +672,26 @@ fn sh_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).display().to_string();
+        }
+    }
+    if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.display().to_string();
+        }
+    }
+    path.to_string()
+}
+
 pub fn persist_hosts(hosts: &[SshTarget]) -> Result<(), String> {
     let dir = crate::runtime::grok_home();
     fs::create_dir_all(&dir).map_err(|err| format!("无法保存 SSH 配置：{err}"))?;
     let path = dir.join("ssh-hosts.json");
-    let json = serde_json::to_vec_pretty(hosts).map_err(|err| format!("无法序列化 SSH 配置：{err}"))?;
+    let safe: Vec<SshTarget> = hosts.iter().map(SshTarget::for_persist).collect();
+    let json = serde_json::to_vec_pretty(&safe).map_err(|err| format!("无法序列化 SSH 配置：{err}"))?;
     fs::write(path, json).map_err(|err| format!("无法写入 SSH 配置：{err}"))
 }
 
@@ -585,8 +702,134 @@ pub fn load_hosts() -> Vec<SshTarget> {
         .and_then(|text| serde_json::from_str::<Vec<SshTarget>>(&text).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|item| item.normalized().ok())
+        .filter_map(|mut item| {
+            if item.remote_path.trim().is_empty() {
+                item.remote_path = "~/app".into();
+            }
+            let mut normalized = item.normalized().ok()?;
+            normalized.password = None;
+            Some(normalized)
+        })
         .collect()
+}
+
+pub fn load_ssh_config_hosts() -> Vec<SshConfigHost> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    parse_ssh_config_files(&[home.join(".ssh").join("config")], 0)
+}
+
+fn parse_ssh_config_files(paths: &[PathBuf], depth: usize) -> Vec<SshConfigHost> {
+    if depth > 4 {
+        return Vec::new();
+    }
+    let mut hosts = Vec::new();
+    for path in paths {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        hosts.extend(parse_ssh_config(&text, path.parent(), depth));
+    }
+    let mut seen = std::collections::HashSet::new();
+    hosts.retain(|item| seen.insert(item.alias.clone()));
+    hosts
+}
+
+fn parse_ssh_config(text: &str, base: Option<&Path>, depth: usize) -> Vec<SshConfigHost> {
+    let mut hosts = Vec::new();
+    let mut includes = Vec::new();
+    let mut current: Option<SshConfigHost> = None;
+    let flush = |slot: &mut Option<SshConfigHost>, out: &mut Vec<SshConfigHost>| {
+        if let Some(item) = slot.take() {
+            if !item.alias.contains('*') && !item.alias.contains('?') && item.alias != "*" {
+                out.push(item);
+            }
+        }
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = split_ssh_kv(line);
+        if key.is_empty() {
+            continue;
+        }
+        match key.to_ascii_lowercase().as_str() {
+            "host" => {
+                flush(&mut current, &mut hosts);
+                let alias = value.split_whitespace().next().unwrap_or("").trim().to_string();
+                if alias.is_empty() {
+                    continue;
+                }
+                current = Some(SshConfigHost {
+                    alias: alias.clone(),
+                    host: alias,
+                    port: 22,
+                    user: String::new(),
+                    identity_file: None,
+                    remote_path: String::new(),
+                });
+            }
+            "include" => {
+                if let Some(dir) = base {
+                    includes.extend(expand_include(dir, value));
+                }
+            }
+            "hostname" => {
+                if let Some(item) = current.as_mut() {
+                    item.host = value.to_string();
+                }
+            }
+            "user" => {
+                if let Some(item) = current.as_mut() {
+                    item.user = value.to_string();
+                }
+            }
+            "port" => {
+                if let Some(item) = current.as_mut() {
+                    if let Ok(port) = value.parse::<u16>() {
+                        item.port = port;
+                    }
+                }
+            }
+            "identityfile" => {
+                if let Some(item) = current.as_mut() {
+                    item.identity_file = Some(expand_tilde(value));
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut current, &mut hosts);
+    hosts.extend(parse_ssh_config_files(&includes, depth + 1));
+    hosts
+}
+
+fn split_ssh_kv(line: &str) -> (String, &str) {
+    if let Some((key, value)) = line.split_once('=') {
+        return (key.trim().to_string(), value.trim().trim_matches('"'));
+    }
+    if let Some((key, value)) = line.split_once(char::is_whitespace) {
+        return (key.trim().to_string(), value.trim().trim_matches('"'));
+    }
+    (line.to_string(), "")
+}
+
+fn expand_include(base: &Path, pattern: &str) -> Vec<PathBuf> {
+    let expanded = expand_tilde(pattern);
+    let path = PathBuf::from(&expanded);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    if path.exists() {
+        vec![path]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -602,6 +845,8 @@ mod tests {
             remote_path: "/home/ubuntu/app".into(),
             identity_file: None,
             auth: "key".into(),
+            password: None,
+            alias: None,
         }
         .normalized()
         .unwrap();
@@ -614,8 +859,29 @@ mod tests {
             remote_path: "/home".into(),
             identity_file: None,
             auth: "key".into(),
+            password: None,
+            alias: None,
         };
         assert!(home.normalized().is_err());
+    }
+
+    #[test]
+    fn parses_ssh_config_hosts() {
+        let text = r#"
+Host myserver
+    HostName 10.60.3.19
+    User root
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+
+Host *
+    Compression yes
+"#;
+        let hosts = parse_ssh_config(text, None, 0);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].alias, "myserver");
+        assert_eq!(hosts[0].host, "10.60.3.19");
+        assert_eq!(hosts[0].user, "root");
     }
 
     #[test]

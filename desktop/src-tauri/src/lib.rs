@@ -20,7 +20,7 @@ use config::{
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
 use sessions::{LocalSessionHistory, LocalSessionSummary};
-use ssh::{SshProbe, SshTarget};
+use ssh::{SshConfigHost, SshProbe, SshTarget};
 use workspace::{WorkspaceEntry, WorkspaceFile};
 use serde::Deserialize;
 use serde_json::Value;
@@ -137,6 +137,11 @@ async fn list_local_sessions() -> Vec<LocalSessionSummary> {
 #[tauri::command]
 async fn list_ssh_hosts() -> Vec<SshTarget> {
     ssh::load_hosts()
+}
+
+#[tauri::command]
+async fn list_ssh_config_hosts() -> Vec<SshConfigHost> {
+    ssh::load_ssh_config_hosts()
 }
 
 #[tauri::command]
@@ -492,6 +497,7 @@ pub fn run() {
             load_session_history,
             pick_workspace_folder,
             list_ssh_hosts,
+            list_ssh_config_hosts,
             save_ssh_hosts,
             probe_ssh_host,
             pick_ssh_identity,

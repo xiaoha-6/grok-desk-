@@ -109,6 +109,17 @@ export type SshTarget = {
   remotePath: string;
   identityFile?: string | null;
   auth: "key" | "password" | string;
+  password?: string | null;
+  alias?: string | null;
+};
+
+export type SshConfigHost = {
+  alias: string;
+  host: string;
+  port: number;
+  user: string;
+  identityFile?: string | null;
+  remotePath: string;
 };
 
 export type SshProbe = {

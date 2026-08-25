@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.23";
+const CLIENT_VERSION: &str = "0.6.24";
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;

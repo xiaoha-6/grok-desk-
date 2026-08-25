@@ -321,14 +321,16 @@ export function SettingsView(props: {
                   title={copy.workspace}
                   detail={props.ssh ? `${props.ssh.user}@${props.ssh.host}:${props.ssh.remotePath}` : copy.workspaceDetail}
                 />
-                <p className="hint left">{copy.sshWindowsLinux}</p>
-                <p className="hint left">{copy.sshNeedGrok}</p>
+                <div className="settings-note">
+                  <p>{copy.sshWindowsLinux}</p>
+                  <p>{copy.sshNeedGrok}</p>
+                </div>
                 {(props.sshHosts || []).length ? (
                   <div className="ssh-recent">
                     <div className="row-title">{copy.sshRecent}</div>
                     {(props.sshHosts || []).map((item) => (
                       <div key={`${item.user}@${item.host}:${item.port}/${item.remotePath}`} className="hint left">
-                        {item.user}@{item.host}:{item.port} {item.remotePath}
+                        {item.alias || `${item.user}@${item.host}:${item.port}`} {item.remotePath}
                       </div>
                     ))}
                   </div>

@@ -609,6 +609,13 @@ button { background: none; }
   container-type: inline-size;
   container-name: composer;
 }
+.composer-workspace {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  min-width: 0;
+}
 .workspace-chip, .cwd-input {
   display: inline-flex;
   align-items: center;
@@ -619,8 +626,9 @@ button { background: none; }
   border-radius: 999px;
   padding: 5px 9px;
   font-size: var(--meta);
-  margin-bottom: 8px;
+  margin-bottom: 0;
   cursor: pointer;
+  max-width: min(360px, calc(100% - 72px));
 }
 .cwd-input {
   width: min(420px, 100%);
@@ -655,6 +663,17 @@ button { background: none; }
   margin: 8px 0 0;
 }
 .hint.left { text-align: left; }
+.settings-note {
+  padding: 10px 16px 14px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.settings-note p { margin: 0 0 6px; }
+.settings-note p:last-child { margin-bottom: 0; }
+.group .ssh-recent {
+  padding: 0 16px 14px;
+}
 .send {
   width: 28px;
   height: 28px;
@@ -892,6 +911,10 @@ button { background: none; }
   grid-template-columns: 1fr 1.4fr 90px;
   gap: 10px;
   margin: 12px 0;
+}
+.ssh-grid .app-select.field {
+  width: 100%;
+  max-width: none;
 }
 .ssh-grid label {
   display: grid;
