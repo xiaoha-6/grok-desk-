@@ -17,6 +17,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ActivityTimeline } from "./ActivityTimeline";
+import { TextShimmer } from "./components/prompt-kit/text-shimmer";
+import { ThinkingOrbs } from "./components/thinking-orbs/ThinkingOrbs";
 import { extractFileDiffs } from "./diff";
 import {
   IconArrowUp,
@@ -2298,13 +2300,30 @@ export default function App() {
                         />
                       ) : message.thought ? (
                         <details className="thought" open={message.streaming && !message.text}>
-                          <summary>{t.thinking}</summary>
+                          <summary>
+                            {message.streaming ? <ThinkingOrbs /> : null}
+                            {message.streaming ? (
+                              <TextShimmer>{t.thinkingNow}</TextShimmer>
+                            ) : (
+                              t.thinking
+                            )}
+                          </summary>
                           <pre>{message.thought}</pre>
                         </details>
                       ) : null}
-                      {message.text || message.streaming ? (
+                      {message.role === "assistant" &&
+                      message.streaming &&
+                      !message.events.length &&
+                      !message.thought &&
+                      !message.text ? (
+                        <div className="thinking-bar">
+                          <ThinkingOrbs />
+                          <TextShimmer>{t.thinkingNow}</TextShimmer>
+                        </div>
+                      ) : null}
+                      {message.text || (message.streaming && message.events.length) ? (
                         <MessageBody
-                          text={message.text || (message.streaming && !message.events.length ? t.thinkingNow : "")}
+                          text={message.text}
                           streaming={message.streaming && Boolean(message.text)}
                         />
                       ) : null}
@@ -2319,8 +2338,8 @@ export default function App() {
                       )}
                       {message.streaming ? (
                         <div className="working">
-                          <span className="spinner" />
-                          {t.working}
+                          <ThinkingOrbs />
+                          <TextShimmer>{t.working}</TextShimmer>
                         </div>
                       ) : null}
                       {message.error ? (
