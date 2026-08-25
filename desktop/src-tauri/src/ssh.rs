@@ -48,14 +48,11 @@ impl SshTarget {
         let remote_path = {
             let normalized = normalize_remote_path(&self.remote_path);
             if normalized.is_empty() {
-                "~/app".to_string()
+                "~".to_string()
             } else {
                 normalized
             }
         };
-        if looks_like_home(&remote_path) {
-            return Err("请选择项目文件夹，不能把用户主目录当作工作区".into());
-        }
         let identity_file = self
             .identity_file
             .as_deref()
@@ -141,10 +138,17 @@ pub struct SshProbe {
     pub home: String,
     pub shell: String,
     pub message: String,
+    #[serde(default)]
+    pub entries: Vec<WorkspaceEntry>,
 }
 
 pub fn probe(target: &SshTarget) -> Result<SshProbe, String> {
-    let script = probe_script(&target.remote_path);
+    let browse = if target.remote_path.trim().is_empty() || looks_like_home(&target.remote_path) {
+        "~"
+    } else {
+        target.remote_path.as_str()
+    };
+    let script = probe_script(browse);
     let output = run_ssh(target, &script, SSH_LONG_TIMEOUT_SECS, None)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -152,7 +156,24 @@ pub fn probe(target: &SshTarget) -> Result<SshProbe, String> {
         return Err(ssh_error(&stderr, &stdout, output.status.code()));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_probe(&stdout, &target.remote_path)
+    let mut probe = parse_probe(&stdout, browse)?;
+    let mut listing = target.clone();
+    listing.remote_path = probe.remote_path.clone();
+    probe.entries = list_remote_workspace(&listing, None).unwrap_or_default();
+    Ok(probe)
+}
+
+pub fn list_remote_dir(target: &SshTarget, path: Option<&str>) -> Result<Vec<WorkspaceEntry>, String> {
+    let mut listing = target.clone();
+    listing.remote_path = path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(target.remote_path.as_str())
+        .to_string();
+    if listing.remote_path.trim().is_empty() {
+        listing.remote_path = "~".into();
+    }
+    list_remote_workspace(&listing, None)
 }
 
 pub fn list_remote_workspace(target: &SshTarget, rel: Option<&str>) -> Result<Vec<WorkspaceEntry>, String> {
@@ -160,7 +181,7 @@ pub fn list_remote_workspace(target: &SshTarget, rel: Option<&str>) -> Result<Ve
     let remote = join_remote(&target.remote_path, &rel);
     let script = format!(
         r#"python3 -c "import json,os,sys
-root=sys.argv[1]
+root=os.path.expanduser(sys.argv[1])
 skip=set({skip})
 max_entries={max_entries}
 try:
@@ -246,7 +267,7 @@ pub fn read_remote_file(target: &SshTarget, rel: &str) -> Result<WorkspaceFile, 
     let remote = join_remote(&target.remote_path, &rel);
     let script = format!(
         r#"python3 -c "import os,sys
-path=sys.argv[1]
+path=os.path.expanduser(sys.argv[1])
 limit={limit}
 if os.path.isdir(path):
     print('ERR:dir'); raise SystemExit(2)
@@ -325,8 +346,9 @@ pub fn spawn_remote_agent(
 fn probe_script(remote_path: &str) -> String {
     format!(
         r#"python3 -c "import os,shutil,sys
-path=sys.argv[1]
+raw=sys.argv[1]
 home=os.path.expanduser('~')
+path=os.path.expanduser(raw) if raw else home
 os_name='windows' if os.name=='nt' or sys.platform.startswith('win') else 'linux'
 if sys.platform.startswith('darwin'):
     os_name='macos'
@@ -394,6 +416,7 @@ fn parse_probe(stdout: &str, fallback_path: &str) -> Result<SshProbe, String> {
         home,
         shell,
         message,
+        entries: Vec::new(),
     })
 }
 
@@ -692,10 +715,7 @@ pub fn load_hosts() -> Vec<SshTarget> {
         .and_then(|text| serde_json::from_str::<Vec<SshTarget>>(&text).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|mut item| {
-            if item.remote_path.trim().is_empty() {
-                item.remote_path = "~/app".into();
-            }
+        .filter_map(|item| {
             let mut normalized = item.normalized().ok()?;
             normalized.password = None;
             Some(normalized)
@@ -846,13 +866,15 @@ mod tests {
             host: "10.0.0.8".into(),
             port: 22,
             user: "ubuntu".into(),
-            remote_path: "/home".into(),
+            remote_path: "".into(),
             identity_file: None,
             auth: "key".into(),
             password: None,
             alias: None,
-        };
-        assert!(home.normalized().is_err());
+        }
+        .normalized()
+        .unwrap();
+        assert_eq!(home.remote_path, "~");
     }
 
     #[test]

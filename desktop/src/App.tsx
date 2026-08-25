@@ -80,6 +80,7 @@ import {
   type SshConfigHost,
   type SshProbe,
   type SshTarget,
+  type WorkspaceEntry,
   type Theme,
   type TimelineEvent,
   type View,
@@ -591,6 +592,8 @@ export default function App() {
   const [sshProbe, setSshProbe] = useState<SshProbe | null>(null);
   const [sshBusy, setSshBusy] = useState(false);
   const [sshError, setSshError] = useState("");
+  const [sshBrowsePath, setSshBrowsePath] = useState("");
+  const [sshEntries, setSshEntries] = useState<WorkspaceEntry[]>([]);
   const [running, setRunning] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
@@ -1690,6 +1693,8 @@ export default function App() {
   async function openSshModal() {
     setSshError("");
     setSshProbe(null);
+    setSshEntries([]);
+    setSshBrowsePath("");
     setSshForm(activeSsh ? { ...emptySshTarget(), ...activeSsh } : emptySshTarget());
     setShowSshModal(true);
     await loadSshHosts();
@@ -1710,15 +1715,21 @@ export default function App() {
     setSshError("");
     setStatusText(t.sshConnecting);
     try {
-      const probe = await invoke<SshProbe>("probe_ssh_host", { target });
+      const probe = await invoke<SshProbe>("probe_ssh_host", {
+        target: { ...target, remotePath: "" },
+      });
       setSshProbe(probe);
-      setSshForm((current) => ({ ...current, remotePath: probe.remotePath || current.remotePath }));
+      const home = probe.remotePath || probe.home || "~";
+      setSshBrowsePath(home);
+      setSshEntries(probe.entries || []);
+      setSshForm((current) => ({ ...current, remotePath: home }));
       setStatusText(probe.message);
       return probe;
     } catch (error) {
       const message = String(error);
       setSshError(message);
       setSshProbe(null);
+      setSshEntries([]);
       setStatusText(message);
       return null;
     } finally {
@@ -1726,7 +1737,37 @@ export default function App() {
     }
   }
 
+  async function browseSshDir(path: string, target = sshForm) {
+    setSshBusy(true);
+    setSshError("");
+    try {
+      const entries = await invoke<WorkspaceEntry[]>("list_ssh_dir", { target, path });
+      setSshBrowsePath(path);
+      setSshEntries(Array.isArray(entries) ? entries : []);
+      setSshForm((current) => ({ ...current, remotePath: path }));
+    } catch (error) {
+      setSshError(String(error));
+    } finally {
+      setSshBusy(false);
+    }
+  }
+
+  function sshParentPath(path: string) {
+    const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+    if (!normalized || normalized === "/" || normalized === "~") return "";
+    const parts = normalized.split("/").filter(Boolean);
+    if (normalized.startsWith("/")) {
+      return parts.length <= 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
+    }
+    return parts.slice(0, -1).join("/") || "~";
+  }
+
   async function applySshWorkspace(target = sshForm) {
+    const folder = (target.remotePath || sshBrowsePath).trim();
+    if (!folder || folder === "~" || folder === "/" || folder === "/home" || folder === "/root" || folder === "/Users") {
+      setSshError(t.workspaceHomeHint);
+      return;
+    }
     const probe = sshProbe || (await testSsh(target));
     if (!probe) return;
     const normalized: SshTarget = {
@@ -1734,7 +1775,7 @@ export default function App() {
       host: target.host.trim(),
       user: target.user.trim() || "root",
       port: target.port || 22,
-      remotePath: probe.remotePath || target.remotePath,
+      remotePath: folder,
       identityFile: target.identityFile || "",
       auth: target.auth === "password" ? "password" : "key",
       password: target.auth === "password" ? target.password || "" : "",
@@ -2187,10 +2228,6 @@ export default function App() {
                 {t.sshPort}
                 <input value={sshForm.port} spellCheck={false} onChange={(event) => setSshForm((current) => ({ ...current, port: Number(event.target.value) || 22 }))} />
               </label>
-              <label className="ssh-span">
-                {t.sshPath}
-                <input value={sshForm.remotePath} spellCheck={false} placeholder="/home/ubuntu/app" onChange={(event) => setSshForm((current) => ({ ...current, remotePath: event.target.value }))} />
-              </label>
               <label>
                 {t.sshAuth}
                 <Select
@@ -2223,6 +2260,41 @@ export default function App() {
               )}
             </div>
             <p className="hint">{t.sshIdentityHint}</p>
+            {sshProbe ? (
+              <div className="ssh-browser">
+                <div className="ssh-browser-head">
+                  <span>{t.sshBrowse}</span>
+                  <code>{sshBrowsePath || sshForm.remotePath || "~"}</code>
+                </div>
+                <p className="hint left">{t.sshConnectedPick}</p>
+                <div className="ssh-browser-actions">
+                  {sshParentPath(sshBrowsePath || sshForm.remotePath) ? (
+                    <button className="ghost compact nowrap" type="button" disabled={sshBusy} onClick={() => void browseSshDir(sshParentPath(sshBrowsePath || sshForm.remotePath))}>
+                      {t.sshParent}
+                    </button>
+                  ) : null}
+                </div>
+                <div className="ssh-browser-list">
+                  {sshEntries.filter((item) => item.isDir).map((item) => {
+                    const base = (sshBrowsePath || sshForm.remotePath || "~").replace(/\/+$/, "");
+                    const full = `${base}/${item.name}`.replace(/\/+/g, "/");
+                    const selected = sshForm.remotePath === full;
+                    return (
+                      <button
+                        key={full}
+                        className={`ssh-dir${selected ? " selected" : ""}`}
+                        type="button"
+                        disabled={sshBusy}
+                        onClick={() => setSshForm((current) => ({ ...current, remotePath: full }))}
+                        onDoubleClick={() => void browseSshDir(full)}
+                      >
+                        <span>{item.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
             {sshHosts.length ? (
               <div className="ssh-recent">
                 <div className="row-title">{t.sshRecent}</div>
@@ -2242,8 +2314,8 @@ export default function App() {
               <button className="ghost compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || (sshForm.auth === "password" && !String(sshForm.password || "").trim())} onClick={() => void testSsh()}>
                 {sshBusy ? t.sshConnecting : t.sshTest}
               </button>
-              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshForm.host.trim() || (sshForm.auth === "password" && !String(sshForm.password || "").trim())} onClick={() => void applySshWorkspace()}>
-                {t.sshSave}
+              <button className="primary compact nowrap" type="button" disabled={sshBusy || !sshProbe || !sshForm.remotePath.trim()} onClick={() => void applySshWorkspace()}>
+                {t.sshPickFolder}
               </button>
             </div>
           </div>

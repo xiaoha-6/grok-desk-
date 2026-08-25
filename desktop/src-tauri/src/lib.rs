@@ -160,6 +160,12 @@ async fn probe_ssh_host(target: SshTarget) -> Result<SshProbe, String> {
 }
 
 #[tauri::command]
+async fn list_ssh_dir(target: SshTarget, path: Option<String>) -> Result<Vec<WorkspaceEntry>, String> {
+    let target = target.normalized()?;
+    run_blocking(move || ssh::list_remote_dir(&target, path.as_deref())).await
+}
+
+#[tauri::command]
 async fn pick_ssh_identity() -> Option<String> {
     rfd::AsyncFileDialog::new()
         .set_title("选择 SSH 私钥")
@@ -500,6 +506,7 @@ pub fn run() {
             list_ssh_config_hosts,
             save_ssh_hosts,
             probe_ssh_host,
+            list_ssh_dir,
             pick_ssh_identity,
             list_workspace,
             read_workspace_file,

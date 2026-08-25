@@ -8,13 +8,9 @@ import { fileLabel } from "./diff";
 import { FileKindIcon, fileBadge, fileExtension } from "./fileIcons";
 import { IconChevronRight, IconClose } from "./icons";
 import type { Copy } from "./i18n";
-import type { FileDiff, SshTarget } from "./types";
+import type { FileDiff, SshTarget, WorkspaceEntry } from "./types";
 
-export type WorkspaceEntry = {
-  name: string;
-  path: string;
-  isDir: boolean;
-};
+export type { WorkspaceEntry };
 
 export type WorkspaceFile = {
   path: string;

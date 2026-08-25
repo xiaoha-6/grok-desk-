@@ -36,6 +36,12 @@ export type DiffLine = {
   text: string;
 };
 
+export type WorkspaceEntry = {
+  name: string;
+  path: string;
+  isDir: boolean;
+};
+
 export type FileDiff = {
   path?: string;
   oldText: string;
@@ -131,6 +137,7 @@ export type SshProbe = {
   home: string;
   shell: string;
   message: string;
+  entries?: WorkspaceEntry[];
 };
 
 export type Conversation = {
