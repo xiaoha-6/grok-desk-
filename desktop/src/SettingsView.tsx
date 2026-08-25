@@ -26,6 +26,7 @@ import {
   type RuntimeStatus,
   type SettingsPage,
   type SkillRecord,
+  type SshTarget,
   type Theme,
 } from "./types";
 
@@ -129,8 +130,11 @@ export function SettingsView(props: {
   modelsMessage: string;
   onRefreshModels: (fromForm?: boolean) => void;
   cwd: string;
-  applyCwd: (path: string) => void;
+  applyCwd: (path: string, ssh?: SshTarget | null) => void;
   onPickWorkspace?: () => void;
+  onConnectSsh?: () => void;
+  ssh?: SshTarget | null;
+  sshHosts?: SshTarget[];
   status: RuntimeStatus | null;
   statusError: string;
   installing: boolean;
@@ -173,6 +177,7 @@ export function SettingsView(props: {
     { id: "general", title: copy.general, icon: <IconGear /> },
     { id: "runtime", title: copy.runtime, icon: <IconTerminal /> },
     { id: "relay", title: copy.relay, icon: <IconRelay /> },
+    { id: "ssh", title: copy.ssh, icon: <IconTerminal /> },
     { id: "agent", title: copy.agent, icon: <IconSpark size={15} /> },
     { id: "compatibility", title: copy.compatibility, icon: <IconSliders /> },
     { id: "skills", title: copy.skills, icon: <IconBox /> },
@@ -278,7 +283,12 @@ export function SettingsView(props: {
                     <input value={props.cwd} spellCheck={false} onChange={(event) => props.applyCwd(event.target.value)} />
                     {props.onPickWorkspace ? (
                       <button className="ghost compact" type="button" onClick={props.onPickWorkspace}>
-                        {copy.chooseFolder}
+                        {copy.localFolder}
+                      </button>
+                    ) : null}
+                    {props.onConnectSsh ? (
+                      <button className="ghost compact" type="button" onClick={props.onConnectSsh}>
+                        {copy.remoteFolder}
                       </button>
                     ) : null}
                   </div>
@@ -293,6 +303,33 @@ export function SettingsView(props: {
                     options={EFFORTS.map((item) => ({ id: item.id, label: item.label }))}
                   />
                 </SettingsRow>
+              </section>
+            </>
+          )}
+
+          {props.settingsPage === "ssh" && (
+            <>
+              <section className="group">
+                <SettingsRow title={copy.ssh} detail={copy.sshDetail}>
+                  {props.onConnectSsh ? (
+                    <button className="primary" type="button" onClick={props.onConnectSsh}>
+                      {copy.sshConnect}
+                    </button>
+                  ) : null}
+                </SettingsRow>
+                <SettingsRow title={copy.workspace} detail={props.ssh ? `${props.ssh.user}@${props.ssh.host}:${props.ssh.remotePath}` : copy.workspaceDetail} />
+                <p className="hint">{copy.sshWindowsLinux}</p>
+                <p className="hint">{copy.sshNeedGrok}</p>
+                {(props.sshHosts || []).length ? (
+                  <div className="ssh-recent">
+                    <div className="row-title">{copy.sshRecent}</div>
+                    {(props.sshHosts || []).map((item) => (
+                      <div key={`${item.user}@${item.host}:${item.port}/${item.remotePath}`} className="hint left">
+                        {item.user}@{item.host}:{item.port} {item.remotePath}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
               </section>
             </>
           )}

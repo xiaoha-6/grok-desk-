@@ -37,6 +37,7 @@ import {
   IconSidebar,
   GrokMark,
   IconStop,
+  IconTerminal,
 } from "./icons";
 import { t as translate, type Copy } from "./i18n";
 import { MessageBody } from "./markdown";
@@ -76,6 +77,8 @@ import {
   type SessionInfo,
   type SettingsPage,
   type SkillRecord,
+  type SshProbe,
+  type SshTarget,
   type Theme,
   type TimelineEvent,
   type View,
@@ -124,6 +127,41 @@ function workspaceLabel(path: string, homeDir: string, homeWord: string) {
   if (isHomeLikePath(path, homeDir)) return homeWord;
   const parts = normalizePath(path).split("/").filter(Boolean);
   return parts[parts.length - 1] || homeWord;
+}
+
+function emptySshTarget(): SshTarget {
+  return { host: "", port: 22, user: "", remotePath: "", identityFile: "", auth: "key" };
+}
+
+function sshWorkspaceId(target: SshTarget) {
+  const user = target.user.trim() || "root";
+  const host = target.host.trim();
+  const port = target.port || 22;
+  const path = target.remotePath.replace(/\\/g, "/").replace(/^\/+/, "");
+  return `ssh://${user}@${host}:${port}/${path}`;
+}
+
+function isSshWorkspace(path: string) {
+  return /^ssh:\/\//i.test(path.trim());
+}
+
+function parseSshWorkspace(path: string): SshTarget | null {
+  const trimmed = path.trim();
+  const match = trimmed.match(/^ssh:\/\/([^@]+)@([^:/]+):(\d+)\/(.*)$/i);
+  if (!match) return null;
+  return {
+    host: match[2],
+    port: Number(match[3]) || 22,
+    user: match[1],
+    remotePath: `/${match[4]}`.replace(/\/+/g, "/"),
+    identityFile: "",
+    auth: "key",
+  };
+}
+
+function sshLabel(target: SshTarget, path = target.remotePath) {
+  const folder = workspaceLabel(path, "", target.host || "ssh");
+  return `${target.user || "root"}@${target.host}:${folder}`;
 }
 
 function friendlyError(raw: string) {
@@ -272,6 +310,7 @@ function combineConversations(current: Conversation, incoming: Conversation): Co
     id: stableId,
     title: isGenericTitle(winner.title) && !isGenericTitle(loser.title) ? loser.title : winner.title,
     cwd: winner.cwd || loser.cwd,
+    ssh: winner.ssh || loser.ssh || null,
     grokSessionId: sessionId || winner.grokSessionId || loser.grokSessionId,
     accountId: winner.accountId || loser.accountId,
     messages: (winner.messages?.length || 0) >= (loser.messages?.length || 0) ? winner.messages : loser.messages,
@@ -290,6 +329,7 @@ function hydrateConversation(item: Conversation): Conversation {
     ...item,
     title: item.title || "Grok Session",
     cwd: item.cwd || "",
+    ssh: item.ssh || null,
     messages: (item.messages || []).map((message) => ({
       ...message,
       events: message.events || [],
@@ -528,6 +568,12 @@ export default function App() {
   const [cwd, setCwd] = useState(saved.cwd || "");
   const [prompt, setPrompt] = useState("");
   const [editingCwd, setEditingCwd] = useState(false);
+  const [showSshModal, setShowSshModal] = useState(false);
+  const [sshForm, setSshForm] = useState<SshTarget>(emptySshTarget);
+  const [sshHosts, setSshHosts] = useState<SshTarget[]>([]);
+  const [sshProbe, setSshProbe] = useState<SshProbe | null>(null);
+  const [sshBusy, setSshBusy] = useState(false);
+  const [sshError, setSshError] = useState("");
   const [running, setRunning] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
@@ -646,8 +692,9 @@ export default function App() {
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
   const homeDir = status?.homeDir || "";
   const sessionCwd = selected?.cwd || cwd;
-  const workspaceRoot = usableWorkspace(sessionCwd, homeDir);
-  const projectName = workspaceLabel(sessionCwd, homeDir, t.home);
+  const activeSsh = selected?.ssh || (isSshWorkspace(sessionCwd) ? parseSshWorkspace(sessionCwd) : null);
+  const workspaceRoot = activeSsh ? activeSsh.remotePath : usableWorkspace(sessionCwd, homeDir);
+  const projectName = activeSsh ? sshLabel(activeSsh, workspaceRoot) : workspaceLabel(sessionCwd, homeDir, t.home);
   const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing && !running;
   const relayConfigured = Boolean(relayQuota?.configured || relayReady);
   const routed = relayConfigured ? undefined : pickRoutedAccount(accounts, settings);
@@ -681,7 +728,7 @@ export default function App() {
   const projects = useMemo(() => {
     const groups = new Map<string, Conversation[]>();
     for (const item of dedupeConversations(conversations).filter((conversation) => !conversation.archivedAt)) {
-      const key = item.cwd || homeDir || "";
+      const key = item.ssh ? sshWorkspaceId(item.ssh) : item.cwd || homeDir || "";
       const list = groups.get(key) || [];
       list.push(item);
       groups.set(key, list);
@@ -689,7 +736,7 @@ export default function App() {
     return [...groups.entries()]
       .map(([path, items]) => ({
         path,
-        name: workspaceLabel(path, homeDir, t.home),
+        name: items[0]?.ssh ? sshLabel(items[0].ssh) : workspaceLabel(path, homeDir, t.home),
         items: dedupeConversations(items),
       }))
       .sort((a, b) => (b.items[0]?.updatedAt || 0) - (a.items[0]?.updatedAt || 0));
@@ -1600,12 +1647,86 @@ export default function App() {
     setSelectedId(ensured.id);
   }
 
-  function applyCwd(path: string) {
+  function applyCwd(path: string, ssh?: SshTarget | null) {
     const trimmed = path.trim();
+    const nextSsh = ssh === undefined ? (isSshWorkspace(trimmed) ? parseSshWorkspace(trimmed) : null) : ssh;
     setCwd(trimmed);
     setConversations((list) =>
-      list.map((item) => (item.id === selectedId ? { ...item, cwd: trimmed } : item)),
+      list.map((item) => (item.id === selectedId ? { ...item, cwd: trimmed, ssh: nextSsh } : item)),
     );
+  }
+
+  async function loadSshHosts() {
+    try {
+      const hosts = await invoke<SshTarget[]>("list_ssh_hosts");
+      setSshHosts(Array.isArray(hosts) ? hosts : []);
+    } catch {
+      setSshHosts([]);
+    }
+  }
+
+  async function openSshModal() {
+    setSshError("");
+    setSshProbe(null);
+    setSshForm(activeSsh ? { ...emptySshTarget(), ...activeSsh } : emptySshTarget());
+    setShowSshModal(true);
+    await loadSshHosts();
+  }
+
+  async function pickSshIdentity() {
+    try {
+      const picked = await invoke<string | null>("pick_ssh_identity");
+      if (!picked) return;
+      setSshForm((current) => ({ ...current, identityFile: picked, auth: "key" }));
+    } catch (error) {
+      setSshError(String(error));
+    }
+  }
+
+  async function testSsh(target = sshForm) {
+    setSshBusy(true);
+    setSshError("");
+    setStatusText(t.sshConnecting);
+    try {
+      const probe = await invoke<SshProbe>("probe_ssh_host", { target });
+      setSshProbe(probe);
+      setSshForm((current) => ({ ...current, remotePath: probe.remotePath || current.remotePath }));
+      setStatusText(probe.message);
+      return probe;
+    } catch (error) {
+      const message = String(error);
+      setSshError(message);
+      setSshProbe(null);
+      setStatusText(message);
+      return null;
+    } finally {
+      setSshBusy(false);
+    }
+  }
+
+  async function applySshWorkspace(target = sshForm) {
+    const probe = sshProbe || (await testSsh(target));
+    if (!probe) return;
+    const normalized: SshTarget = {
+      ...target,
+      host: target.host.trim(),
+      user: target.user.trim() || "root",
+      port: target.port || 22,
+      remotePath: probe.remotePath || target.remotePath,
+      identityFile: target.identityFile || "",
+      auth: "key",
+    };
+    const id = sshWorkspaceId(normalized);
+    applyCwd(id, normalized);
+    setShowWorkspace(true);
+    setShowSshModal(false);
+    try {
+      const next = [normalized, ...sshHosts.filter((item) => sshWorkspaceId(item) !== id)].slice(0, 12);
+      setSshHosts(next);
+      await invoke("save_ssh_hosts", { hosts: next });
+    } catch {
+      // keep the workspace even if history save fails
+    }
   }
 
   async function pickWorkspaceFolder() {
@@ -1618,7 +1739,7 @@ export default function App() {
         setStatusText(t.workspaceHomeHint);
         return;
       }
-      applyCwd(picked);
+      applyCwd(picked, null);
     } catch (error) {
       setStatusText(String(error));
     }
@@ -1629,7 +1750,7 @@ export default function App() {
     const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
     if ((!text.trim() && !attachments.length) || !conversation || runningRef.current) return;
     const runtime = statusRef.current;
-    if (!runtime?.installed) {
+    if (!conversation.ssh && !runtime?.installed) {
       setShowInstallPrompt(true);
       return;
     }
@@ -1640,7 +1761,7 @@ export default function App() {
       : named?.enabled && named?.loggedIn
         ? named
         : pickRoutedAccount(accountsRef.current, settingsRef.current);
-    if (runtime.credentialsReady === false && !account?.loggedIn) {
+    if (!conversation.ssh && runtime?.credentialsReady === false && !account?.loggedIn) {
       setView("settings");
       setSettingsPage("relay");
       setStatusText(t.needCredentials);
@@ -1680,7 +1801,8 @@ export default function App() {
       const session = await invoke<SessionInfo>("ensure_session", {
         options: {
           model: canonicalModelId(modelRef.current),
-          cwd: conversation.cwd || cwdRef.current,
+          cwd: conversation.ssh?.remotePath || conversation.cwd || cwdRef.current,
+          ssh: conversation.ssh || null,
           existingSessionId: conversation.grokSessionId ?? null,
           grokHome: relayOn ? null : account?.homePath || null,
           permissionMode: settingsRef.current.permissionMode,
@@ -2032,6 +2154,9 @@ export default function App() {
         cwd={sessionCwd}
         applyCwd={applyCwd}
         onPickWorkspace={() => void pickWorkspaceFolder()}
+        onConnectSsh={() => void openSshModal()}
+        ssh={activeSsh}
+        sshHosts={sshHosts}
         status={status}
         statusError={statusError}
         installing={installing}
@@ -2197,6 +2322,9 @@ export default function App() {
             <button className="crumb-folder" type="button" title={t.pickWorkspace} onClick={() => void pickWorkspaceFolder()}>
               <IconFolder />
               <span>{workspaceRoot ? projectName : t.chooseFolder}</span>
+            </button>
+            <button className="icon-btn" type="button" title={t.sshConnect} onClick={() => void openSshModal()}>
+              <IconTerminal />
             </button>
             <span className="sep">
               <IconChevronRight />
@@ -2413,6 +2541,11 @@ export default function App() {
                 </button>
               )
             ) : null}
+            {!selected?.messages.length ? (
+              <button className="ghost compact" type="button" onClick={() => void openSshModal()}>
+                {t.sshConnect}
+              </button>
+            ) : null}
             {pendingImages.length ? (
               <div className="attach-row">
                 {pendingImages.map((item, index) => (
@@ -2528,6 +2661,7 @@ export default function App() {
           <Suspense fallback={<aside className="workspace" style={{ width: workspaceWidth, minWidth: workspaceWidth, flex: "0 0 auto" }} />}>
             <WorkspacePanel
               cwd={workspaceRoot}
+              ssh={activeSsh}
               changedPaths={changedPaths}
               diffs={fileDiffs}
               focusPath={workspaceFocusPath}
@@ -2535,6 +2669,7 @@ export default function App() {
               copy={t}
               onClose={() => setShowWorkspace(false)}
               onPickFolder={() => void pickWorkspaceFolder()}
+              onConnectSsh={() => void openSshModal()}
               width={workspaceWidth}
             />
           </Suspense>
@@ -2590,6 +2725,67 @@ export default function App() {
               ))}
           </div>
         </aside>
+      ) : null}
+
+      {showSshModal ? (
+        <div className="overlay" onClick={() => !sshBusy && setShowSshModal(false)}>
+          <div className="modal wide" onClick={(event) => event.stopPropagation()}>
+            <h3>{t.sshConnect}</h3>
+            <p>{t.sshDetail}</p>
+            <div className="ssh-grid">
+              <label>
+                {t.sshUser}
+                <input value={sshForm.user} spellCheck={false} placeholder="ubuntu" onChange={(event) => setSshForm((current) => ({ ...current, user: event.target.value }))} />
+              </label>
+              <label>
+                {t.sshHost}
+                <input value={sshForm.host} spellCheck={false} placeholder="10.0.0.8" onChange={(event) => setSshForm((current) => ({ ...current, host: event.target.value }))} />
+              </label>
+              <label>
+                {t.sshPort}
+                <input value={sshForm.port} spellCheck={false} onChange={(event) => setSshForm((current) => ({ ...current, port: Number(event.target.value) || 22 }))} />
+              </label>
+              <label className="ssh-span">
+                {t.sshPath}
+                <input value={sshForm.remotePath} spellCheck={false} placeholder="/home/ubuntu/app" onChange={(event) => setSshForm((current) => ({ ...current, remotePath: event.target.value }))} />
+              </label>
+              <label className="ssh-span">
+                {t.sshIdentity}
+                <div className="model-pick">
+                  <input value={sshForm.identityFile || ""} spellCheck={false} placeholder="~/.ssh/id_ed25519" onChange={(event) => setSshForm((current) => ({ ...current, identityFile: event.target.value }))} />
+                  <button className="ghost compact" type="button" onClick={() => void pickSshIdentity()}>
+                    {t.sshPickKey}
+                  </button>
+                </div>
+              </label>
+            </div>
+            <p className="hint">{t.sshIdentityHint}</p>
+            <p className="hint">{t.sshWindowsLinux}</p>
+            {sshHosts.length ? (
+              <div className="ssh-recent">
+                <div className="row-title">{t.sshRecent}</div>
+                {sshHosts.map((item) => (
+                  <button key={sshWorkspaceId(item)} className="ghost compact" type="button" onClick={() => setSshForm({ ...emptySshTarget(), ...item })}>
+                    {sshLabel(item)}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {sshProbe ? <p className="ok-text">{sshProbe.message}</p> : null}
+            {sshError ? <p className="error">{sshError}</p> : null}
+            <div className="actions">
+              <button className="ghost" type="button" disabled={sshBusy} onClick={() => setShowSshModal(false)}>
+                {t.close}
+              </button>
+              <button className="ghost" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void testSsh()}>
+                {sshBusy ? t.sshConnecting : t.sshTest}
+              </button>
+              <button className="primary" type="button" disabled={sshBusy || !sshForm.host.trim() || !sshForm.remotePath.trim()} onClick={() => void applySshWorkspace()}>
+                {t.sshSave}
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {showInstallPrompt && !status?.installed ? (

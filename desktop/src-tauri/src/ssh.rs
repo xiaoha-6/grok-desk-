@@ -1,0 +1,626 @@
+use crate::workspace::{WorkspaceEntry, WorkspaceFile, SKIP_DIRS, MAX_ENTRIES, MAX_FILE_BYTES, language_for_name};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+const SSH_TIMEOUT_SECS: u64 = 20;
+const SSH_LONG_TIMEOUT_SECS: u64 = 90;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshTarget {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub remote_path: String,
+    pub identity_file: Option<String>,
+    pub auth: String,
+}
+
+impl SshTarget {
+    pub fn normalized(self) -> Result<Self, String> {
+        let host = self.host.trim().to_string();
+        if host.is_empty() {
+            return Err("请填写 SSH 主机".into());
+        }
+        if host.contains(' ') || host.contains('"') || host.contains('\'') {
+            return Err("主机名不合法".into());
+        }
+        let user = {
+            let trimmed = self.user.trim();
+            if trimmed.is_empty() {
+                "root".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        if user.contains(' ') || user.contains('@') || user.contains('"') {
+            return Err("用户名不合法".into());
+        }
+        let port = if self.port == 0 { 22 } else { self.port };
+        let remote_path = normalize_remote_path(&self.remote_path);
+        if remote_path.is_empty() {
+            return Err("请填写远程工作目录".into());
+        }
+        if looks_like_home(&remote_path) {
+            return Err("请选择项目文件夹，不能把用户主目录当作工作区".into());
+        }
+        let identity_file = self
+            .identity_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        if let Some(path) = &identity_file {
+            if !Path::new(path).is_file() {
+                return Err(format!("私钥文件不存在：{path}"));
+            }
+        }
+        let auth = match self.auth.trim().to_ascii_lowercase().as_str() {
+            "password" => "password".to_string(),
+            _ => "key".to_string(),
+        };
+        Ok(Self {
+            host,
+            port,
+            user,
+            remote_path,
+            identity_file,
+            auth,
+        })
+    }
+
+    pub fn workspace_id(&self) -> String {
+        format!(
+            "ssh://{}@{}:{}/{}",
+            self.user,
+            self.host,
+            self.port,
+            self.remote_path.trim_start_matches('/')
+        )
+    }
+
+    pub fn destination(&self) -> String {
+        format!("{}@{}", self.user, self.host)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshProbe {
+    pub ok: bool,
+    pub os: String,
+    pub remote_path: String,
+    pub grok_installed: bool,
+    pub grok_path: Option<String>,
+    pub home: String,
+    pub shell: String,
+    pub message: String,
+}
+
+pub fn probe(target: &SshTarget) -> Result<SshProbe, String> {
+    let script = probe_script(&target.remote_path);
+    let output = run_ssh(target, &script, SSH_LONG_TIMEOUT_SECS, None)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_probe(&stdout, &target.remote_path)
+}
+
+pub fn list_remote_workspace(target: &SshTarget, rel: Option<&str>) -> Result<Vec<WorkspaceEntry>, String> {
+    let rel = sanitize_rel(rel.unwrap_or(""))?;
+    let remote = join_remote(&target.remote_path, &rel);
+    let script = format!(
+        r#"python3 -c "import json,os,sys
+root=sys.argv[1]
+skip=set({skip})
+max_entries={max_entries}
+try:
+    names=os.listdir(root)
+except FileNotFoundError:
+    print('ERR:not_found'); raise SystemExit(2)
+except NotADirectoryError:
+    print('ERR:not_dir'); raise SystemExit(2)
+except PermissionError:
+    print('ERR:denied'); raise SystemExit(2)
+out=[]
+for name in names:
+    if name in ('.','..'):
+        continue
+    path=os.path.join(root,name)
+    is_dir=os.path.isdir(path)
+    if is_dir and (name.startswith('.') or name in skip):
+        continue
+    out.append({{'name':name,'isDir':bool(is_dir)}})
+    if len(out)>=max_entries:
+        break
+out.sort(key=lambda item:(not item['isDir'], item['name'].lower()))
+print('OK')
+print(json.dumps(out,ensure_ascii=False))
+" {remote}"#,
+        remote = sh_single(&remote),
+        skip = serde_json::to_string(&SKIP_DIRS).unwrap_or_else(|_| "[]".into()),
+        max_entries = MAX_ENTRIES,
+    );
+    let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('[') || line.starts_with("ERR:"))
+        .unwrap_or("");
+    if json_line.starts_with("ERR:") {
+        return Err(match json_line {
+            "ERR:not_found" => "远程路径不存在".into(),
+            "ERR:not_dir" => "不是文件夹".into(),
+            "ERR:denied" => "没有权限读取该目录".into(),
+            other => format!("无法列出远程目录：{other}"),
+        });
+    }
+    let raw: Vec<serde_json::Value> =
+        serde_json::from_str(json_line).map_err(|err| format!("无法解析远程目录：{err}"))?;
+    let mut entries = Vec::new();
+    for item in raw {
+        let name = item
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let is_dir = item.get("isDir").and_then(|value| value.as_bool()).unwrap_or(false);
+        let path = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        entries.push(WorkspaceEntry {
+            name,
+            path: path.replace('\\', "/"),
+            is_dir,
+        });
+    }
+    Ok(entries)
+}
+
+pub fn read_remote_file(target: &SshTarget, rel: &str) -> Result<WorkspaceFile, String> {
+    let rel = sanitize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("还没有选择文件".into());
+    }
+    let remote = join_remote(&target.remote_path, &rel);
+    let script = format!(
+        r#"python3 -c "import os,sys
+path=sys.argv[1]
+limit={limit}
+if os.path.isdir(path):
+    print('ERR:dir'); raise SystemExit(2)
+try:
+    size=os.path.getsize(path)
+except FileNotFoundError:
+    print('ERR:not_found'); raise SystemExit(2)
+except PermissionError:
+    print('ERR:denied'); raise SystemExit(2)
+print('OK %s'%size)
+sys.stdout.buffer.write(open(path,'rb').read(limit))
+" {remote}"#,
+        remote = sh_single(&remote),
+        limit = MAX_FILE_BYTES,
+    );
+    let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ssh_error(&stderr, "", output.status.code()));
+    }
+    let stdout = output.stdout;
+    let split = stdout.iter().position(|byte| *byte == b'\n').unwrap_or(stdout.len());
+    let header = String::from_utf8_lossy(&stdout[..split]).trim().to_string();
+    if header.starts_with("ERR:") {
+        return Err(match header.as_str() {
+            "ERR:dir" => "这是文件夹".into(),
+            "ERR:not_found" => "远程文件不存在".into(),
+            "ERR:denied" => "没有权限读取该文件".into(),
+            other => format!("无法读取远程文件：{other}"),
+        });
+    }
+    let size = header
+        .strip_prefix("OK ")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let body = if split < stdout.len() { &stdout[split + 1..] } else { &[] };
+    let truncated = size > MAX_FILE_BYTES;
+    let mut content = String::from_utf8_lossy(body).into_owned();
+    if truncated {
+        content.push_str("\n…");
+    }
+    Ok(WorkspaceFile {
+        path: rel.replace('\\', "/"),
+        language: language_for_name(&rel),
+        content,
+        truncated,
+        size,
+    })
+}
+
+pub fn spawn_remote_agent(
+    target: &SshTarget,
+    model: &str,
+    grok_home: Option<&str>,
+    extra_env: &[(&str, String)],
+) -> Result<std::process::Child, String> {
+    let remote_home = grok_home
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "$HOME/.grok".to_string());
+    let mut env_prefix = String::from("export PATH=\"$HOME/.grok/bin:$HOME/.local/bin:/usr/local/bin:$PATH\"; ");
+    env_prefix.push_str(&format!("export GROK_HOME={}; ", sh_single(&remote_home)));
+    for (key, value) in extra_env {
+        env_prefix.push_str(&format!("export {key}={}; ", sh_single(value)));
+    }
+    let command = format!(
+        "{env} cd {cwd} && if command -v grok >/dev/null 2>&1; then BIN=grok; elif [ -x \"$HOME/.grok/bin/grok\" ]; then BIN=\"$HOME/.grok/bin/grok\"; elif [ -x \"$HOME/.grok/bin/grok.exe\" ]; then BIN=\"$HOME/.grok/bin/grok.exe\"; else echo 'GROKDESK_NO_GROK: 远程还没有安装 Grok Build。请先在 Linux 上执行 curl -fsSL https://x.ai/cli/install.sh | bash，或在 Windows 上执行 irm https://x.ai/cli/install.ps1 | iex。' >&2; exit 42; fi; exec \"$BIN\" agent --model {model} stdio",
+        env = env_prefix,
+        cwd = sh_single(&target.remote_path),
+        model = sh_single(model),
+    );
+    spawn_ssh(target, &command)
+}
+
+fn probe_script(remote_path: &str) -> String {
+    format!(
+        r#"python3 -c "import os,shutil,sys
+path=sys.argv[1]
+home=os.path.expanduser('~')
+os_name='windows' if os.name=='nt' or sys.platform.startswith('win') else 'linux'
+if sys.platform.startswith('darwin'):
+    os_name='macos'
+shell=os.environ.get('SHELL') or os.environ.get('COMSPEC') or ''
+cands=[shutil.which('grok'), os.path.join(home,'.grok','bin','grok'), os.path.join(home,'.grok','bin','grok.exe')]
+grok=next((item for item in cands if item and os.path.exists(item)), '')
+exists=os.path.isdir(path)
+print('OS='+os_name)
+print('HOME='+home)
+print('SHELL='+shell)
+print('PATH_EXISTS='+('1' if exists else '0'))
+print('PATH='+(os.path.abspath(path) if exists else path))
+print('GROK='+grok)
+" {path}"#,
+        path = sh_single(remote_path),
+    )
+}
+
+fn parse_probe(stdout: &str, fallback_path: &str) -> Result<SshProbe, String> {
+    let mut os = "linux".to_string();
+    let mut home = String::new();
+    let mut shell = String::new();
+    let mut remote_path = fallback_path.to_string();
+    let mut grok_path = None;
+    let mut exists = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("OS=") {
+            os = value.trim().to_ascii_lowercase();
+        } else if let Some(value) = line.strip_prefix("HOME=") {
+            home = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("SHELL=") {
+            shell = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("PATH=") {
+            if !value.trim().is_empty() {
+                remote_path = value.trim().to_string();
+            }
+        } else if let Some(value) = line.strip_prefix("PATH_EXISTS=") {
+            exists = value.trim() == "1";
+        } else if let Some(value) = line.strip_prefix("GROK=") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                grok_path = Some(trimmed.to_string());
+            }
+        }
+    }
+    if !exists {
+        return Err(format!("远程路径不存在：{remote_path}"));
+    }
+    let grok_installed = grok_path.is_some();
+    let message = if grok_installed {
+        format!("已连接到 {}，远程 Grok Build 可用", os_label(&os))
+    } else {
+        format!(
+            "已连接到 {}，但远程还没有 Grok Build。Linux 执行 curl -fsSL https://x.ai/cli/install.sh | bash；Windows 执行 irm https://x.ai/cli/install.ps1 | iex。",
+            os_label(&os)
+        )
+    };
+    Ok(SshProbe {
+        ok: true,
+        os,
+        remote_path,
+        grok_installed,
+        grok_path,
+        home,
+        shell,
+        message,
+    })
+}
+
+fn os_label(os: &str) -> &str {
+    match os {
+        "windows" => "Windows",
+        "macos" => "macOS",
+        _ => "Linux",
+    }
+}
+
+fn run_ssh(
+    target: &SshTarget,
+    remote_command: &str,
+    timeout_secs: u64,
+    stdin: Option<&[u8]>,
+) -> Result<std::process::Output, String> {
+    let mut command = ssh_command(target)?;
+    command.arg(target.destination());
+    command.arg(remote_command);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("无法启动 SSH：{err}。请确认本机已安装 OpenSSH 客户端。"))?;
+    if let Some(bytes) = stdin {
+        if let Some(mut handle) = child.stdin.take() {
+            let _ = handle.write_all(bytes);
+        }
+    }
+    wait_output(child, timeout_secs)
+}
+
+fn spawn_ssh(target: &SshTarget, remote_command: &str) -> Result<std::process::Child, String> {
+    let mut command = ssh_command(target)?;
+    command.arg("-T");
+    command.arg(target.destination());
+    command.arg(remote_command);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+        .spawn()
+        .map_err(|err| format!("无法启动远程 SSH 会话：{err}"))
+}
+
+fn ssh_command(target: &SshTarget) -> Result<Command, String> {
+    let program = ssh_binary()?;
+    let mut command = Command::new(program);
+    command.arg("-p").arg(target.port.to_string());
+    command.arg("-o").arg("BatchMode=yes");
+    command.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    command.arg("-o").arg("ConnectTimeout=12");
+    command.arg("-o").arg("ServerAliveInterval=15");
+    command.arg("-o").arg("ServerAliveCountMax=3");
+    command.arg("-o").arg("PreferredAuthentications=publickey,keyboard-interactive");
+    if let Some(identity) = &target.identity_file {
+        command.arg("-i").arg(identity);
+        command.arg("-o").arg("IdentitiesOnly=yes");
+    }
+    Ok(command)
+}
+
+fn ssh_binary() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("GROKDESK_SSH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    let names = if cfg!(windows) {
+        vec!["ssh.exe", "ssh"]
+    } else {
+        vec!["ssh"]
+    };
+    for name in names {
+        if let Ok(path) = which(name) {
+            return Ok(path);
+        }
+    }
+    Err("本机没有 OpenSSH 客户端。macOS / Linux 一般自带 ssh；Windows 请安装 OpenSSH Client。".into())
+}
+
+fn which(name: &str) -> Result<PathBuf, String> {
+    if let Ok(output) = Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg(name)
+        .output()
+    {
+        if output.status.success() {
+            if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    return Ok(PathBuf::from(trimmed));
+                }
+            }
+        }
+    }
+    Err(format!("找不到 {name}"))
+}
+
+fn wait_output(mut child: std::process::Child, timeout_secs: u64) -> Result<std::process::Output, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("读取 SSH 输出失败：{err}"))
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("SSH 连接超时。请检查主机、端口、私钥，或先在终端里 ssh 一次确认能登录。".into());
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(err) => return Err(format!("SSH 进程异常：{err}")),
+        }
+    }
+}
+
+fn ssh_error(stderr: &str, stdout: &str, code: Option<i32>) -> String {
+    let text = format!("{stderr}\n{stdout}");
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("permission denied") {
+        "SSH 认证失败。请改用私钥/ssh-agent，或先在终端登录一次确认密钥可用。".into()
+    } else if lower.contains("connection refused") {
+        "SSH 端口被拒绝。请确认远程 sshd 已启动，以及端口是否正确。".into()
+    } else if lower.contains("could not resolve") || lower.contains("nodename nor servname") {
+        "无法解析主机名。请检查地址是否写对。".into()
+    } else if lower.contains("timed out") || lower.contains("connection timed out") {
+        "SSH 连接超时。请检查网络、防火墙和端口。".into()
+    } else if lower.contains("no such file") {
+        "远程路径不存在。".into()
+    } else {
+        let snippet = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if snippet.is_empty() {
+            format!("SSH 失败{}", code.map(|value| format!("（退出码 {value}）")).unwrap_or_default())
+        } else {
+            format!("SSH 失败：{snippet}")
+        }
+    }
+}
+
+fn normalize_remote_path(path: &str) -> String {
+    let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return String::new();
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    if trimmed.starts_with('/') {
+        format!("/{out}")
+    } else if trimmed.starts_with("~/") || trimmed == "~" {
+        trimmed.trim_end_matches('/').to_string()
+    } else {
+        format!("/{out}")
+    }
+}
+
+fn looks_like_home(path: &str) -> bool {
+    matches!(path, "/" | "~" | "/root" | "/home")
+        || path == "/Users"
+        || path.ends_with("/Documents") && path.matches('/').count() <= 2
+}
+
+fn sanitize_rel(rel: &str) -> Result<String, String> {
+    let cleaned = rel.replace('\\', "/");
+    let mut parts = Vec::new();
+    for part in cleaned.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err("路径不允许跳出工作目录".into());
+        }
+        parts.push(part);
+    }
+    Ok(parts.join("/"))
+}
+
+fn join_remote(root: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        root.trim_end_matches('/').to_string()
+    } else {
+        format!("{}/{}", root.trim_end_matches('/'), rel.trim_start_matches('/'))
+    }
+}
+
+fn sh_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+pub fn persist_hosts(hosts: &[SshTarget]) -> Result<(), String> {
+    let dir = crate::runtime::grok_home();
+    fs::create_dir_all(&dir).map_err(|err| format!("无法保存 SSH 配置：{err}"))?;
+    let path = dir.join("ssh-hosts.json");
+    let json = serde_json::to_vec_pretty(hosts).map_err(|err| format!("无法序列化 SSH 配置：{err}"))?;
+    fs::write(path, json).map_err(|err| format!("无法写入 SSH 配置：{err}"))
+}
+
+pub fn load_hosts() -> Vec<SshTarget> {
+    let path = crate::runtime::grok_home().join("ssh-hosts.json");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<SshTarget>>(&text).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| item.normalized().ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_and_rejects_home() {
+        let target = SshTarget {
+            host: "  10.0.0.8 ".into(),
+            port: 0,
+            user: " ubuntu ".into(),
+            remote_path: "/home/ubuntu/app".into(),
+            identity_file: None,
+            auth: "key".into(),
+        }
+        .normalized()
+        .unwrap();
+        assert_eq!(target.port, 22);
+        assert_eq!(target.workspace_id(), "ssh://ubuntu@10.0.0.8:22/home/ubuntu/app");
+        let home = SshTarget {
+            host: "10.0.0.8".into(),
+            port: 22,
+            user: "ubuntu".into(),
+            remote_path: "/home".into(),
+            identity_file: None,
+            auth: "key".into(),
+        };
+        assert!(home.normalized().is_err());
+    }
+
+    #[test]
+    fn blocks_parent_escape() {
+        assert!(sanitize_rel("../etc/passwd").is_err());
+        assert_eq!(sanitize_rel("src/main.rs").unwrap(), "src/main.rs");
+    }
+}

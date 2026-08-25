@@ -102,12 +102,33 @@ export type ChatMessage = {
   error?: string;
 };
 
+export type SshTarget = {
+  host: string;
+  port: number;
+  user: string;
+  remotePath: string;
+  identityFile?: string | null;
+  auth: "key" | "password" | string;
+};
+
+export type SshProbe = {
+  ok: boolean;
+  os: string;
+  remotePath: string;
+  grokInstalled: boolean;
+  grokPath?: string | null;
+  home: string;
+  shell: string;
+  message: string;
+};
+
 export type Conversation = {
   id: string;
   title: string;
   cwd: string;
   accountId?: string;
   grokSessionId?: string;
+  ssh?: SshTarget | null;
   messages: ChatMessage[];
   updatedAt: number;
   archivedAt?: number;
@@ -251,6 +272,7 @@ export type SettingsPage =
   | "general"
   | "runtime"
   | "relay"
+  | "ssh"
   | "agent"
   | "compatibility"
   | "skills"

@@ -5,6 +5,7 @@ mod install;
 mod media;
 mod runtime;
 mod sessions;
+mod ssh;
 mod workspace;
 
 use accounts::{
@@ -19,6 +20,7 @@ use config::{
 use install::{install_official, InstallEventSink};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
 use sessions::{LocalSessionHistory, LocalSessionSummary};
+use ssh::{SshProbe, SshTarget};
 use workspace::{WorkspaceEntry, WorkspaceFile};
 use serde::Deserialize;
 use serde_json::Value;
@@ -133,6 +135,35 @@ async fn list_local_sessions() -> Vec<LocalSessionSummary> {
 }
 
 #[tauri::command]
+async fn list_ssh_hosts() -> Vec<SshTarget> {
+    ssh::load_hosts()
+}
+
+#[tauri::command]
+async fn save_ssh_hosts(hosts: Vec<SshTarget>) -> Result<(), String> {
+    let normalized = hosts
+        .into_iter()
+        .map(SshTarget::normalized)
+        .collect::<Result<Vec<_>, _>>()?;
+    ssh::persist_hosts(&normalized)
+}
+
+#[tauri::command]
+async fn probe_ssh_host(target: SshTarget) -> Result<SshProbe, String> {
+    let target = target.normalized()?;
+    run_blocking(move || ssh::probe(&target)).await
+}
+
+#[tauri::command]
+async fn pick_ssh_identity() -> Option<String> {
+    rfd::AsyncFileDialog::new()
+        .set_title("选择 SSH 私钥")
+        .pick_file()
+        .await
+        .map(|file| file.path().to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 async fn pick_workspace_folder(current: Option<String>) -> Option<String> {
     let mut dialog = rfd::AsyncFileDialog::new().set_title("选择工作目录");
     if let Some(path) = current.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
@@ -145,13 +176,37 @@ async fn pick_workspace_folder(current: Option<String>) -> Option<String> {
 }
 
 #[tauri::command]
-async fn list_workspace(root: String, path: Option<String>) -> Result<Vec<WorkspaceEntry>, String> {
-    run_blocking(move || workspace::list_workspace(&root, path.as_deref())).await
+async fn list_workspace(
+    root: String,
+    path: Option<String>,
+    ssh: Option<SshTarget>,
+) -> Result<Vec<WorkspaceEntry>, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::list_remote_workspace(&target, path.as_deref())
+        } else {
+            workspace::list_workspace(&root, path.as_deref())
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-async fn read_workspace_file(root: String, path: String) -> Result<WorkspaceFile, String> {
-    run_blocking(move || workspace::read_workspace_file(&root, &path)).await
+async fn read_workspace_file(
+    root: String,
+    path: String,
+    ssh: Option<SshTarget>,
+) -> Result<WorkspaceFile, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::read_remote_file(&target, &path)
+        } else {
+            workspace::read_workspace_file(&root, &path)
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -436,6 +491,10 @@ pub fn run() {
             list_local_sessions,
             load_session_history,
             pick_workspace_folder,
+            list_ssh_hosts,
+            save_ssh_hosts,
+            probe_ssh_host,
+            pick_ssh_identity,
             list_workspace,
             read_workspace_file,
             list_accounts,

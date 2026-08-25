@@ -1,6 +1,6 @@
 Unicode True
 !define PRODUCT_NAME "xiaoha grok 桌面版"
-!define PRODUCT_VERSION "0.6.21"
+!define PRODUCT_VERSION "0.6.22"
 !define PRODUCT_PUBLISHER "小哈AI"
 !define PRODUCT_EXE "xiaoha-grok.exe"
 !define PROTOCOL "grokdesk"

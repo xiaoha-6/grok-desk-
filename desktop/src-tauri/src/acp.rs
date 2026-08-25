@@ -1,5 +1,6 @@
 use crate::config::{canonical_model_id, credentials_ready, resolve_agent_home, NO_CREDENTIALS_CODE};
 use crate::runtime::{grok_home, resolve_binary};
+use crate::ssh::SshTarget;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-const CLIENT_VERSION: &str = "0.6.19";
+const CLIENT_VERSION: &str = "0.6.22";
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;
@@ -32,6 +33,7 @@ pub struct SessionOptions {
     pub enable_memory: Option<bool>,
     pub enable_web_search: Option<bool>,
     pub enable_subagents: Option<bool>,
+    pub ssh: Option<SshTarget>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,8 +353,17 @@ impl AcpClient {
                 .filter(|value| !value.is_empty())
                 .unwrap_or("grok-4.5"),
         );
-        let cwd = resolve_cwd(options.cwd.clone())?;
-        let fingerprint = spawn_fingerprint(&options, &model);
+        let ssh = options
+            .ssh
+            .clone()
+            .map(SshTarget::normalized)
+            .transpose()?;
+        let cwd = if let Some(ssh) = &ssh {
+            ssh.remote_path.clone()
+        } else {
+            resolve_cwd(options.cwd.clone())?
+        };
+        let fingerprint = spawn_fingerprint(&options, &model, ssh.as_ref());
         let existing_session_id = options
             .existing_session_id
             .as_deref()
@@ -385,7 +396,7 @@ impl AcpClient {
                 this.agent.is_none() || this.spawn_fingerprint.as_deref() != Some(&fingerprint);
             if restart_agent {
                 this.stop();
-                this.spawn_agent(app, &options, &model, &cwd)?;
+                this.spawn_agent(app, &options, &model, &cwd, ssh.as_ref())?;
                 this.spawn_fingerprint = Some(fingerprint);
             } else if let Some(agent) = &this.agent {
                 if let Ok(mut mode) = agent.permission_mode.lock() {
@@ -518,77 +529,88 @@ impl AcpClient {
         options: &SessionOptions,
         model: &str,
         cwd: &str,
+        ssh: Option<&SshTarget>,
     ) -> Result<(), String> {
-        let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
         let home = resolve_agent_home(options.grok_home.as_deref())?;
-        let mut command = Command::new(&binary);
-        command.arg("agent");
-        if !model.is_empty() {
-            command.arg("--model").arg(model);
-        }
-        command
-            .arg("stdio")
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("GROK_HOME", &home)
-            .env(
-                "GROK_MEMORY",
+        let mut extra_env: Vec<(String, String)> = vec![
+            (
+                "GROK_MEMORY".into(),
                 if options.enable_memory.unwrap_or(false) {
-                    "1"
+                    "1".into()
                 } else {
-                    "0"
+                    "0".into()
                 },
-            )
-            .env(
-                "GROK_DEBUG_CONTEXT_WINDOW",
+            ),
+            (
+                "GROK_DEBUG_CONTEXT_WINDOW".into(),
                 options
                     .context_window_tokens
                     .unwrap_or(DEFAULT_CONTEXT_WINDOW)
                     .to_string(),
-            )
-            .env(
-                "GROK_AUTO_COMPACT_THRESHOLD_PERCENT",
+            ),
+            (
+                "GROK_AUTO_COMPACT_THRESHOLD_PERCENT".into(),
                 options
                     .auto_compact_threshold_percent
                     .unwrap_or(85)
                     .clamp(50, 99)
                     .to_string(),
-            );
+            ),
+        ];
         if options.enable_web_search == Some(false) {
-            command.env("GROK_WEB_FETCH", "0");
+            extra_env.push(("GROK_WEB_FETCH".into(), "0".into()));
         }
+        let relay_profile = crate::config::read_relay_profile(&grok_home());
         if crate::config::is_relay_configured(&grok_home()) {
-            if let Some(profile) = crate::config::read_relay_profile(&grok_home()) {
-                command.env("GROK_CLI_CHAT_PROXY_BASE_URL", &profile.endpoint);
-                command.env("XAI_API_KEY", &profile.api_key);
-                command.env("GROK_CODE_XAI_API_KEY", &profile.api_key);
+            if let Some(profile) = &relay_profile {
+                extra_env.push(("GROK_CLI_CHAT_PROXY_BASE_URL".into(), profile.endpoint.clone()));
+                extra_env.push(("XAI_API_KEY".into(), profile.api_key.clone()));
+                extra_env.push(("GROK_CODE_XAI_API_KEY".into(), profile.api_key.clone()));
             }
         }
 
-        let bin_dir = binary
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let path_sep = if cfg!(windows) { ';' } else { ':' };
-        let mut path_value = bin_dir.display().to_string();
-        if let Ok(existing) = std::env::var("PATH") {
-            path_value.push(path_sep);
-            path_value.push_str(&existing);
-        }
-        command.env("PATH", path_value);
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let mut child = command
-            .spawn()
-            .map_err(|err| format!("无法启动 Grok Agent：{err}"))?;
+        let mut child = if let Some(ssh) = ssh {
+            let grok_home_value = options.grok_home.clone().or_else(|| Some("$HOME/.grok".into()));
+            let env_refs: Vec<(&str, String)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            crate::ssh::spawn_remote_agent(ssh, model, grok_home_value.as_deref(), &env_refs)?
+        } else {
+            let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
+            let mut command = Command::new(&binary);
+            command.arg("agent");
+            if !model.is_empty() {
+                command.arg("--model").arg(model);
+            }
+            command
+                .arg("stdio")
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env("GROK_HOME", &home);
+            for (key, value) in &extra_env {
+                command.env(key, value);
+            }
+            let bin_dir = binary
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let path_sep = if cfg!(windows) { ';' } else { ':' };
+            let mut path_value = bin_dir.display().to_string();
+            if let Ok(existing) = std::env::var("PATH") {
+                path_value.push(path_sep);
+                path_value.push_str(&existing);
+            }
+            command.env("PATH", path_value);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            command
+                .spawn()
+                .map_err(|err| format!("无法启动 Grok Agent：{err}"))?
+        };
         let stdin = child
             .stdin
             .take()
@@ -654,12 +676,13 @@ fn require_credentials(options: &SessionOptions) -> Result<(), String> {
     ))
 }
 
-fn spawn_fingerprint(options: &SessionOptions, model: &str) -> String {
+fn spawn_fingerprint(options: &SessionOptions, model: &str, ssh: Option<&SshTarget>) -> String {
     let home = resolve_agent_home(options.grok_home.as_deref())
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+    let remote = ssh.map(|item| item.workspace_id()).unwrap_or_default();
     format!(
-        "{model}|{home}|{}|{}|{}|{}",
+        "{model}|{home}|{remote}|{}|{}|{}|{}",
         options
             .context_window_tokens
             .unwrap_or(DEFAULT_CONTEXT_WINDOW),

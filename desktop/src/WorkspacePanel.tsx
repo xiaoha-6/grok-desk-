@@ -8,7 +8,7 @@ import { fileLabel } from "./diff";
 import { FileKindIcon, fileBadge, fileExtension } from "./fileIcons";
 import { IconChevronRight, IconClose } from "./icons";
 import type { Copy } from "./i18n";
-import type { FileDiff } from "./types";
+import type { FileDiff, SshTarget } from "./types";
 
 export type WorkspaceEntry = {
   name: string;
@@ -39,6 +39,7 @@ type OpenTab = {
 
 type Props = {
   cwd: string;
+  ssh?: SshTarget | null;
   changedPaths: string[];
   diffs: FileDiff[];
   focusPath?: string;
@@ -46,10 +47,11 @@ type Props = {
   copy: Copy;
   onClose: () => void;
   onPickFolder?: () => void;
+  onConnectSsh?: () => void;
   width?: number;
 };
 
-export function WorkspacePanel({ cwd, changedPaths, diffs, focusPath, focusTick = 0, copy, onClose, onPickFolder, width }: Props) {
+export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focusTick = 0, copy, onClose, onPickFolder, onConnectSsh, width }: Props) {
   const [expanded, setExpanded] = useState<Record<string, WorkspaceEntry[]>>({});
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activePath, setActivePath] = useState("");
@@ -93,13 +95,13 @@ export function WorkspacePanel({ cwd, changedPaths, diffs, focusPath, focusTick 
       if (!cwd) return;
       if (!force && expandedRef.current[rel]) return;
       try {
-        const entries = await invoke<WorkspaceEntry[]>("list_workspace", { root: cwd, path: rel || null });
+        const entries = await invoke<WorkspaceEntry[]>("list_workspace", { root: cwd, path: rel || null, ssh: ssh || null });
         setExpanded((current) => ({ ...current, [rel]: entries }));
       } catch (err) {
         setError(String(err));
       }
     },
-    [cwd],
+    [cwd, ssh],
   );
 
   useEffect(() => {
@@ -119,7 +121,7 @@ export function WorkspacePanel({ cwd, changedPaths, diffs, focusPath, focusTick 
     async (rel: string) => {
       if (!cwd || !rel) return;
       try {
-        const next = await invoke<WorkspaceFile>("read_workspace_file", { root: cwd, path: rel });
+        const next = await invoke<WorkspaceFile>("read_workspace_file", { root: cwd, path: rel, ssh: ssh || null });
         if (cwdRef.current !== cwd) return;
         filesRef.current[rel] = next;
         if (activePathRef.current === rel) {
@@ -135,7 +137,7 @@ export function WorkspacePanel({ cwd, changedPaths, diffs, focusPath, focusTick 
         }
       }
     },
-    [cwd],
+    [cwd, ssh],
   );
 
   const showTab = useCallback(
@@ -297,12 +299,17 @@ export function WorkspacePanel({ cwd, changedPaths, diffs, focusPath, focusTick 
       <header className="workspace-head">
         <div className="workspace-head-title">
           <strong>{copy.codeWorkspace}</strong>
-          <em>{cwd || copy.chooseFolder}</em>
+          <em>{ssh ? `${ssh.user}@${ssh.host}:${cwd}` : cwd || copy.chooseFolder}</em>
         </div>
         <div className="workspace-head-actions">
+          {onConnectSsh ? (
+            <button className="ghost compact" type="button" onClick={onConnectSsh}>
+              {copy.sshConnect}
+            </button>
+          ) : null}
           {onPickFolder ? (
             <button className="ghost compact" type="button" onClick={onPickFolder}>
-              {copy.chooseFolder}
+              {copy.localFolder}
             </button>
           ) : null}
           <button className="icon-btn" type="button" onClick={onClose} title={copy.close}>
@@ -340,7 +347,12 @@ export function WorkspacePanel({ cwd, changedPaths, diffs, focusPath, focusTick 
                 <p className="hint">{copy.workspaceHomeHint}</p>
                 {onPickFolder ? (
                   <button className="ghost compact" type="button" onClick={onPickFolder}>
-                    {copy.chooseFolder}
+                    {copy.localFolder}
+                  </button>
+                ) : null}
+                {onConnectSsh ? (
+                  <button className="ghost compact" type="button" onClick={onConnectSsh}>
+                    {copy.sshConnect}
                   </button>
                 ) : null}
               </div>

@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SKIP_DIRS: &[&str] = &[
+pub const SKIP_DIRS: &[&str] = &[
     ".git",
     "node_modules",
     "target",
@@ -16,8 +16,8 @@ const SKIP_DIRS: &[&str] = &[
     ".grok",
     "grokdesk-relay",
 ];
-const MAX_ENTRIES: usize = 250;
-const MAX_FILE_BYTES: u64 = 400_000;
+pub const MAX_ENTRIES: usize = 250;
+pub const MAX_FILE_BYTES: u64 = 400_000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,7 +93,7 @@ pub fn read_workspace_file(root: &str, rel: &str) -> Result<WorkspaceFile, Strin
     }
     Ok(WorkspaceFile {
         path: rel.replace('\\', "/"),
-        language: language_for(&path),
+        language: language_for_name(&rel.replace('\\', "/")),
         content,
         truncated,
         size,
@@ -142,8 +142,8 @@ fn resolve_in_root(root: &str, rel: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-fn language_for(path: &Path) -> String {
-    match path
+pub fn language_for_name(path: &str) -> String {
+    match Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
@@ -204,6 +204,7 @@ mod tests {
         assert!(nested.iter().any(|item| item.path == "src/main.rs"));
         let file = read_workspace_file(root, "src/main.rs").unwrap();
         assert_eq!(file.language, "rust");
+        assert_eq!(language_for_name("src/main.rs"), "rust");
         assert!(file.content.contains("fn main"));
         let _ = fs::remove_dir_all(&dir);
     }

@@ -874,6 +874,28 @@ button { background: none; }
 .modal p { margin: 0 0 16px; color: var(--text-2); line-height: 1.5; }
 
 .modal.wide { width: min(680px, 100%); }
+.ssh-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr 90px;
+  gap: 10px;
+  margin: 12px 0;
+}
+.ssh-grid label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.ssh-grid input {
+  width: 100%;
+}
+.ssh-span { grid-column: 1 / -1; }
+.ssh-recent {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 14px;
+}
 .ghost.danger { color: var(--danger); }
 .live-row { display: flex; align-items: center; gap: 8px; }
 .sidebar-foot.account-foot {
