@@ -955,6 +955,109 @@ button { background: none; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.inline-edits {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+.inline-edit {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--group);
+}
+.inline-edit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--text);
+}
+.inline-edit-title {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+.inline-edit .code-diff {
+  border-top: 1px solid var(--hairline);
+  margin: 0;
+  border-radius: 0;
+}
+.inline-edit-body {
+  margin: 0;
+  padding: 10px 12px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  color: var(--text-2);
+}
+.inline-commands {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+.inline-command {
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--group);
+}
+.inline-command-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px 6px;
+}
+.inline-command-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.inline-command-copy strong {
+  font-size: 13px;
+}
+.inline-command-copy span {
+  color: var(--text-3);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool-progress {
+  height: 4px;
+  margin: 0 12px 10px;
+  border-radius: 99px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.tool-progress span {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: var(--text-2);
+}
+.tool-progress span.pulse {
+  background: var(--text);
+  animation: tool-progress 1.2s ease-in-out infinite;
+}
+@keyframes tool-progress {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+.inline-command.ok .tool-progress span { background: #3dd68c; }
+.inline-command.bad .tool-progress span { background: var(--danger); }
+.inline-command.run .tool-progress span { background: var(--text); }
+.inline-command-body {
+  margin: 0;
+  padding: 0 12px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  color: var(--text-2);
+  max-height: 240px;
+  overflow: auto;
+}
 .ssh-browser .hint { margin: 0 12px 8px; }
 .ssh-browser-actions { padding: 0 12px 8px; }
 .ssh-browser-list {

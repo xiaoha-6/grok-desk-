@@ -3,8 +3,13 @@ import { fileLabel, lineDiff } from "./diff";
 import { CategoryIcon, EventKindIcon, IconChevronRight } from "./icons";
 import {
   categoryTitle,
+  commandTitle,
+  editTitle,
   eventIconKind,
+  eventProgress,
   groupRuns,
+  isCommandEvent,
+  isEditEvent,
   statusLabel,
   visibleEvents,
   type ActivityCategory,
@@ -77,7 +82,7 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
         <span className="timeline-ico">
           <EventKindIcon kind={eventIconKind(event)} />
         </span>
-        <span className="timeline-title">{event.title}</span>
+        <span className="timeline-title">{isEditEvent(event) ? editTitle(event) : event.title}</span>
         {status ? <span className={`timeline-status ${tone}`}>{status}</span> : null}
       </Disclosure>
       {open ? (
@@ -144,6 +149,87 @@ function CategoryGroup({
           ))}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+export function InlineCommands({
+  events,
+  lang,
+}: {
+  events: TimelineEvent[];
+  lang: Lang;
+}) {
+  const commands = events.filter((event) => isCommandEvent(event));
+  if (!commands.length) return null;
+  return (
+    <div className="inline-commands">
+      {commands.map((event) => {
+        const running = /in_progress|running|pending/i.test(event.status || "");
+        const failed = /fail|error/i.test(event.status || "");
+        const done = /complete|success/i.test(event.status || "");
+        const progress = eventProgress(event);
+        const detail = event.output || event.input || "";
+        return (
+          <div key={event.id} className={`inline-command${failed ? " bad" : done ? " ok" : running ? " run" : ""}`}>
+            <div className="inline-command-head">
+              <span className="timeline-ico">
+                <EventKindIcon kind="terminal" />
+              </span>
+              <div className="inline-command-copy">
+                <strong>{commandTitle(event, lang)}</strong>
+                <span>{event.title}</span>
+              </div>
+              {event.status ? (
+                <span className={`timeline-status ${failed ? "bad" : done ? "ok" : ""}`}>
+                  {statusLabel(event.status, lang)}
+                </span>
+              ) : null}
+            </div>
+            <div className="tool-progress" aria-hidden>
+              <span style={{ width: `${progress}%` }} className={running ? "pulse" : ""} />
+            </div>
+            {detail ? <pre className="inline-command-body">{clip(detail, 3500)}</pre> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function InlineEdits({
+  events,
+  lang,
+}: {
+  events: TimelineEvent[];
+  lang: Lang;
+}) {
+  const edits = events.filter((event) => isEditEvent(event) && (event.diffs?.length || event.input || event.output));
+  if (!edits.length) return null;
+  return (
+    <div className="inline-edits">
+      {edits.map((event) => (
+        <div key={event.id} className="inline-edit">
+          <div className="inline-edit-head">
+            <span className="timeline-ico">
+              <EventKindIcon kind="file" />
+            </span>
+            <span className="inline-edit-title">{editTitle(event)}</span>
+            {event.status ? (
+              <span className={`timeline-status ${/fail|error/i.test(event.status) ? "bad" : /complete|success/i.test(event.status) ? "ok" : ""}`}>
+                {statusLabel(event.status, lang)}
+              </span>
+            ) : null}
+          </div>
+          {event.diffs?.length
+            ? event.diffs.map((diff, index) => (
+                <CodeDiff key={`${event.id}-${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />
+              ))
+            : event.input || event.output ? (
+              <pre className="inline-edit-body">{clip(event.input || event.output || "", 6000)}</pre>
+            ) : null}
+        </div>
+      ))}
     </div>
   );
 }

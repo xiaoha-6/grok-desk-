@@ -16,7 +16,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { ActivityTimeline } from "./ActivityTimeline";
+import { ActivityTimeline, InlineCommands, InlineEdits } from "./ActivityTimeline";
 import { TextShimmer } from "./components/prompt-kit/text-shimmer";
 import { ThinkingOrbs } from "./components/thinking-orbs/ThinkingOrbs";
 import { extractFileDiffs } from "./diff";
@@ -373,14 +373,12 @@ function dedupeConversations(list: Conversation[]): Conversation[] {
 function persistConversations(list: Conversation[]): Conversation[] {
   return dedupeConversations(list).map((item) => ({
     ...item,
-    messages: item.grokSessionId
-      ? []
-      : item.messages.slice(-30).map((message) => ({
-          ...message,
-          streaming: false,
-          events: (message.events || []).slice(-12),
-          media: (message.media || []).map((media) => ({ ...media, data: undefined })),
-        })),
+    messages: item.messages.slice(-40).map((message) => ({
+      ...message,
+      streaming: false,
+      events: (message.events || []).slice(-16),
+      media: (message.media || []).map((media) => ({ ...media, data: undefined })),
+    })),
   }));
 }
 
@@ -410,10 +408,21 @@ function applyConversationUpdate(
 function mergeHistoryMessages(existing: ChatMessage[], incoming: ChatMessage[], prepend: boolean) {
   if (!incoming.length) return existing;
   if (!existing.length) return incoming;
-  const keys = new Set(existing.map((item) => `${item.role}:${item.text.slice(0, 160)}`));
-  const extra = incoming.filter((item) => !keys.has(`${item.role}:${item.text.slice(0, 160)}`));
+  const keys = new Set(
+    existing.map((item) => `${item.role}:${(item.text || "").slice(0, 160)}:${item.events?.length || 0}`),
+  );
+  const extra = incoming.filter((item) => {
+    if (item.streaming) return false;
+    const key = `${item.role}:${(item.text || "").slice(0, 160)}:${item.events?.length || 0}`;
+    if (keys.has(key)) return false;
+    keys.add(key);
+    return true;
+  });
   if (!extra.length) return existing;
-  return prepend ? [...extra, ...existing] : [...existing, ...extra];
+  const live = existing.filter((item) => item.streaming);
+  const rest = existing.filter((item) => !item.streaming);
+  const merged = prepend ? [...extra, ...rest, ...live] : [...rest, ...extra, ...live];
+  return merged;
 }
 
 function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary[]): Conversation[] {
@@ -687,6 +696,7 @@ export default function App() {
   const relayReadyRef = useRef(relayReady);
   const historyLoadedRef = useRef(new Set<string>());
   const historyBusyRef = useRef(false);
+  const historyLockedRef = useRef(false);
   const shownCountRef = useRef(VIEW_PAGE);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
@@ -992,21 +1002,10 @@ export default function App() {
           const id = String(update.toolCallId || update.tool_call_id || uid());
           const metaTool = toolMeta(update);
           const kind = String(update.kind || metaTool?.kind || metaTool?.name || "other");
-          const title = String(
+          const rawTitle = String(
             update.title || metaTool?.label || metaTool?.name || update.name || (lang === "en" ? "Tool" : "工具调用"),
           );
           const diffs = extractFileDiffs(update);
-          const input = diffs.length ? undefined : jsonText(update.rawInput ?? update.input ?? update.raw_input);
-          const output = diffs.length ? undefined : jsonText(update.content ?? update.output ?? update.rawOutput);
-          assistant.events = upsertEvent(assistant.events, {
-            id: `tool-${id}`,
-            kind,
-            title,
-            status: String(update.status || "pending"),
-            input,
-            output,
-            diffs: diffs.length ? diffs : undefined,
-          });
           const inputRec = asRecord(update.rawInput ?? update.input ?? update.raw_input);
           const editPath = String(
             diffs.find((item) => item.path)?.path ||
@@ -1017,7 +1016,23 @@ export default function App() {
               inputRec?.filePath ||
               "",
           );
-          if (editPath && /edit|write|replace|file/i.test(`${kind} ${title}`)) {
+          const isEdit = Boolean(
+            diffs.length || /edit|write|replace|apply_patch|applypatch|str_replace/i.test(`${kind} ${rawTitle}`),
+          );
+          const fileName = editPath.split("/").filter(Boolean).pop() || "";
+          const title = isEdit ? (fileName ? `Edit ${fileName}` : "Edit") : rawTitle;
+          const input = diffs.length ? undefined : jsonText(update.rawInput ?? update.input ?? update.raw_input);
+          const output = diffs.length ? undefined : jsonText(update.content ?? update.output ?? update.rawOutput);
+          assistant.events = upsertEvent(assistant.events, {
+            id: `tool-${id}`,
+            kind: isEdit ? "edit" : kind,
+            title,
+            status: String(update.status || "pending"),
+            input,
+            output,
+            diffs: diffs.length ? diffs : undefined,
+          });
+          if (editPath && isEdit) {
             setWorkspaceFocusPath(editPath);
             setWorkspaceFocusTick((tick) => tick + 1);
             setShowWorkspace(true);
@@ -1223,35 +1238,44 @@ export default function App() {
       const el = transcriptRef.current;
       const prevHeight = el?.scrollHeight || 0;
       const prevTop = el?.scrollTop || 0;
-      const hasMore = incoming.length === 0 ? skip > 0 && Boolean(history.hasMore) : incoming.length >= HISTORY_PAGE || Boolean(history.hasMore);
+      const hasMore = incoming.length === 0
+        ? Boolean(history.hasMore)
+        : incoming.length >= HISTORY_PAGE || Boolean(history.hasMore);
       setConversations((list) =>
         list.map((item) => {
           if (item.id !== conversationId) return item;
-          const messages = mergeHistoryMessages(item.messages, incoming, older || item.messages.length > 0);
+          const messages = incoming.length
+            ? mergeHistoryMessages(item.messages, incoming, older || item.messages.length > 0)
+            : item.messages;
           return {
             ...item,
             messages,
-            historyHasMore: incoming.length === 0 ? false : hasMore,
+            historyHasMore: hasMore,
             historySkip: skip + incoming.length,
           };
         }),
       );
       if (!older) {
-        setShownCount(Math.max(VIEW_PAGE, incoming.length));
+        setShownCount((count) => Math.max(VIEW_PAGE, count, incoming.length, conversation.messages.length));
         requestAnimationFrame(() => {
           const box = transcriptRef.current;
           if (!box) return;
-          box.scrollTop = box.scrollHeight;
-          followRef.current = true;
-          setShowJumpToBottom(false);
+          if (followRef.current) {
+            box.scrollTop = box.scrollHeight;
+            setShowJumpToBottom(false);
+          }
         });
       }
-      if (older || skip > 0) {
-        setShownCount((count) => count + incoming.length);
+      if (older) {
+        setShownCount((count) => Math.max(count, conversation.messages.length) + incoming.length);
         requestAnimationFrame(() => {
           const box = transcriptRef.current;
           if (!box) return;
           box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+          historyLockedRef.current = true;
+          window.setTimeout(() => {
+            historyLockedRef.current = false;
+          }, 240);
           updateFollowState(box);
         });
       }
@@ -1304,11 +1328,14 @@ export default function App() {
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
+        if (historyLockedRef.current) return;
+        const rootEl = transcriptRef.current;
+        if (rootEl && rootEl.scrollTop > 8) return;
         const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
         if (!conversation) return;
         revealOlder(conversation.id);
       },
-      { root, rootMargin: "160px 0px 0px 0px", threshold: 0 },
+      { root, rootMargin: "0px", threshold: 1 },
     );
     observer.observe(target);
     return () => observer.disconnect();
@@ -1855,6 +1882,7 @@ export default function App() {
       streaming: false,
     };
     const assistant: ChatMessage = { id: uid(), role: "assistant", text: "", thought: "", events: [], media: [], streaming: true };
+    setShownCount((count) => Math.max(count, conversation.messages.length + 2));
     setConversations((list) =>
       list.map((item) =>
         item.id === conversation.id
@@ -2022,8 +2050,11 @@ export default function App() {
   }
 
   function revealOlder(conversationId: string) {
+    if (historyLockedRef.current || historyBusyRef.current) return;
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) return;
+    const el = transcriptRef.current;
+    if (el && el.scrollTop > 24) return;
     if (shownCountRef.current < conversation.messages.length) {
       const el = transcriptRef.current;
       const prevHeight = el?.scrollHeight || 0;
@@ -2046,7 +2077,8 @@ export default function App() {
     const el = transcriptRef.current;
     if (!el) return;
     updateFollowState(el);
-    if (el.scrollTop > 80) return;
+    if (historyLockedRef.current) return;
+    if (el.scrollTop > 8) return;
     if (selectedIdRef.current) revealOlder(selectedIdRef.current);
   }
 
@@ -2624,11 +2656,15 @@ export default function App() {
                   <article key={message.id} className={`row ${message.role}`}>
                     <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
                       {message.role === "assistant" && message.events.length ? (
-                        <ActivityTimeline
-                          events={message.events}
-                          lang={lang}
-                          defaultOpen={message.streaming || message.events.length > 0}
-                        />
+                        <>
+                          <InlineEdits events={message.events} lang={lang} />
+                          <InlineCommands events={message.events} lang={lang} />
+                          <ActivityTimeline
+                            events={message.events}
+                            lang={lang}
+                            defaultOpen={message.streaming}
+                          />
+                        </>
                       ) : message.thought ? (
                         <details className="thought" open={message.streaming && !message.text}>
                           <summary>

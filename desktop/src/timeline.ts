@@ -64,6 +64,50 @@ export function categoryTitle(category: ActivityCategory, lang: "zh" | "en") {
   return lang === "en" ? en[category] : zh[category];
 }
 
+export function isEditEvent(event: TimelineEvent) {
+  if (event.diffs?.length) return true;
+  const haystack = `${event.kind} ${event.title}`.toLowerCase();
+  return ["edit", "write", "replace", "apply_patch", "applypatch", "str_replace"].some((item) => haystack.includes(item));
+}
+
+export function isCommandEvent(event: TimelineEvent) {
+  if (isEditEvent(event)) return false;
+  const haystack = `${event.kind} ${event.title}`.toLowerCase();
+  return [
+    "execute",
+    "command",
+    "shell",
+    "bash",
+    "zsh",
+    "terminal",
+    "compile",
+    "build",
+    "cargo",
+    "pnpm",
+    "npm",
+    "make",
+    "background_task",
+    "task_",
+  ].some((item) => haystack.includes(item));
+}
+
+export function commandTitle(event: TimelineEvent, lang: "zh" | "en") {
+  const haystack = `${event.kind} ${event.title}`.toLowerCase();
+  if (haystack.includes("compile") || haystack.includes("build") || haystack.includes("cargo") || haystack.includes("pnpm")) {
+    return lang === "en" ? "Build" : "编译";
+  }
+  if (haystack.includes("terminal") || haystack.includes("shell") || haystack.includes("bash")) {
+    return lang === "en" ? "Terminal" : "终端";
+  }
+  return lang === "en" ? "Command" : "命令";
+}
+
+export function editTitle(event: TimelineEvent) {
+  const path = event.diffs?.find((item) => item.path)?.path || "";
+  const name = path.split("/").filter(Boolean).pop() || path;
+  return name ? `Edit ${name}` : "Edit";
+}
+
 export function categoryFor(event: TimelineEvent): ActivityCategory {
   const haystack = `${event.kind} ${event.title}`.toLowerCase();
   if (haystack.includes("hook") || haystack.includes("pre_tool_use") || haystack.includes("post_tool_use")) {
@@ -94,6 +138,7 @@ export function categoryFor(event: TimelineEvent): ActivityCategory {
 
 export function visibleEvents(events: TimelineEvent[]) {
   return events.filter((event) => {
+    if (isEditEvent(event) || isCommandEvent(event)) return false;
     if (event.kind === "extension" && REDUNDANT.has(normalize(event.title))) return false;
     return categoryFor(event) !== "system";
   });
@@ -128,6 +173,16 @@ export function statusLabel(status: string, lang: "zh" | "en") {
   return status;
 }
 
+export function eventProgress(event: TimelineEvent) {
+  const status = (event.status || "").toLowerCase();
+  if (status.includes("fail") || status.includes("error")) return 100;
+  if (status.includes("complete") || status.includes("success")) return 100;
+  if (status.includes("cancel")) return 100;
+  if (status.includes("pending")) return 12;
+  if (status.includes("in_progress") || status.includes("running")) return 62;
+  return event.output || event.input ? 100 : 28;
+}
+
 export function eventIconKind(event: TimelineEvent) {
   if (event.kind === "thought") return "brain";
   if (event.kind === "plan") return "plan";
@@ -137,7 +192,7 @@ export function eventIconKind(event: TimelineEvent) {
     return "permission";
   }
   const title = `${event.kind} ${event.title}`.toLowerCase();
-  if (title.includes("shell") || title.includes("terminal") || title.includes("command") || title.includes("execute")) {
+  if (title.includes("shell") || title.includes("terminal") || title.includes("command") || title.includes("execute") || title.includes("build") || title.includes("compile")) {
     return "terminal";
   }
   if (title.includes("search")) return "search";
