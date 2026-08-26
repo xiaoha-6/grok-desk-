@@ -106,6 +106,12 @@ export type ChatMessage = {
   media: MessageMedia[];
   streaming: boolean;
   error?: string;
+  /** Waiting to be sent after the current turn. Always shown in the transcript. */
+  queued?: boolean;
+  /** Inserted by this app. History/session merges must never drop these bubbles. */
+  local?: boolean;
+  /** User stopped this turn. Keep whatever streamed so far and show a stopped marker. */
+  stopped?: boolean;
 };
 
 export type SshTarget = {
@@ -138,6 +144,8 @@ export type SshProbe = {
   shell: string;
   message: string;
   entries?: WorkspaceEntry[];
+  grokSetup?: boolean;
+  configSynced?: boolean;
 };
 
 export type Conversation = {
@@ -353,12 +361,62 @@ export const EFFORTS = [
 ];
 
 export const PERMISSION_MODES = [
-  { id: "default", labelZh: "确认操作", labelEn: "Ask each time" },
-  { id: "acceptEdits", labelZh: "接受编辑", labelEn: "Accept edits" },
-  { id: "auto", labelZh: "自动执行", labelEn: "Auto" },
-  { id: "plan", labelZh: "规划模式", labelEn: "Plan" },
-  { id: "bypassPermissions", labelZh: "完全访问", labelEn: "Full access" },
+  {
+    id: "default",
+    labelZh: "每次确认",
+    labelEn: "Ask before edits",
+    hintZh: "改文件或跑命令前都先问你",
+    hintEn: "Ask before file edits and shell commands",
+  },
+  {
+    id: "acceptEdits",
+    labelZh: "自动接受编辑",
+    labelEn: "Accept edits",
+    hintZh: "文件修改自动通过，其它操作仍会确认",
+    hintEn: "Auto-approve file edits; still confirm other actions",
+  },
+  {
+    id: "plan",
+    labelZh: "规划模式",
+    labelEn: "Plan mode",
+    hintZh: "先出计划，你确认后再动手",
+    hintEn: "Draft a plan first, then wait for approval",
+  },
+  {
+    id: "auto",
+    labelZh: "自动执行",
+    labelEn: "Auto",
+    hintZh: "工具调用自动执行，少打断",
+    hintEn: "Run tools automatically with fewer prompts",
+  },
+  {
+    id: "bypassPermissions",
+    labelZh: "完全访问",
+    labelEn: "Full access",
+    hintZh: "跳过确认（高风险）",
+    hintEn: "Skip confirmations (higher risk)",
+  },
 ];
+
+export function normalizePermissionMode(mode: string | undefined | null): string {
+  const value = String(mode || "").trim();
+  if (!value) return "default";
+  if (value === "ask" || value === "askAlways" || value === "confirm") return "default";
+  if (value === "approve" || value === "accept") return "acceptEdits";
+  return value;
+}
+
+export function permissionModeLabel(mode: string | undefined | null, lang: "zh" | "en") {
+  const id = normalizePermissionMode(mode);
+  const item = PERMISSION_MODES.find((entry) => entry.id === id) || PERMISSION_MODES[0];
+  return lang === "en" ? item.labelEn : item.labelZh;
+}
+
+export function permissionModeHint(mode: string | undefined | null, lang: "zh" | "en") {
+  const id = normalizePermissionMode(mode);
+  const item = PERMISSION_MODES.find((entry) => entry.id === id) || PERMISSION_MODES[0];
+  return lang === "en" ? item.hintEn : item.hintZh;
+}
 
 export function defaultSettings(): AppSettings {
   return {

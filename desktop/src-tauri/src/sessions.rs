@@ -251,6 +251,9 @@ fn reconstruct_turns(path: &Path) -> Vec<LocalSessionMessage> {
         };
         match kind {
             "user" => {
+                // One assistant bubble per user turn. Flushing every assistant chunk
+                // used to explode history into dozens of fragments and push real
+                // user messages out of the visible / persisted window.
                 flush_assistant(&mut out, &mut text, &mut events);
                 if let Some(message) = user_message_from_value(&value) {
                     out.push(message);
@@ -258,15 +261,14 @@ fn reconstruct_turns(path: &Path) -> Vec<LocalSessionMessage> {
             }
             "reasoning" => {
                 if let Some(event) = reasoning_event(&value) {
-                    events.push(event);
+                    upsert_timeline_event(&mut events, event);
                 }
             }
             "assistant" | "backend_tool_call" => {
                 push_tool_calls(&mut events, &value);
                 let raw = content_text(&value);
                 if !raw.trim().is_empty() {
-                    text = truncate_text(&raw, 16_000);
-                    flush_assistant(&mut out, &mut text, &mut events);
+                    merge_assistant_text(&mut text, &raw);
                 }
             }
             "tool_result" => apply_tool_result(&mut events, &value),
@@ -275,6 +277,39 @@ fn reconstruct_turns(path: &Path) -> Vec<LocalSessionMessage> {
     }
     flush_assistant(&mut out, &mut text, &mut events);
     out
+}
+
+fn merge_assistant_text(text: &mut String, raw: &str) {
+    let next = raw.trim();
+    if next.is_empty() {
+        return;
+    }
+    if text.is_empty() {
+        *text = truncate_text(next, 16_000);
+        return;
+    }
+    if text == next || text.contains(next) {
+        return;
+    }
+    // Later chunks often replace or extend an earlier draft in the same turn.
+    if next.contains(text.as_str()) || next.starts_with(text.as_str()) {
+        *text = truncate_text(next, 16_000);
+        return;
+    }
+    let combined = format!("{text}\n\n{next}");
+    *text = truncate_text(&combined, 16_000);
+}
+
+fn upsert_timeline_event(events: &mut Vec<LocalTimelineEvent>, event: LocalTimelineEvent) {
+    if let Some(existing) = events.iter_mut().rev().find(|item| item.id == event.id) {
+        if (event.output.as_ref().map(String::len).unwrap_or(0))
+            >= (existing.output.as_ref().map(String::len).unwrap_or(0))
+        {
+            *existing = event;
+        }
+        return;
+    }
+    events.push(event);
 }
 
 fn flush_assistant(
@@ -294,6 +329,11 @@ fn flush_assistant(
 
 fn user_message_from_value(value: &Value) -> Option<LocalSessionMessage> {
     let raw = content_text(value);
+    // Synthetic injections (skills, MCP, background-task notices) are typed as
+    // "user" in chat_history.jsonl but must not become chat bubbles.
+    if value.get("synthetic_reason").is_some() && !raw.contains("<user_query>") {
+        return None;
+    }
     if value.get("prompt_index").is_none() && !raw.contains("<user_query>") {
         return None;
     }
@@ -349,18 +389,21 @@ fn push_tool_calls(events: &mut Vec<LocalTimelineEvent>, value: &Value) {
         let args = parse_args(call.get("arguments"));
         let (kind, title) = tool_label(name, &args);
         let input = serde_json::to_string_pretty(&args).ok();
-        events.push(LocalTimelineEvent {
-            id: if id.is_empty() {
-                format!("tool-{}", events.len())
-            } else {
-                format!("tool-{id}")
+        upsert_timeline_event(
+            events,
+            LocalTimelineEvent {
+                id: if id.is_empty() {
+                    format!("tool-{}", events.len())
+                } else {
+                    format!("tool-{id}")
+                },
+                kind: kind.into(),
+                title,
+                status: Some("completed".into()),
+                input,
+                output: None,
             },
-            kind: kind.into(),
-            title,
-            status: Some("completed".into()),
-            input,
-            output: None,
-        });
+        );
     }
 }
 
@@ -688,6 +731,34 @@ mod tests {
         let (latest, more) = parse_chat_history(&session.join("chat_history.jsonl"), 1, 0);
         assert!(more);
         assert_eq!(latest[0].text, "你好，我是 Grok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merges_assistant_chunks_into_one_turn_and_keeps_users() {
+        let dir = std::env::temp_dir().join(format!("grokdesk-hist-{}", std::process::id()));
+        let path = dir.join("chat_history.jsonl");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>os</user_info>"}]}
+{"type":"user","synthetic_reason":"skills","content":[{"type":"text","text":"<system-reminder>skills</system-reminder>"}]}
+{"type":"user","prompt_index":0,"content":[{"type":"text","text":"<user_query>第一句</user_query>"}]}
+{"type":"assistant","content":"草稿"}
+{"type":"assistant","content":"完整回答一"}
+{"type":"user","prompt_index":1,"content":[{"type":"text","text":"<user_query>第二句</user_query>"}]}
+{"type":"assistant","content":"回答二"}
+"#,
+        )
+        .unwrap();
+        let messages = reconstruct_turns(&path);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].text, "第一句");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].text, "完整回答一");
+        assert_eq!(messages[2].text, "第二句");
+        assert_eq!(messages[3].text, "回答二");
         let _ = fs::remove_dir_all(&dir);
     }
 

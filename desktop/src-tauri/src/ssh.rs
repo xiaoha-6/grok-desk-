@@ -1,4 +1,7 @@
+use crate::config::{is_relay_configured, read_relay_profile, render_config, RelayImport};
+use crate::runtime::grok_home;
 use crate::workspace::{WorkspaceEntry, WorkspaceFile, SKIP_DIRS, MAX_FILE_BYTES, language_for_name};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -8,6 +11,7 @@ use std::time::Duration;
 
 const SSH_TIMEOUT_SECS: u64 = 20;
 const SSH_LONG_TIMEOUT_SECS: u64 = 90;
+const SSH_INSTALL_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -140,14 +144,26 @@ pub struct SshProbe {
     pub message: String,
     #[serde(default)]
     pub entries: Vec<WorkspaceEntry>,
+    /// True when this connect call installed grok on the remote host.
+    #[serde(default)]
+    pub grok_setup: bool,
+    /// True when local relay config was synced to the remote host.
+    #[serde(default)]
+    pub config_synced: bool,
 }
 
 pub fn probe(target: &SshTarget) -> Result<SshProbe, String> {
-    let browse = if target.remote_path.trim().is_empty() || looks_like_home(&target.remote_path) {
-        "~"
+    // Always probe "/" first so the folder browser can start at the filesystem root.
+    // Fall back to "~" only if root listing is unavailable (rare permission cases).
+    let preferred = if target.remote_path.trim().is_empty()
+        || looks_like_home(&target.remote_path)
+        || target.remote_path.trim() == "/"
+    {
+        "/"
     } else {
         target.remote_path.as_str()
     };
+    let browse = preferred;
     let script = probe_script(browse);
     let output = run_ssh(target, &script, SSH_LONG_TIMEOUT_SECS, None)?;
     if !output.status.success() {
@@ -157,12 +173,68 @@ pub fn probe(target: &SshTarget) -> Result<SshProbe, String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut probe = parse_probe(&stdout, browse)?;
+    // Auto-setup: install remote grok when missing, then sync local relay config.
+    if !probe.grok_installed {
+        match ensure_remote_grok(target, &probe.os) {
+            Ok(path) => {
+                probe.grok_installed = true;
+                probe.grok_path = Some(path);
+                probe.grok_setup = true;
+            }
+            Err(err) => {
+                probe.message = format!("{}（自动安装失败：{err}）", probe.message);
+            }
+        }
+    }
+    if probe.grok_installed {
+        match sync_remote_relay_config(target) {
+            Ok(true) => {
+                probe.config_synced = true;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                probe.message = format!("{}（配置同步失败：{err}）", probe.message);
+            }
+        }
+    }
+    if probe.grok_installed {
+        let mut parts = vec![format!("已连接到 {}，远程 Grok Build 可用", os_label(&probe.os))];
+        if probe.grok_setup {
+            parts.push("已自动安装".into());
+        }
+        if probe.config_synced {
+            parts.push("已同步中转站配置".into());
+        }
+        probe.message = parts.join("，");
+    }
+    // Prefer listing "/" after connect so the UI shows top-level dirs (bin, etc, home, root…).
+    let list_path = if preferred == "/" {
+        "/".to_string()
+    } else {
+        probe.remote_path.clone()
+    };
+    probe.remote_path = list_path.clone();
     let mut listing = target.clone();
-    listing.remote_path = probe.remote_path.clone();
+    listing.remote_path = list_path;
     match list_remote_workspace(&listing, None) {
         Ok(entries) => probe.entries = entries,
         Err(err) => {
-            if probe.message.is_empty() {
+            if preferred == "/" {
+                // Root listing failed — fall back to home.
+                listing.remote_path = "~".into();
+                match list_remote_workspace(&listing, None) {
+                    Ok(entries) => {
+                        probe.remote_path = probe.home.clone();
+                        if probe.remote_path.is_empty() {
+                            probe.remote_path = "~".into();
+                        }
+                        probe.entries = entries;
+                    }
+                    Err(home_err) => {
+                        probe.message = format!("{}（{err}；回退家目录也失败：{home_err}）", probe.message);
+                    }
+                }
+            } else if probe.message.is_empty() {
                 probe.message = err;
             } else {
                 probe.message = format!("{}（{err}）", probe.message);
@@ -188,10 +260,23 @@ pub fn list_remote_dir(target: &SshTarget, path: Option<&str>) -> Result<Vec<Wor
 pub fn list_remote_workspace(target: &SshTarget, rel: Option<&str>) -> Result<Vec<WorkspaceEntry>, String> {
     let rel = sanitize_rel(rel.unwrap_or(""))?;
     let remote = join_remote(&target.remote_path, &rel);
-    let quoted = sh_single(&remote);
+    // Use python3 (same as probe) so remote zsh never parses shell globs like "~/)*".
     let script = format!(
-        "root={quoted}; case \"$root\" in ~|~/ *) root=\"$HOME${{root#~}}\";; esac; if [ ! -e \"$root\" ]; then echo ERR:not_found; exit 2; fi; if [ ! -d \"$root\" ]; then echo ERR:not_dir; exit 2; fi; if [ ! -r \"$root\" ]; then echo ERR:denied; exit 2; fi; printf 'OK\\n'; ls -1A \"$root\" | while IFS= read -r name; do [ -n \"$name\" ] || continue; if [ -d \"$root/$name\" ]; then printf 'D\\t%s\\n' \"$name\"; else printf 'F\\t%s\\n' \"$name\"; fi; done",
-        quoted = quoted,
+        r#"python3 -c "import os,sys
+raw=sys.argv[1]
+root=os.path.expanduser(raw)
+if not os.path.exists(root):
+    print('ERR:not_found'); raise SystemExit(2)
+if not os.path.isdir(root):
+    print('ERR:not_dir'); raise SystemExit(2)
+if not os.access(root, os.R_OK):
+    print('ERR:denied'); raise SystemExit(2)
+print('OK')
+for name in os.listdir(root):
+    path=os.path.join(root, name)
+    print(('D' if os.path.isdir(path) else 'F') + '\t' + name)
+" {path}"#,
+        path = sh_single(&remote),
     );
     let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -222,8 +307,8 @@ pub fn list_remote_workspace(target: &SshTarget, rel: Option<&str>) -> Result<Ve
         if name.is_empty() {
             continue;
         }
-        let is_dir = kind == "D";
-        if is_dir && (name.starts_with('.') || skip.contains(name)) {
+        let is_dir = kind == "D" || kind == "d";
+        if name.starts_with('.') || (is_dir && skip.contains(name)) {
             continue;
         }
         let path = if rel.is_empty() {
@@ -249,16 +334,39 @@ pub fn read_remote_file(target: &SshTarget, rel: &str) -> Result<WorkspaceFile, 
         return Err("还没有选择文件".into());
     }
     let remote = join_remote(&target.remote_path, &rel);
-    let quoted = sh_single(&remote);
+    // Avoid nested shell case patterns with "*" — remote login shells are often zsh.
     let script = format!(
-        "path={quoted}; case \"$path\" in ~|~/ *) path=\"$HOME${{path#~}}\";; esac; if [ -d \"$path\" ]; then echo ERR:dir; exit 2; fi; if [ ! -e \"$path\" ]; then echo ERR:not_found; exit 2; fi; if [ ! -r \"$path\" ]; then echo ERR:denied; exit 2; fi; size=$(wc -c < \"$path\" | tr -d ' '); printf 'OK %s\\n' \"$size\"; dd if=\"$path\" bs=1 count={limit} 2>/dev/null",
-        quoted = quoted,
+        r#"python3 -c "import os,sys
+path=os.path.expanduser(sys.argv[1])
+limit=int(sys.argv[2])
+if os.path.isdir(path):
+    sys.stdout.write('ERR:dir\n'); raise SystemExit(2)
+if not os.path.exists(path):
+    sys.stdout.write('ERR:not_found\n'); raise SystemExit(2)
+if not os.access(path, os.R_OK):
+    sys.stdout.write('ERR:denied\n'); raise SystemExit(2)
+size=os.path.getsize(path)
+sys.stdout.buffer.write(('OK %d\n' % size).encode())
+with open(path, 'rb') as handle:
+    sys.stdout.buffer.write(handle.read(limit))
+" {path} {limit}"#,
+        path = sh_single(&remote),
         limit = MAX_FILE_BYTES,
     );
     let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ssh_error(&stderr, "", output.status.code()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("ERR:dir") {
+            return Err("这是文件夹".into());
+        }
+        if stdout.contains("ERR:not_found") {
+            return Err("远程文件不存在".into());
+        }
+        if stdout.contains("ERR:denied") {
+            return Err("没有权限读取该文件".into());
+        }
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
     }
     let stdout = output.stdout;
     let split = stdout.iter().position(|byte| *byte == b'\n').unwrap_or(stdout.len());
@@ -296,16 +404,20 @@ pub fn spawn_remote_agent(
     grok_home: Option<&str>,
     extra_env: &[(&str, String)],
 ) -> Result<std::process::Child, String> {
+    // Always expand on the remote shell. Quoting "$HOME/.grok" with sh_single would
+    // set GROK_HOME to the literal characters $HOME/.grok and break config lookup.
     let remote_home = grok_home
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "$HOME/.grok".to_string());
+        .filter(|value| !value.is_empty() && !value.contains("$HOME") && *value != "~/.grok")
+        .map(|value| sh_single(value))
+        .unwrap_or_else(|| "\"$HOME/.grok\"".to_string());
     let mut env_prefix = String::from("export PATH=\"$HOME/.grok/bin:$HOME/.local/bin:/usr/local/bin:$PATH\"; ");
-    env_prefix.push_str(&format!("export GROK_HOME={}; ", sh_single(&remote_home)));
+    env_prefix.push_str(&format!("export GROK_HOME={remote_home}; "));
     for (key, value) in extra_env {
         env_prefix.push_str(&format!("export {key}={}; ", sh_single(value)));
     }
+    // Don't block session start on Mac-only MCP binaries that may linger in synced configs.
+    env_prefix.push_str("export GROK_MCP_STARTUP_TIMEOUT_SECS=1; ");
     let command = format!(
         "{env} cd {cwd} && if command -v grok >/dev/null 2>&1; then BIN=grok; elif [ -x \"$HOME/.grok/bin/grok\" ]; then BIN=\"$HOME/.grok/bin/grok\"; elif [ -x \"$HOME/.grok/bin/grok.exe\" ]; then BIN=\"$HOME/.grok/bin/grok.exe\"; else echo 'GROKDESK_NO_GROK: 远程还没有安装 Grok Build。请先在 Linux 上执行 curl -fsSL https://x.ai/cli/install.sh | bash，或在 Windows 上执行 irm https://x.ai/cli/install.ps1 | iex。' >&2; exit 42; fi; exec \"$BIN\" agent --model {model} stdio",
         env = env_prefix,
@@ -389,7 +501,141 @@ fn parse_probe(stdout: &str, fallback_path: &str) -> Result<SshProbe, String> {
         shell,
         message,
         entries: Vec::new(),
+        grok_setup: false,
+        config_synced: false,
     })
+}
+
+fn ensure_remote_grok(target: &SshTarget, os: &str) -> Result<String, String> {
+    if os.contains("windows") {
+        return Err("Windows 远程主机请先手动安装：irm https://x.ai/cli/install.ps1 | iex".into());
+    }
+    let script = r#"set -e
+export PATH="$HOME/.grok/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+if command -v grok >/dev/null 2>&1; then
+  command -v grok
+  exit 0
+fi
+if [ -x "$HOME/.grok/bin/grok" ]; then
+  printf '%s\n' "$HOME/.grok/bin/grok"
+  exit 0
+fi
+mkdir -p "$HOME/.grok/downloads" "$HOME/.grok/bin"
+ARCH=$(uname -m 2>/dev/null || echo x86_64)
+case "$ARCH" in
+  x86_64|amd64) PLATFORM=linux-x86_64 ;;
+  aarch64|arm64) PLATFORM=linux-aarch64 ;;
+  *) echo "GROKDESK_INSTALL: unsupported arch $ARCH" >&2; exit 3 ;;
+esac
+VERSION=""
+if VERSION=$(curl -fsSL --connect-timeout 20 https://storage.googleapis.com/grok-build-public-artifacts/cli/stable 2>/dev/null); then
+  :
+elif VERSION=$(curl -fsSL --connect-timeout 20 https://x.ai/cli/stable 2>/dev/null); then
+  :
+else
+  echo "GROKDESK_INSTALL: cannot fetch stable version" >&2
+  exit 4
+fi
+VERSION=$(printf '%s' "$VERSION" | tr -d '\r\n')
+OUT="$HOME/.grok/downloads/grok-$PLATFORM"
+URL_GCS="https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${VERSION}-${PLATFORM}"
+URL_XAI="https://x.ai/cli/grok-${VERSION}-${PLATFORM}"
+if ! curl -fsSL --connect-timeout 30 --retry 2 -o "$OUT" "$URL_GCS"; then
+  curl -fsSL --connect-timeout 30 --retry 2 -o "$OUT" "$URL_XAI"
+fi
+chmod +x "$OUT"
+ln -sfn "../downloads/grok-$PLATFORM" "$HOME/.grok/bin/grok"
+if [ -w /usr/local/bin ] 2>/dev/null; then
+  ln -sfn "$HOME/.grok/bin/grok" /usr/local/bin/grok 2>/dev/null || true
+fi
+"$HOME/.grok/bin/grok" --version >/dev/null
+printf '%s\n' "$HOME/.grok/bin/grok"
+"#;
+    let output = run_ssh(target, script, SSH_INSTALL_TIMEOUT_SECS, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    let path = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .last()
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return Err("安装完成，但没有找到 grok 路径".into());
+    }
+    Ok(path)
+}
+
+fn sync_remote_relay_config(target: &SshTarget) -> Result<bool, String> {
+    let home = grok_home();
+    if !is_relay_configured(&home) {
+        return Ok(false);
+    }
+    let profile = read_relay_profile(&home).ok_or_else(|| "本机没有可用的中转站配置".to_string())?;
+    let rendered = render_config(&RelayImport {
+        endpoint: profile.endpoint,
+        api_key: profile.api_key,
+        model: profile.model,
+        name: profile.name,
+    });
+    // Strip any accidental mcp_servers blocks (Mac-only paths must not go remote).
+    let rendered = strip_mcp_servers(&rendered);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(rendered.as_bytes());
+    let script = format!(
+        r#"python3 -c "import base64,os,sys
+raw=sys.argv[1]
+home=os.path.expanduser('~')
+path=os.path.join(home,'.grok','config.toml')
+os.makedirs(os.path.dirname(path), exist_ok=True)
+data=base64.b64decode(raw)
+if os.path.exists(path):
+    bak=path+'.bak-grokdesk-ssh'
+    try:
+        if not os.path.exists(bak):
+            open(bak,'wb').write(open(path,'rb').read())
+    except Exception:
+        pass
+open(path,'wb').write(data)
+os.chmod(path, 0o600)
+print('OK', path)
+" {payload}"#,
+        payload = sh_single(&encoded),
+    );
+    let output = run_ssh(target, &script, SSH_LONG_TIMEOUT_SECS, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() || !stdout.contains("OK") {
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    Ok(true)
+}
+
+fn strip_mcp_servers(text: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[mcp_servers") {
+            skip = true;
+            continue;
+        }
+        if skip {
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                skip = false;
+            } else {
+                continue;
+            }
+        }
+        if !skip {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn os_label(os: &str) -> &str {
@@ -462,6 +708,7 @@ fn ssh_command(target: &SshTarget) -> Result<Command, String> {
     command.arg("-o").arg("ServerAliveInterval=15");
     command.arg("-o").arg("ServerAliveCountMax=3");
     command.arg("-o").arg("NumberOfPasswordPrompts=1");
+    command.arg("-o").arg("RequestTTY=no");
     if use_password {
         let askpass = write_askpass()?;
         command.env("SSH_ASKPASS", &askpass);
@@ -602,6 +849,9 @@ fn normalize_remote_path(path: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
+    if trimmed == "/" {
+        return "/".into();
+    }
     let mut out = String::new();
     for part in trimmed.split('/') {
         if part.is_empty() || part == "." {
@@ -646,11 +896,18 @@ fn sanitize_rel(rel: &str) -> Result<String, String> {
 }
 
 fn join_remote(root: &str, rel: &str) -> String {
+    let root = root.trim();
     if rel.is_empty() {
-        root.trim_end_matches('/').to_string()
-    } else {
-        format!("{}/{}", root.trim_end_matches('/'), rel.trim_start_matches('/'))
+        // Keep "/" as the filesystem root; trim_end_matches('/') would turn it into "".
+        if root == "/" {
+            return "/".into();
+        }
+        return root.trim_end_matches('/').to_string();
     }
+    if root == "/" {
+        return format!("/{}", rel.trim_start_matches('/'));
+    }
+    format!("{}/{}", root.trim_end_matches('/'), rel.trim_start_matches('/'))
 }
 
 fn sh_single(value: &str) -> String {
@@ -878,5 +1135,13 @@ Host *
     fn blocks_parent_escape() {
         assert!(sanitize_rel("../etc/passwd").is_err());
         assert_eq!(sanitize_rel("src/main.rs").unwrap(), "src/main.rs");
+    }
+
+    #[test]
+    fn join_remote_keeps_filesystem_root() {
+        assert_eq!(join_remote("/", ""), "/");
+        assert_eq!(join_remote("/", "etc"), "/etc");
+        assert_eq!(join_remote("/root", ""), "/root");
+        assert_eq!(normalize_remote_path("/"), "/");
     }
 }

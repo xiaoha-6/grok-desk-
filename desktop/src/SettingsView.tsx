@@ -1,11 +1,16 @@
 import { useMemo, useState, type ReactNode } from "react";
 import {
   IconArchive,
+  IconBolt,
   IconBox,
   IconChevronLeft,
   IconGear,
+  IconHand,
   IconPerson,
+  IconPencil,
+  IconPlan,
   IconRelay,
+  IconShield,
   IconSliders,
   IconSpark,
   IconTerminal,
@@ -497,6 +502,19 @@ export function SettingsView(props: {
                   options={PERMISSION_MODES.map((item) => ({
                     id: item.id,
                     label: props.lang === "en" ? item.labelEn : item.labelZh,
+                    hint: props.lang === "en" ? item.hintEn : item.hintZh,
+                    icon:
+                      item.id === "acceptEdits" ? (
+                        <IconPencil size={14} />
+                      ) : item.id === "plan" ? (
+                        <IconPlan size={14} />
+                      ) : item.id === "auto" ? (
+                        <IconBolt size={14} />
+                      ) : item.id === "bypassPermissions" ? (
+                        <IconShield size={14} />
+                      ) : (
+                        <IconHand size={14} />
+                      ),
                   }))}
                 />
               </SettingsRow>

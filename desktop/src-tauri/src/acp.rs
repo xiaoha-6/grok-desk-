@@ -339,6 +339,23 @@ impl AcpClient {
         )
     }
 
+    pub fn set_permission_mode(&self, mode: &str) -> Result<(), String> {
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| "Agent 尚未连接".to_string())?;
+        let next = mode.trim();
+        if next.is_empty() {
+            return Err("权限模式不能为空".into());
+        }
+        let mut current = agent
+            .permission_mode
+            .lock()
+            .map_err(|_| "无法锁定权限模式".to_string())?;
+        *current = next.to_string();
+        Ok(())
+    }
+
     pub fn connect(
         shared: &Arc<Mutex<Self>>,
         app: &AppHandle,
@@ -356,6 +373,7 @@ impl AcpClient {
         let ssh = options
             .ssh
             .clone()
+            .or_else(|| recover_ssh_from_cwd(options.cwd.as_deref()))
             .map(SshTarget::normalized)
             .transpose()?;
         let cwd = if let Some(ssh) = &ssh {
@@ -570,9 +588,9 @@ impl AcpClient {
         }
 
         let mut child = if let Some(ssh) = ssh {
-            let grok_home_value = options.grok_home.clone().or_else(|| Some("$HOME/.grok".into()));
+            // Let spawn_remote_agent expand $HOME on the remote shell.
             let env_refs: Vec<(&str, String)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-            crate::ssh::spawn_remote_agent(ssh, model, grok_home_value.as_deref(), &env_refs)?
+            crate::ssh::spawn_remote_agent(ssh, model, None, &env_refs)?
         } else {
             let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
             let mut command = Command::new(&binary);
@@ -664,6 +682,33 @@ fn lock_client(shared: &Arc<Mutex<AcpClient>>) -> Result<std::sync::MutexGuard<'
     shared
         .lock()
         .map_err(|_| "无法锁定 ACP 会话".to_string())
+}
+
+fn recover_ssh_from_cwd(cwd: Option<&str>) -> Option<SshTarget> {
+    let trimmed = cwd?.trim();
+    let rest = trimmed.strip_prefix("ssh://").or_else(|| trimmed.strip_prefix("SSH://"))?;
+    let (user_host, path) = rest.split_once('/')?;
+    let (user, host_port) = user_host.split_once('@')?;
+    let (host, port_text) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => (host_port, "22"),
+    };
+    let port = port_text.parse::<u16>().unwrap_or(22);
+    let remote_path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{path}")
+    };
+    Some(SshTarget {
+        host: host.to_string(),
+        port,
+        user: user.to_string(),
+        remote_path,
+        identity_file: None,
+        auth: "key".into(),
+        password: None,
+        alias: None,
+    })
 }
 
 fn require_credentials(options: &SessionOptions) -> Result<(), String> {

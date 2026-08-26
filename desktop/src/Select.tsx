@@ -6,6 +6,7 @@ export type SelectOption = {
   id: string;
   label: string;
   hint?: string;
+  icon?: ReactNode;
 };
 
 type Align = "start" | "end";
@@ -27,6 +28,8 @@ export function Select({
   align = "end",
   prefix,
   className,
+  menuClassName,
+  dense,
   ariaLabel,
 }: {
   value: string;
@@ -37,6 +40,9 @@ export function Select({
   align?: Align;
   prefix?: ReactNode;
   className?: string;
+  menuClassName?: string;
+  /** Smaller menu / option footprint for composer chips. */
+  dense?: boolean;
   ariaLabel?: string;
 }) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
@@ -59,15 +65,20 @@ export function Select({
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const margin = 8;
-      const minW = variant === "field" ? Math.min(220, vw - margin * 2) : Math.min(rect.width, vw - margin * 2);
+      const hasHints = options.some((item) => Boolean(item.hint));
+      const hintFloor = dense ? 210 : 260;
+      const hintPreferred = dense ? 228 : 280;
+      const minW = variant === "field"
+        ? Math.min(hasHints ? (dense ? 240 : 300) : 220, vw - margin * 2)
+        : Math.min(Math.max(rect.width, hasHints ? hintPreferred : 140), vw - margin * 2);
       const preferred = Math.max(rect.width, minW);
-      const width = Math.min(Math.max(preferred, 140), Math.max(140, vw - margin * 2));
+      const width = Math.min(Math.max(preferred, hasHints ? hintFloor : 140), Math.max(140, vw - margin * 2));
       const leftRaw = align === "end" ? rect.right - width : rect.left;
       const left = Math.min(Math.max(margin, leftRaw), Math.max(margin, vw - width - margin));
       const spaceBelow = Math.max(96, vh - rect.bottom - margin);
       const spaceAbove = Math.max(96, rect.top - margin);
       const openUp = spaceBelow < 220 && spaceAbove > spaceBelow;
-      const maxHeight = Math.min(320, openUp ? spaceAbove : spaceBelow);
+      const maxHeight = Math.min(dense ? 280 : 320, openUp ? spaceAbove : spaceBelow);
       const top = openUp ? Math.max(margin, rect.top - maxHeight - 4) : rect.bottom + 4;
       setBox({ top, left, width, maxHeight });
     };
@@ -78,7 +89,7 @@ export function Select({
       window.removeEventListener("resize", place);
       window.removeEventListener("scroll", place, true);
     };
-  }, [align, open, variant, options.length]);
+  }, [align, dense, open, variant, options.length]);
 
   useEffect(() => {
     if (!open) return;
@@ -167,7 +178,7 @@ export function Select({
     ? createPortal(
         <div
           ref={menuRef}
-          className="app-select-menu"
+          className={["app-select-menu", dense ? "dense" : "", menuClassName].filter(Boolean).join(" ")}
           role="listbox"
           tabIndex={-1}
           aria-label={ariaLabel || label}
@@ -183,7 +194,7 @@ export function Select({
                   <button
                     key={`${item.id}-${index}`}
                     id={`app-select-opt-${index}`}
-                    className={`app-select-option${selected ? " on" : ""}${index === active ? " active" : ""}`}
+                    className={`app-select-option${selected ? " on" : ""}${index === active ? " active" : ""}${item.icon ? " with-icon" : ""}`}
                     type="button"
                     role="option"
                     aria-selected={selected}
@@ -191,8 +202,11 @@ export function Select({
                     onMouseEnter={() => setActive(index)}
                     onClick={() => choose(item.id)}
                   >
-                    <span className="app-select-option-name">{item.label}</span>
-                    {item.hint ? <span className="app-select-option-id">{item.hint}</span> : null}
+                    {item.icon ? <span className="app-select-option-icon">{item.icon}</span> : null}
+                    <span className="app-select-option-copy">
+                      <span className="app-select-option-name">{item.label}</span>
+                      {item.hint ? <span className="app-select-option-id">{item.hint}</span> : null}
+                    </span>
                   </button>
                 );
               })
@@ -219,7 +233,9 @@ export function Select({
         onClick={() => setOpen((wasOpen) => !wasOpen)}
         onKeyDown={onTriggerKey}
       >
-        {prefix ? <span className="app-select-prefix">{prefix}</span> : null}
+        {prefix ? <span className="app-select-prefix">{prefix}</span> : current?.icon ? (
+          <span className="app-select-prefix">{current.icon}</span>
+        ) : null}
         <span className="app-select-label">{label}</span>
         <IconChevronDown />
       </button>

@@ -15,3 +15,10 @@ auth.json
 state.json
 sessions/
 memory/
+
+# Locally staged installers / cross-compiled binaries (CI publishes these).
+desktop/packaging/**/*.dmg
+desktop/packaging/**/*.exe
+desktop/packaging/**/grokdesk.exe
+desktop/src/vscodeIcons.json
+desktop/src-tauri/target/

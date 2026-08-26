@@ -245,6 +245,21 @@ export function IconShield(props: IconProps) {
     </Svg>
   );
 }
+export function IconPencil(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M14.2 5.4 18.6 9.8 9.5 18.9H5.1v-4.4z" />
+      <path d="M12.8 6.8l4.4 4.4" />
+    </Svg>
+  );
+}
+export function IconBolt(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M13 3 6.5 13.2h4.2L10.2 21 17.5 10.8h-4.3z" />
+    </Svg>
+  );
+}
 export function IconRefresh(props: IconProps) {
   return (
     <Svg {...props}>

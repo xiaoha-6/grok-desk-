@@ -267,6 +267,16 @@ async fn cancel_turn(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn set_permission_mode(state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    let acp = Arc::clone(&state.acp);
+    run_blocking(move || {
+        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        client.set_permission_mode(&mode)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
     let acp = Arc::clone(&state.acp);
     run_blocking(move || {
@@ -496,6 +506,7 @@ pub fn run() {
             ensure_session,
             send_prompt,
             cancel_turn,
+            set_permission_mode,
             stop_session,
             answer_interaction,
             call_extension,

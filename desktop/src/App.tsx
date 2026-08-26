@@ -30,8 +30,12 @@ import {
   IconFolder,
   IconGauge,
   IconGear,
+  IconBolt,
+  IconHand,
   IconInspector,
   IconPerson,
+  IconPencil,
+  IconPlan,
   IconRefresh,
   IconShield,
   IconSidebar,
@@ -50,6 +54,7 @@ import {
   defaultSettings,
   EFFORTS,
   mergeModelOptions,
+  normalizePermissionMode,
   PERMISSION_MODES,
   type AccountRecord,
   type AccountState,
@@ -151,15 +156,43 @@ function parseSshWorkspace(path: string): SshTarget | null {
   const trimmed = path.trim();
   const match = trimmed.match(/^ssh:\/\/([^@]+)@([^:/]+):(\d+)\/(.*)$/i);
   if (!match) return null;
+  const remote = `/${match[4]}`.replace(/\/+/g, "/") || "/";
   return {
     host: match[2],
     port: Number(match[3]) || 22,
     user: match[1],
-    remotePath: `/${match[4]}`.replace(/\/+/g, "/"),
+    remotePath: remote === "//" ? "/" : remote,
     identityFile: "",
     auth: "key",
     password: "",
     alias: "",
+  };
+}
+
+function sameSshHost(left: SshTarget, right: SshTarget) {
+  return (
+    left.host.trim() === right.host.trim() &&
+    (left.port || 22) === (right.port || 22) &&
+    (left.user.trim() || "root") === (right.user.trim() || "root")
+  );
+}
+
+/** Recover a usable SSH target from conversation state, cwd, or recent hosts. */
+function resolveConversationSsh(conversation: Conversation, hosts: SshTarget[] = []): SshTarget | null {
+  const fromField = conversation.ssh?.host ? conversation.ssh : null;
+  const fromCwd = isSshWorkspace(conversation.cwd) ? parseSshWorkspace(conversation.cwd) : null;
+  const base = fromField || fromCwd;
+  if (!base) return null;
+  const saved = hosts.find((item) => sameSshHost(item, base));
+  return {
+    host: base.host.trim(),
+    port: base.port || saved?.port || 22,
+    user: base.user.trim() || saved?.user || "root",
+    remotePath: (fromField?.remotePath || fromCwd?.remotePath || saved?.remotePath || "/").trim() || "/",
+    identityFile: fromField?.identityFile || saved?.identityFile || "",
+    auth: fromField?.auth || saved?.auth || "key",
+    password: fromField?.password || saved?.password || "",
+    alias: fromField?.alias || saved?.alias || "",
   };
 }
 
@@ -198,6 +231,33 @@ function friendlyError(raw: string) {
     return `${text}\n这是官方 Grok 的周额度/登录限制，不是中转站余额。中转站显示「额度不限」时，请开一个新对话，让桌面端走中转站而不是 grok.com。`;
   }
   return text;
+}
+
+function isUserCancelError(raw?: string) {
+  const text = String(raw || "").trim();
+  if (!text) return false;
+  return /连接已取消|cancelled by user|session\/cancel|user cancel|canceled by the user|prompt cancelled|turn cancelled/i.test(
+    text,
+  );
+}
+
+function sealAssistantMessage(message: ChatMessage, options?: { error?: string; stopped?: boolean }): ChatMessage {
+  const cancelled = Boolean(options?.stopped || isUserCancelError(options?.error));
+  const err = options?.error && !cancelled ? friendlyError(options.error) : undefined;
+  return {
+    ...message,
+    streaming: false,
+    local: true,
+    queued: false,
+    stopped: cancelled || Boolean(message.stopped),
+    error: err || (cancelled ? undefined : message.error),
+    events: (message.events || []).map((event) => {
+      if (!cancelled) return event;
+      const status = String(event.status || "").toLowerCase();
+      if (!status || /complete|success|approved|fail|error|cancel/.test(status)) return event;
+      return { ...event, status: "cancelled" };
+    }),
+  };
 }
 
 function importSig(payload: RelayImport) {
@@ -286,6 +346,21 @@ function formatTokens(value: number) {
   return value >= 1000 ? `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k` : String(value);
 }
 
+function permissionModeIcon(mode: string, size = 14) {
+  switch (normalizePermissionMode(mode)) {
+    case "acceptEdits":
+      return <IconPencil size={size} />;
+    case "plan":
+      return <IconPlan size={size} />;
+    case "auto":
+      return <IconBolt size={size} />;
+    case "bypassPermissions":
+      return <IconShield size={size} />;
+    default:
+      return <IconHand size={size} />;
+  }
+}
+
 function migrateSettings(saved?: Partial<AppSettings>): AppSettings {
   const merged = { ...defaultSettings(), ...saved };
   if (!saved?.contextWindowTokens || saved.contextWindowTokens === LEGACY_CONTEXT_WINDOW) {
@@ -297,6 +372,49 @@ function migrateSettings(saved?: Partial<AppSettings>): AppSettings {
 function isGenericTitle(title: string) {
   const value = (title || "").trim();
   return !value || value === "Grok Session" || value === "新对话" || value === "New chat";
+}
+
+function mergeConversationMessages(left: ChatMessage[] = [], right: ChatMessage[] = []): ChatMessage[] {
+  if (!left.length) return right;
+  if (!right.length) return left;
+  const byId = new Map<string, ChatMessage>();
+  const order: string[] = [];
+  const push = (item: ChatMessage) => {
+    // Never collapse two different bubbles just because the text is the same
+    // ("hi" sent twice, or a new send matching an older history "hi").
+    const key = item.id || `tmp:${order.length}:${item.role}:${item.queued ? 1 : 0}:${item.streaming ? 1 : 0}`;
+    const prev = byId.get(key);
+    if (!prev) {
+      byId.set(key, item);
+      order.push(key);
+      return;
+    }
+    const preferIncoming =
+      (item.streaming && !prev.streaming) ||
+      Boolean(item.local && !prev.local) ||
+      ((item.text?.length || 0) > (prev.text?.length || 0)) ||
+      ((item.thought?.length || 0) > (prev.thought?.length || 0)) ||
+      ((item.events?.length || 0) > (prev.events?.length || 0)) ||
+      ((item.media?.length || 0) > (prev.media?.length || 0));
+    byId.set(key, {
+      ...prev,
+      ...(preferIncoming ? item : {}),
+      id: prev.id || item.id,
+      local: Boolean(prev.local || item.local),
+      queued: Boolean(item.queued ?? prev.queued),
+      stopped: Boolean(prev.stopped || item.stopped),
+      text: (item.text?.length || 0) >= (prev.text?.length || 0) ? item.text : prev.text,
+      thought: (item.thought?.length || 0) >= (prev.thought?.length || 0) ? item.thought : prev.thought,
+      events: (item.events?.length || 0) >= (prev.events?.length || 0) ? item.events : prev.events,
+      media: (item.media?.length || 0) >= (prev.media?.length || 0) ? item.media : prev.media,
+      error: preferIncoming ? item.error ?? prev.error : prev.error ?? item.error,
+    });
+  };
+  const pinned = [...left, ...right].filter((item) => item.local || item.queued);
+  const rest = [...left, ...right].filter((item) => !item.local && !item.queued);
+  for (const item of rest) push(item);
+  for (const item of pinned) push(item);
+  return order.map((key) => byId.get(key)!);
 }
 
 function betterConversation(current: Conversation, incoming: Conversation) {
@@ -330,7 +448,8 @@ function combineConversations(current: Conversation, incoming: Conversation): Co
     ssh: winner.ssh || loser.ssh || null,
     grokSessionId: sessionId || winner.grokSessionId || loser.grokSessionId,
     accountId: winner.accountId || loser.accountId,
-    messages: (winner.messages?.length || 0) >= (loser.messages?.length || 0) ? winner.messages : loser.messages,
+    // Never drop bubbles from either side — length-based "winner" was swallowing just-sent user messages.
+    messages: mergeConversationMessages(current.messages || [], incoming.messages || []),
     updatedAt: Math.max(winner.updatedAt || 0, loser.updatedAt || 0),
     archivedAt: winner.archivedAt ?? loser.archivedAt,
   };
@@ -342,16 +461,21 @@ function keepBetter(map: Map<string, Conversation>, key: string, item: Conversat
 }
 
 function hydrateConversation(item: Conversation): Conversation {
+  const cwd = item.cwd || "";
+  const ssh = item.ssh?.host ? item.ssh : isSshWorkspace(cwd) ? parseSshWorkspace(cwd) : null;
   return {
     ...item,
     title: item.title || "Grok Session",
-    cwd: item.cwd || "",
-    ssh: item.ssh || null,
+    cwd,
+    ssh,
     messages: (item.messages || []).map((message) => ({
       ...message,
       events: message.events || [],
       media: message.media || [],
       streaming: false,
+      queued: Boolean(message.queued),
+      local: Boolean(message.local),
+      stopped: Boolean(message.stopped),
     })),
   };
 }
@@ -363,23 +487,35 @@ function dedupeConversations(list: Conversation[]): Conversation[] {
     if (!id) continue;
     keepBetter(byId, id, item);
   }
-  const byKey = new Map<string, Conversation>();
-  for (const item of byId.values()) {
-    keepBetter(byKey, item.grokSessionId || item.id, item);
-  }
-  return [...byKey.values()].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  return [...byId.values()].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
 }
 
 function persistConversations(list: Conversation[]): Conversation[] {
   return dedupeConversations(list).map((item) => ({
     ...item,
-    messages: item.messages.slice(-40).map((message) => ({
+    messages: persistMessageWindow(item.messages).map((message) => ({
       ...message,
       streaming: false,
+      // Queued drafts stay local. Completed turns drop the flag so session history
+      // can reload and replace a stale assistant-only window.
+      queued: Boolean(message.queued),
+      local: Boolean(message.queued),
+      stopped: Boolean(message.stopped),
       events: (message.events || []).slice(-16),
       media: (message.media || []).map((media) => ({ ...media, data: undefined })),
     })),
   }));
+}
+
+/** Keep a balanced recent window so user turns are not dropped behind assistant fragments. */
+function persistMessageWindow(messages: ChatMessage[], limit = 80): ChatMessage[] {
+  if (messages.length <= limit) return messages;
+  let start = messages.length - limit;
+  // Prefer starting on a user bubble so the window does not open mid-turn.
+  while (start > 0 && messages[start]?.role === "assistant") {
+    start -= 1;
+  }
+  return messages.slice(start);
 }
 
 function resolveSelectedId(list: Conversation[], id: string | null) {
@@ -399,30 +535,45 @@ function applyConversationUpdate(
 ) {
   const next = typeof update === "function" ? update(current) : update;
   const unique = dedupeConversations(next);
-  if (unique.length === current.length && unique.every((item, index) => item === current[index])) {
+  const byId = new Map(unique.map((item) => [item.id, item]));
+  for (const item of current) {
+    const live = (item.messages || []).filter((message) => message.local || message.queued || message.streaming);
+    if (!live.length) continue;
+    const found = byId.get(item.id);
+    if (!found) {
+      byId.set(item.id, item);
+      continue;
+    }
+    const missing = live.filter((message) => !found.messages.some((entry) => entry.id === message.id));
+    if (missing.length) {
+      byId.set(item.id, { ...found, messages: mergeConversationMessages(found.messages, missing) });
+    }
+  }
+  const preserved = [...byId.values()].sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+  if (preserved.length === current.length && preserved.every((item, index) => item === current[index])) {
     return current;
   }
-  return unique;
+  return preserved;
 }
+
+type QueuedPrompt = {
+  id: string;
+  messageId: string;
+  conversationId: string;
+  text: string;
+  attachments: PromptAttachment[];
+};
 
 function mergeHistoryMessages(existing: ChatMessage[], incoming: ChatMessage[], prepend: boolean) {
   if (!incoming.length) return existing;
-  if (!existing.length) return incoming;
-  const keys = new Set(
-    existing.map((item) => `${item.role}:${(item.text || "").slice(0, 160)}:${item.events?.length || 0}`),
-  );
-  const extra = incoming.filter((item) => {
-    if (item.streaming) return false;
-    const key = `${item.role}:${(item.text || "").slice(0, 160)}:${item.events?.length || 0}`;
-    if (keys.has(key)) return false;
-    keys.add(key);
-    return true;
-  });
-  if (!extra.length) return existing;
-  const live = existing.filter((item) => item.streaming);
-  const rest = existing.filter((item) => !item.streaming);
-  const merged = prepend ? [...extra, ...rest, ...live] : [...rest, ...extra, ...live];
-  return merged;
+  const keep = existing.filter((item) => item.local || item.queued || item.streaming);
+  // Initial history load replaces persisted transcript. Appending used to keep an
+  // old assistant-only fragment window and hide the real user turns.
+  if (!prepend) {
+    return mergeConversationMessages(incoming, keep);
+  }
+  const rest = existing.filter((item) => !item.local && !item.queued && !item.streaming);
+  return mergeConversationMessages([...incoming, ...rest], keep);
 }
 
 function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary[]): Conversation[] {
@@ -451,7 +602,7 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
   }
   const merged = unique.map((item) => {
     const summary = summaries.find(
-      (entry) => entry.grokSessionId === item.grokSessionId || entry.grokSessionId === item.id,
+      (entry) => entry.grokSessionId === item.grokSessionId,
     );
     if (!summary) return item;
     const untitled = isGenericTitle(item.title);
@@ -671,6 +822,12 @@ export default function App() {
   const [questionNotes, setQuestionNotes] = useState<Record<string, string>>({});
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string[]>>({});
   const [planFeedback, setPlanFeedback] = useState("");
+  const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingDraft, setEditingDraft] = useState("");
+  /** Sticky outgoing bubbles. History/session reloads cannot erase these from the UI. */
+  const [stickyOutgoing, setStickyOutgoing] = useState<ChatMessage[]>([]);
+  const stickyOutgoingRef = useRef<ChatMessage[]>([]);
 
   const t: Copy = translate(lang);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -697,6 +854,14 @@ export default function App() {
   const historyLoadedRef = useRef(new Set<string>());
   const historyBusyRef = useRef(false);
   const historyLockedRef = useRef(false);
+  const historyEpochRef = useRef(0);
+  const userPinnedRef = useRef(false);
+  const promptQueueRef = useRef<QueuedPrompt[]>([]);
+  const sendTextRef = useRef<(
+    text: string,
+    extraAttachments?: PromptAttachment[],
+    options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean },
+  ) => Promise<void>>(async () => {});
   const shownCountRef = useRef(VIEW_PAGE);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
@@ -713,6 +878,7 @@ export default function App() {
   relayQuotaRef.current = relayQuota;
   relayReadyRef.current = relayReady;
   shownCountRef.current = shownCount;
+  sendTextRef.current = sendText;
 
   useEffect(() => {
     const next = resolveSelectedId(conversations, selectedId);
@@ -720,12 +886,21 @@ export default function App() {
   }, [conversations, selectedId]);
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
+  const visibleMessages = useMemo(() => {
+    const base = selected?.messages || [];
+    if (!stickyOutgoing.length) return base;
+    const stickyIds = new Set(stickyOutgoing.map((item) => item.id).filter(Boolean));
+    // Prefer sticky copies for outgoing user bubbles so a mid-turn conversations rewrite
+    // cannot blank the transcript. Keep non-sticky messages as-is.
+    const withoutStickyDupes = base.filter((item) => !item.id || !stickyIds.has(item.id));
+    return [...withoutStickyDupes, ...stickyOutgoing];
+  }, [selected?.messages, stickyOutgoing]);
   const homeDir = status?.homeDir || "";
   const sessionCwd = selected?.cwd || cwd;
   const activeSsh = selected?.ssh || (isSshWorkspace(sessionCwd) ? parseSshWorkspace(sessionCwd) : null);
   const workspaceRoot = activeSsh ? activeSsh.remotePath : usableWorkspace(sessionCwd, homeDir);
   const projectName = activeSsh ? sshLabel(activeSsh, workspaceRoot) : workspaceLabel(sessionCwd, homeDir, t.home);
-  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing && !running;
+  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing;
   const relayConfigured = Boolean(relayQuota?.configured || relayReady);
   const routed = relayConfigured ? undefined : pickRoutedAccount(accounts, settings);
   const activeAccount = relayConfigured
@@ -783,6 +958,24 @@ export default function App() {
   }, [lang, theme]);
 
   useEffect(() => {
+    stickyOutgoingRef.current = stickyOutgoing;
+  }, [stickyOutgoing]);
+
+  useEffect(() => {
+    // Only retire sticky copies after the turn is idle. If we clear them as soon as
+    // conversations temporarily contain the bubble, a later history/session rewrite
+    // can wipe conversations and leave the UI with neither copy.
+    if (running) return;
+    const base = conversations.find((item) => item.id === selectedId)?.messages || [];
+    if (!base.length || !stickyOutgoingRef.current.length) return;
+    const ids = new Set(base.map((item) => item.id));
+    setStickyOutgoing((current) => {
+      const next = current.filter((item) => !(item.id && ids.has(item.id) && !item.queued));
+      return next.length === current.length ? current : next;
+    });
+  }, [conversations, selectedId, running]);
+
+  useEffect(() => {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
@@ -812,8 +1005,22 @@ export default function App() {
   }, [settings.contextWindowTokens]);
 
   const patchSettings = useCallback((patch: Partial<AppSettings>) => {
-    setSettings((current) => ({ ...current, ...patch }));
+    const nextPatch =
+      patch.permissionMode != null
+        ? { ...patch, permissionMode: normalizePermissionMode(patch.permissionMode) }
+        : patch;
+    setSettings((current) => ({ ...current, ...nextPatch }));
+    if (nextPatch.permissionMode != null) {
+      void invoke("set_permission_mode", { mode: nextPatch.permissionMode }).catch(() => undefined);
+    }
   }, []);
+
+  const setPermissionMode = useCallback(
+    (mode: string) => {
+      patchSettings({ permissionMode: mode });
+    },
+    [patchSettings],
+  );
 
   const persistAccounts = useCallback(async (next: AccountRecord[], extra?: Partial<AppSettings>) => {
     const merged = extra ? { ...settingsRef.current, ...extra } : settingsRef.current;
@@ -860,21 +1067,32 @@ export default function App() {
 
   const syncJumpButton = useCallback((el: HTMLElement) => {
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    setShowJumpToBottom(gap > 48 && el.scrollHeight > el.clientHeight + 8);
+    setShowJumpToBottom(gap > 80 && el.scrollHeight > el.clientHeight + 8);
   }, []);
 
   const updateFollowState = useCallback((el: HTMLElement) => {
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    followRef.current = gap < 72;
+    const pinned = gap < 48;
+    followRef.current = pinned;
+    userPinnedRef.current = !pinned;
     syncJumpButton(el);
+
+    // 修复：当 Grok 正在处理时，强制保持在底部（防止消息被“不见”）
+    if (runningRef.current) {
+      el.scrollTop = el.scrollHeight;
+      followRef.current = true;
+      userPinnedRef.current = false;
+      setShowJumpToBottom(false);
+    }
   }, [syncJumpButton]);
 
   const scrollToBottom = useCallback((force = false) => {
     const el = transcriptRef.current;
     if (!el) return;
-    if (!force && !followRef.current) return;
+    if (!force && (userPinnedRef.current || !followRef.current)) return;
     el.scrollTop = el.scrollHeight;
     followRef.current = true;
+    userPinnedRef.current = false;
     setShowJumpToBottom(false);
   }, []);
 
@@ -905,20 +1123,56 @@ export default function App() {
   );
 
   const finishTurn = useCallback((error?: string) => {
-    const err = error ? friendlyError(error) : undefined;
-    setConversations((list) =>
-      list.map((item) => {
+    const cancelled = isUserCancelError(error);
+    const err = error && !cancelled ? friendlyError(error) : undefined;
+    setConversations((list) => {
+      const next = list.map((item) => {
         if (item.id !== selectedIdRef.current) return item;
-        return {
-          ...item,
-          messages: item.messages.map((message) =>
-            message.streaming ? { ...message, streaming: false, error: err || message.error } : message,
-          ),
-        };
-      }),
-    );
+        const sticky = stickyOutgoingRef.current;
+        // Only seal the live turn. Never rewrite older completed assistants on cancel.
+        let sealedLive = false;
+        const sealed = item.messages.map((message) => {
+          if (message.role === "assistant" && message.streaming) {
+            sealedLive = true;
+            return sealAssistantMessage(message, { error, stopped: cancelled });
+          }
+          return message;
+        });
+        // If stop raced ahead of React state and nothing is streaming anymore,
+        // still mark the latest local assistant as stopped when this was a cancel.
+        if (cancelled && !sealedLive) {
+          for (let i = sealed.length - 1; i >= 0; i -= 1) {
+            if (sealed[i].role === "assistant" && sealed[i].local) {
+              sealed[i] = sealAssistantMessage(sealed[i], { stopped: true });
+              break;
+            }
+          }
+        }
+        const merged = sticky.length
+          ? mergeConversationMessages(
+              sealed,
+              sticky.map((message) => ({ ...message, queued: false, local: true })),
+            )
+          : sealed;
+        return { ...item, messages: merged, updatedAt: Date.now() };
+      });
+      conversationsRef.current = next;
+      return next;
+    });
+    // Keep sticky until conversations have absorbed them on the next idle pass.
     setRunning(false);
-    setStatusText(err || tRef.current.ready);
+    runningRef.current = false;
+    setStatusText(cancelled ? tRef.current.stopped : err || tRef.current.ready);
+    window.setTimeout(() => {
+      const next = promptQueueRef.current.shift();
+      setQueuedPrompts([...promptQueueRef.current]);
+      if (!next) return;
+      void sendTextRef.current(next.text, next.attachments, {
+        fromQueue: true,
+        conversationId: next.conversationId,
+        messageId: next.messageId,
+      });
+    }, 40);
   }, []);
 
   const handleAcpUpdate = useCallback(
@@ -1082,6 +1336,8 @@ export default function App() {
         } else if (type === "session_summary_generated") {
           const title = String(update.sessionSummary || update.session_summary || "");
           if (title) return { ...conversation, title, updatedAt: Date.now() };
+        } else if (type === "user_message_chunk" || type === "user_message") {
+          // User bubbles are owned by the composer/optimistic insert. Never absorb them into the assistant bubble.
         } else if (type !== "user_message_chunk" && type !== "user_message" && !isRedundantExtension(type)) {
           const kind = extensionKind(type);
           if (kind !== "system") {
@@ -1207,10 +1463,21 @@ export default function App() {
   const loadSessionHistory = useCallback(async (conversationId: string, older = false) => {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation?.grokSessionId || historyBusyRef.current) return;
+    // Remote SSH chats must never pull local ~/.grok session history.
+    if (conversation.ssh || isSshWorkspace(conversation.cwd)) return;
+    // Freeze history entirely while sending or while sticky outgoing bubbles exist.
+    if (
+      runningRef.current ||
+      stickyOutgoingRef.current.length > 0 ||
+      conversation.messages.some((item) => item.streaming || item.queued || item.local)
+    ) {
+      return;
+    }
     if (older && conversation.historyHasMore === false) return;
     if (!older && historyLoadedRef.current.has(conversationId)) return;
     if (!older) historyLoadedRef.current.add(conversationId);
     historyBusyRef.current = true;
+    const epoch = historyEpochRef.current;
     if (older) setLoadingOlder(true);
     const skip = older ? conversation.historySkip || conversation.messages.length : 0;
     try {
@@ -1219,6 +1486,16 @@ export default function App() {
         limit: HISTORY_PAGE,
         skip,
       });
+      // Drop stale responses that finished after a new send started.
+      if (epoch !== historyEpochRef.current) return;
+      const latest = conversationsRef.current.find((item) => item.id === conversationId);
+      if (
+        !latest ||
+        runningRef.current ||
+        latest.messages.some((item) => item.streaming || item.queued || item.local)
+      ) {
+        return;
+      }
       const incoming: ChatMessage[] = (history.messages || []).map((item) => ({
         id: uid(),
         role: item.role === "assistant" ? "assistant" : "user",
@@ -1244,8 +1521,12 @@ export default function App() {
       setConversations((list) =>
         list.map((item) => {
           if (item.id !== conversationId) return item;
+          // Never rewrite a transcript that already has local/optimistic bubbles.
+          if (item.messages.some((message) => message.streaming || message.queued || message.local)) {
+            return item;
+          }
           const messages = incoming.length
-            ? mergeHistoryMessages(item.messages, incoming, older || item.messages.length > 0)
+            ? mergeHistoryMessages(item.messages, incoming, older)
             : item.messages;
           return {
             ...item,
@@ -1260,9 +1541,11 @@ export default function App() {
         requestAnimationFrame(() => {
           const box = transcriptRef.current;
           if (!box) return;
-          if (followRef.current) {
+          if (!userPinnedRef.current && followRef.current) {
             box.scrollTop = box.scrollHeight;
             setShowJumpToBottom(false);
+          } else {
+            syncJumpButton(box);
           }
         });
       }
@@ -1328,11 +1611,13 @@ export default function App() {
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
-        if (historyLockedRef.current) return;
+        if (historyLockedRef.current || runningRef.current || stickyOutgoingRef.current.length) return;
+        if (followRef.current && !userPinnedRef.current) return;
         const rootEl = transcriptRef.current;
-        if (rootEl && rootEl.scrollTop > 8) return;
+        if (!rootEl || rootEl.scrollTop > 8) return;
         const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
         if (!conversation) return;
+        if (conversation.messages.some((item) => item.streaming || item.queued || item.local)) return;
         revealOlder(conversation.id);
       },
       { root, rootMargin: "0px", threshold: 1 },
@@ -1344,10 +1629,8 @@ export default function App() {
   const loadLocalSessions = useCallback(async () => {
     try {
       const summaries = await invoke<LocalSessionSummary[]>("list_local_sessions");
-      const merged = mergeLocalSessions(conversationsRef.current, summaries || []);
-      setConversations(merged);
-      conversationsRef.current = merged;
-      return merged;
+      setConversations((current) => mergeLocalSessions(current, summaries || []));
+      return conversationsRef.current;
     } catch {
       return conversationsRef.current;
     }
@@ -1552,9 +1835,12 @@ export default function App() {
       const imported = await loadLocalSessions();
       const path = usableWorkspace(cwdRef.current, runtime?.homeDir || "");
       const ensured = ensureConversation(imported, selectedIdRef.current, path);
-      setConversations(ensured.list);
+      setConversations((current) => {
+        const live = current.some((item) => item.messages.some((message) => message.streaming || message.queued));
+        return live ? current : ensured.list;
+      });
       setSelectedId(ensured.id);
-      if (ensured.id) void loadSessionHistory(ensured.id);
+      if (ensured.id && !runningRef.current) void loadSessionHistory(ensured.id);
       setStatusText(
         runtime?.installed
           ? runtime.credentialsReady
@@ -1567,7 +1853,6 @@ export default function App() {
       await add(listen<AcpUpdate>("acp-update", (event) => handleAcpUpdateRef.current(event.payload)));
       await add(
         listen<AcpTurnDone>("acp-turn-done", (event) => {
-          if (!runningRef.current) return;
           finishTurnRef.current(event.payload.ok ? undefined : event.payload.error);
         }),
       );
@@ -1658,15 +1943,23 @@ export default function App() {
       setView("chat");
       return;
     }
+
+    const nextCwd = usableWorkspace(cwd, homeDir);
+    const nextSsh =
+      activeSsh ||
+      (isSshWorkspace(nextCwd) ? parseSshWorkspace(nextCwd) : null) ||
+      resolveConversationSsh({ id: "", title: "", cwd: nextCwd, messages: [], updatedAt: 0, ssh: null }, sshHosts);
     const created: Conversation = {
       id: uid(),
       title: t.newChat,
-      cwd: usableWorkspace(cwd, homeDir),
+      cwd: nextCwd,
+      ssh: nextSsh,
       accountId: account?.id || activeAccount?.id,
       messages: [],
       updatedAt: Date.now(),
     };
-    setConversations((list) => [created, ...list]);
+
+    setConversations((list) => [created, ...list.filter((item) => item.id !== created.id)]);
     setSelectedId(created.id);
     setView("chat");
     setPrompt("");
@@ -1683,8 +1976,13 @@ export default function App() {
     setView("chat");
     followRef.current = true;
     setShowJumpToBottom(false);
+    setStickyOutgoing([]);
+    // Allow history to reload so repaired reconstructions replace stale local windows.
+    historyLoadedRef.current.delete(id);
     if (item?.cwd) setCwd(item.cwd);
-    void loadSessionHistory(id);
+    if (!runningRef.current && !item?.ssh && !isSshWorkspace(item?.cwd || "")) {
+      void loadSessionHistory(id);
+    }
   }
 
   function deleteConversation(id: string) {
@@ -1740,16 +2038,17 @@ export default function App() {
   async function testSsh(target = sshForm) {
     setSshBusy(true);
     setSshError("");
-    setStatusText(t.sshConnecting);
+    setStatusText(`${t.sshConnecting} ${t.sshAutoSetup}`);
     try {
       const probe = await invoke<SshProbe>("probe_ssh_host", {
         target: { ...target, remotePath: "" },
       });
       setSshProbe(probe);
-      const home = probe.remotePath || probe.home || "~";
-      setSshBrowsePath(home);
+      // Prefer filesystem root so the picker starts at the top-level path.
+      const start = probe.remotePath || "/";
+      setSshBrowsePath(start);
       setSshEntries(probe.entries || []);
-      setSshForm((current) => ({ ...current, remotePath: home }));
+      setSshForm((current) => ({ ...current, remotePath: start }));
       setStatusText(probe.message);
       return probe;
     } catch (error) {
@@ -1838,13 +2137,106 @@ export default function App() {
     }
   }
 
-  async function sendText(text: string, extraAttachments?: PromptAttachment[]) {
-    const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+  async function sendText(
+    text: string,
+    extraAttachments?: PromptAttachment[],
+    options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean },
+  ) {
+    const conversation = conversationsRef.current.find((item) => item.id === (options?.conversationId || selectedIdRef.current));
     const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
-    if ((!text.trim() && !attachments.length) || !conversation || runningRef.current) return;
+    if ((!text.trim() && !attachments.length) || !conversation) return;
+    if (runningRef.current && !options?.fromQueue) {
+      if (options?.interrupt) {
+        promptQueueRef.current = [];
+        setQueuedPrompts([]);
+        turnIdRef.current += 1;
+        // Seal the in-flight assistant BEFORE tearing down the session so tool/
+        // process output cannot vanish when stop_session races history merges.
+        setConversations((list) => {
+          const next = list.map((item) =>
+            item.id === conversation.id
+              ? {
+                  ...item,
+                  messages: item.messages.map((message) =>
+                    message.role === "assistant" && message.streaming
+                      ? sealAssistantMessage(message, { stopped: true })
+                      : message,
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : item,
+          );
+          conversationsRef.current = next;
+          return next;
+        });
+        setRunning(false);
+        runningRef.current = false;
+        setStatusText(t.stopped);
+        try {
+          await invoke("cancel_turn");
+        } catch {
+          // ignore
+        }
+        try {
+          await invoke("stop_session");
+        } catch {
+          // ignore
+        }
+      } else {
+        const queuedUser: ChatMessage = {
+          id: uid(),
+          role: "user",
+          text: text.trim(),
+          thought: "",
+          events: [],
+          media: attachments.map(mediaFromAttachment),
+          streaming: false,
+          queued: true,
+          local: true,
+        };
+        const queued: QueuedPrompt = {
+          id: uid(),
+          messageId: queuedUser.id,
+          conversationId: conversation.id,
+          text: text.trim(),
+          attachments,
+        };
+        promptQueueRef.current = [...promptQueueRef.current, queued];
+        setQueuedPrompts(promptQueueRef.current);
+        historyEpochRef.current += 1;
+        const queuedConversation = {
+          ...conversation,
+          messages: [...conversation.messages, queuedUser],
+          updatedAt: Date.now(),
+        };
+        conversationsRef.current = conversationsRef.current.map((item) =>
+          item.id === conversation.id ? queuedConversation : item,
+        );
+        setConversations((list) =>
+          list.map((item) => (item.id === conversation.id ? queuedConversation : item)),
+        );
+        setStickyOutgoing((current) => [...current.filter((item) => item.id !== queuedUser.id), queuedUser]);
+        setShownCount((count) => Math.max(count, conversation.messages.length + 1, VIEW_PAGE));
+        setPrompt("");
+        setPendingImages([]);
+        if (composerRef.current) composerRef.current.style.height = "30px";
+        setStatusText(`${t.queued} ${promptQueueRef.current.length}`);
+        requestAnimationFrame(() => scrollToBottom(true));
+        return;
+      }
+    }
+    if (runningRef.current) return;
     const runtime = statusRef.current;
-    if (!conversation.ssh && !runtime?.installed) {
+    const sshTarget = resolveConversationSsh(conversation, sshHosts);
+    if (!sshTarget && !runtime?.installed) {
       setShowInstallPrompt(true);
+      return;
+    }
+    if (sshTarget?.auth === "password" && !String(sshTarget.password || "").trim()) {
+      setShowSshModal(true);
+      setSshForm({ ...emptySshTarget(), ...sshTarget, password: "" });
+      setSshError("远程密码登录需要重新输入密码后再发送。");
+      setStatusText("请重新输入 SSH 密码");
       return;
     }
     const relayOn = Boolean(relayQuotaRef.current?.configured || relayReadyRef.current);
@@ -1854,17 +2246,21 @@ export default function App() {
       : named?.enabled && named?.loggedIn
         ? named
         : pickRoutedAccount(accountsRef.current, settingsRef.current);
-    if (!conversation.ssh && runtime?.credentialsReady === false && !account?.loggedIn) {
+    if (!sshTarget && runtime?.credentialsReady === false && !account?.loggedIn) {
       setView("settings");
       setSettingsPage("relay");
       setStatusText(t.needCredentials);
       return;
     }
     const turnId = ++turnIdRef.current;
+    // Invalidate any in-flight history fetch immediately, before React re-renders.
+    historyEpochRef.current += 1;
+    historyBusyRef.current = false;
     setPrompt("");
     setPendingImages([]);
     if (composerRef.current) composerRef.current.style.height = "30px";
     setRunning(true);
+    runningRef.current = true;
     setStatusText(t.connecting);
     followRef.current = true;
     setShowJumpToBottom(false);
@@ -1872,31 +2268,57 @@ export default function App() {
       conversation.title === translate("zh").newChat || conversation.title === translate("en").newChat
         ? (text.trim() || attachments[0]?.name || t.newChat).slice(0, 28)
         : conversation.title;
-    const user: ChatMessage = {
+    const existingUser = options?.messageId
+      ? conversation.messages.find((item) => item.id === options.messageId)
+      : undefined;
+    const user: ChatMessage = existingUser
+      ? { ...existingUser, text: text.trim(), media: attachments.map(mediaFromAttachment), queued: false, streaming: false, local: true }
+      : {
+          id: uid(),
+          role: "user",
+          text: text.trim(),
+          thought: "",
+          events: [],
+          media: attachments.map(mediaFromAttachment),
+          streaming: false,
+          local: true,
+        };
+    const assistant: ChatMessage = {
       id: uid(),
-      role: "user",
-      text: text.trim(),
+      role: "assistant",
+      text: "",
       thought: "",
       events: [],
-      media: attachments.map(mediaFromAttachment),
-      streaming: false,
+      media: [],
+      streaming: true,
+      local: true,
     };
-    const assistant: ChatMessage = { id: uid(), role: "assistant", text: "", thought: "", events: [], media: [], streaming: true };
-    setShownCount((count) => Math.max(count, conversation.messages.length + 2));
-    setConversations((list) =>
-      list.map((item) =>
-        item.id === conversation.id
-          ? { ...item, title, messages: [...item.messages, user, assistant], updatedAt: Date.now() }
-          : item,
-      ),
+    userPinnedRef.current = false;
+    followRef.current = true;
+    setShownCount((count) => Math.max(count, conversation.messages.length + 2, VIEW_PAGE));
+    const optimisticMessages = existingUser
+      ? [
+          ...conversation.messages.map((item) => (item.id === existingUser.id ? user : item)).filter((item) => !item.queued || item.id === user.id),
+          assistant,
+        ]
+      : [...conversation.messages, user, assistant];
+    const optimisticConversation = { ...conversation, title, messages: optimisticMessages, updatedAt: Date.now() };
+    // Keep the ref in sync before await points so history merges see the local bubbles.
+    conversationsRef.current = conversationsRef.current.map((item) =>
+      item.id === conversation.id ? optimisticConversation : item,
     );
+    setConversations((list) =>
+      list.map((item) => (item.id === conversation.id ? optimisticConversation : item)),
+    );
+    setStickyOutgoing((current) => [...current.filter((item) => item.id !== user.id), user]);
     requestAnimationFrame(() => scrollToBottom(true));
     try {
+      const workspaceCwd = sshTarget ? sshWorkspaceId(sshTarget) : conversation.cwd || cwdRef.current;
       const session = await invoke<SessionInfo>("ensure_session", {
         options: {
           model: canonicalModelId(modelRef.current),
-          cwd: conversation.ssh?.remotePath || conversation.cwd || cwdRef.current,
-          ssh: conversation.ssh || null,
+          cwd: sshTarget?.remotePath || conversation.cwd || cwdRef.current,
+          ssh: sshTarget,
           existingSessionId: conversation.grokSessionId ?? null,
           grokHome: relayOn ? null : account?.homePath || null,
           permissionMode: settingsRef.current.permissionMode,
@@ -1909,13 +2331,29 @@ export default function App() {
         },
       });
       if (turnId !== turnIdRef.current) return;
-      setConversations((list) =>
-        list.map((item) =>
-          item.id === conversation.id
-            ? { ...item, grokSessionId: session.sessionId, cwd: session.cwd, accountId: relayOn ? undefined : account?.id }
-            : item,
-        ),
-      );
+      setConversations((list) => {
+        const next = list.map((item) => {
+          if (item.id !== conversation.id) return item;
+          // Re-assert optimistic bubbles after session id attach — history merge may race here.
+          const hasUser = item.messages.some((message) => message.id === user.id);
+          const hasAssistant = item.messages.some((message) => message.id === assistant.id);
+          const messages =
+            hasUser && hasAssistant
+              ? item.messages
+              : mergeConversationMessages(item.messages, [user, assistant]);
+          return {
+            ...item,
+            title,
+            messages,
+            grokSessionId: session.sessionId,
+            cwd: workspaceCwd,
+            ssh: sshTarget || item.ssh || null,
+            accountId: relayOn ? undefined : account?.id,
+          };
+        });
+        conversationsRef.current = next;
+        return next;
+      });
       setStatusText(t.running);
       await invoke("send_prompt", {
         text: text.trim(),
@@ -1939,7 +2377,8 @@ export default function App() {
 
   async function stopTurn() {
     turnIdRef.current += 1;
-    finishTurn();
+    // Freeze the live assistant first so cancel/stop cannot blank the transcript.
+    finishTurn("连接已取消");
     try {
       await invoke("cancel_turn");
     } catch {
@@ -1950,6 +2389,77 @@ export default function App() {
     } catch {
       // ignore
     }
+  }
+
+  function startEditingMessage(message: ChatMessage) {
+    if (message.role !== "user") return;
+    setEditingMessageId(message.id);
+    setEditingDraft(message.text);
+  }
+
+  async function saveEditedMessage() {
+    const messageId = editingMessageId;
+    const draft = editingDraft.trim();
+    if (!messageId || !draft) {
+      setEditingMessageId(null);
+      return;
+    }
+    const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+    if (!conversation) return;
+    const original = conversation.messages.find((item) => item.id === messageId);
+    setConversations((list) =>
+      list.map((item) => {
+        if (item.id !== conversation.id) return item;
+        const index = item.messages.findIndex((message) => message.id === messageId);
+        if (index < 0) return item;
+        const messages = item.messages.slice(0, index + 1).map((message) =>
+          message.id === messageId ? { ...message, text: draft, queued: false, streaming: false, local: true } : message,
+        );
+        return { ...item, messages, updatedAt: Date.now() };
+      }),
+    );
+    promptQueueRef.current = promptQueueRef.current.filter((item) => item.messageId !== messageId);
+    setQueuedPrompts([...promptQueueRef.current]);
+    setEditingMessageId(null);
+    setEditingDraft("");
+    const extras = (original?.media || [])
+      .filter((item) => item.data)
+      .map((item) => ({ mimeType: item.mimeType, data: item.data, name: item.name }));
+    await sendText(draft, extras, { conversationId: conversation.id, interrupt: Boolean(runningRef.current), messageId });
+  }
+
+  function sendQueuedNow(item: QueuedPrompt) {
+    promptQueueRef.current = promptQueueRef.current.filter((entry) => entry.id !== item.id);
+    setQueuedPrompts([...promptQueueRef.current]);
+    void sendText(item.text, item.attachments, {
+      conversationId: item.conversationId,
+      messageId: item.messageId,
+      interrupt: Boolean(runningRef.current),
+    });
+  }
+
+  function removeQueued(item: QueuedPrompt) {
+    promptQueueRef.current = promptQueueRef.current.filter((entry) => entry.id !== item.id);
+    setQueuedPrompts([...promptQueueRef.current]);
+    setConversations((list) =>
+      list.map((conversation) =>
+        conversation.id === item.conversationId
+          ? { ...conversation, messages: conversation.messages.filter((message) => message.id !== item.messageId) }
+          : conversation,
+      ),
+    );
+  }
+
+  function clearQueue() {
+    const ids = new Set(promptQueueRef.current.map((item) => item.messageId));
+    promptQueueRef.current = [];
+    setQueuedPrompts([]);
+    setConversations((list) =>
+      list.map((conversation) => ({
+        ...conversation,
+        messages: conversation.messages.filter((message) => !ids.has(message.id)),
+      })),
+    );
   }
 
   async function regenerate() {
@@ -2050,9 +2560,12 @@ export default function App() {
   }
 
   function revealOlder(conversationId: string) {
-    if (historyLockedRef.current || historyBusyRef.current) return;
+    if (historyLockedRef.current || historyBusyRef.current || runningRef.current || stickyOutgoingRef.current.length) return;
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) return;
+    if (conversation.ssh || isSshWorkspace(conversation.cwd)) return;
+    if (conversation.messages.some((item) => item.streaming || item.queued || item.local)) return;
+    if (followRef.current && !userPinnedRef.current) return;
     const el = transcriptRef.current;
     if (el && el.scrollTop > 24) return;
     if (shownCountRef.current < conversation.messages.length) {
@@ -2077,13 +2590,17 @@ export default function App() {
     const el = transcriptRef.current;
     if (!el) return;
     updateFollowState(el);
-    if (historyLockedRef.current) return;
+    if (historyLockedRef.current || runningRef.current || stickyOutgoingRef.current.length) return;
+    if (followRef.current && !userPinnedRef.current) return;
     if (el.scrollTop > 8) return;
     if (selectedIdRef.current) revealOlder(selectedIdRef.current);
   }
 
   function onTranscriptWheel(event: ReactWheelEvent<HTMLElement>) {
-    if (event.deltaY < 0) followRef.current = false;
+    if (event.deltaY < 0) {
+      followRef.current = false;
+      userPinnedRef.current = true;
+    }
     const el = transcriptRef.current;
     if (!el) return;
     requestAnimationFrame(() => updateFollowState(el));
@@ -2308,11 +2825,11 @@ export default function App() {
                 </div>
                 <div className="ssh-browser-list">
                   {sshEntries.filter((item) => item.isDir).length === 0 ? (
-                    <div className="hint left" style={{ padding: "8px 12px" }}>{sshBusy ? t.sshConnecting : t.sshConnectedPick}</div>
+                    <div className="hint left" style={{ padding: "8px 12px" }}>{sshBusy ? t.sshConnecting : (sshError || t.sshConnectedPick)}</div>
                   ) : null}
                   {sshEntries.filter((item) => item.isDir).map((item) => {
                     const base = (sshBrowsePath || sshForm.remotePath || "~").replace(/\/+$/, "");
-                    const full = `${base}/${item.name}`.replace(/\/+/g, "/");
+                    const full = (base === "/" ? `/${item.name}` : `${base}/${item.name}`).replace(/\/+/g, "/");
                     const selected = sshForm.remotePath === full;
                     return (
                       <button
@@ -2612,14 +3129,14 @@ export default function App() {
             onScroll={onTranscriptScroll}
             onWheel={onTranscriptWheel}
           >
-            {selected?.grokSessionId || selected?.messages.length ? (
+            {selected?.grokSessionId || visibleMessages.length ? (
               <div className="history-more-bar">
-                {selected.messages.length > shownCount || (selected.grokSessionId && selected.historyHasMore !== false) ? (
+                {visibleMessages.length > shownCount || (selected?.grokSessionId && selected.historyHasMore !== false) ? (
                   <button
                     className="ghost compact history-more"
                     type="button"
-                    disabled={loadingOlder}
-                    onClick={() => revealOlder(selected.id)}
+                    disabled={loadingOlder || !selected}
+                    onClick={() => selected && revealOlder(selected.id)}
                   >
                     {loadingOlder ? t.loadingOlder : t.loadOlder}
                   </button>
@@ -2628,7 +3145,7 @@ export default function App() {
                 )}
               </div>
             ) : null}
-            {!selected?.messages.length ? (
+            {!visibleMessages.length ? (
               <div className="empty">
                 <div className="empty-hero">
                   <GrokMark size={72} className="empty-mark" />
@@ -2652,9 +3169,38 @@ export default function App() {
             ) : (
               <div className="messages">
                 <div ref={topSentinelRef} className="history-sentinel" />
-                {selected.messages.slice(Math.max(0, selected.messages.length - shownCount)).map((message) => (
+                {visibleMessages.slice(Math.max(0, visibleMessages.length - shownCount)).map((message) => (
                   <article key={message.id} className={`row ${message.role}`}>
                     <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
+                      {message.role === "user" && editingMessageId === message.id ? (
+                        <div className="user-edit">
+                          <textarea
+                            className="user-edit-input"
+                            value={editingDraft}
+                            autoFocus
+                            rows={Math.min(8, Math.max(2, editingDraft.split("\n").length))}
+                            onChange={(event) => setEditingDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" && !event.shiftKey) {
+                                event.preventDefault();
+                                void saveEditedMessage();
+                              }
+                              if (event.key === "Escape") {
+                                setEditingMessageId(null);
+                                setEditingDraft("");
+                              }
+                            }}
+                          />
+                          <div className="user-edit-actions">
+                            <button className="ghost compact" type="button" onClick={() => { setEditingMessageId(null); setEditingDraft(""); }}>
+                              {t.cancelEdit}
+                            </button>
+                            <button className="primary compact" type="button" onClick={() => void saveEditedMessage()}>
+                              {t.saveEdit}
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                       {message.role === "assistant" && message.events.length ? (
                         <>
                           <InlineEdits events={message.events} lang={lang} />
@@ -2662,11 +3208,11 @@ export default function App() {
                           <ActivityTimeline
                             events={message.events}
                             lang={lang}
-                            defaultOpen={message.streaming}
+                            defaultOpen={message.streaming || Boolean(message.stopped)}
                           />
                         </>
                       ) : message.thought ? (
-                        <details className="thought" open={message.streaming && !message.text}>
+                        <details className="thought" open={(message.streaming || Boolean(message.stopped)) && !message.text}>
                           <summary>
                             {message.streaming ? <ThinkingOrbs /> : null}
                             {message.streaming ? (
@@ -2688,7 +3234,9 @@ export default function App() {
                           <TextShimmer>{t.thinkingNow}</TextShimmer>
                         </div>
                       ) : null}
-                      {message.text || (message.streaming && message.events.length) ? (
+                      {editingMessageId === message.id
+                        ? null
+                        : message.text || (message.streaming && message.events.length) ? (
                         <MessageBody
                           text={message.text}
                           streaming={message.streaming && Boolean(message.text)}
@@ -2709,6 +3257,12 @@ export default function App() {
                           <TextShimmer>{t.working}</TextShimmer>
                         </div>
                       ) : null}
+                      {message.role === "assistant" && message.stopped && !message.streaming ? (
+                        <div className="stopped-note">
+                          <strong>{t.stopped}</strong>
+                          <span>{t.stoppedHint}</span>
+                        </div>
+                      ) : null}
                       {message.error ? (
                         <div className="fail">
                           <div className="fail-title">{t.failed}</div>
@@ -2718,13 +3272,21 @@ export default function App() {
                           </button>
                         </div>
                       ) : null}
+                      {message.role === "user" && editingMessageId !== message.id ? (
+                        <div className="user-actions">
+                          {message.queued ? <span className="queued-pill">{t.queuedToSend}</span> : null}
+                          <button className="ghost compact nowrap" type="button" onClick={() => startEditingMessage(message)}>
+                            {t.editMessage}
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
                   </article>
                 ))}
               </div>
             )}
           </section>
-          {showJumpToBottom && selected?.messages.length ? (
+          {showJumpToBottom && visibleMessages.length ? (
             <button
               className="jump-bottom"
               type="button"
@@ -2806,6 +3368,28 @@ export default function App() {
                 ))}
               </div>
             ) : null}
+            {queuedPrompts.length ? (
+              <div className="prompt-queue">
+                <div className="prompt-queue-head">
+                  <span>{t.queued} {queuedPrompts.length}</span>
+                  <em>{t.queuedNext}</em>
+                  <button className="ghost compact nowrap" type="button" onClick={clearQueue}>
+                    {t.clearQueue}
+                  </button>
+                </div>
+                {queuedPrompts.map((item) => (
+                  <div key={item.id} className="prompt-queue-item">
+                    <p>{item.text || t.pasteImage}</p>
+                    <button className="ghost compact nowrap" type="button" onClick={() => sendQueuedNow(item)}>
+                      {running ? t.interruptSend : t.sendNow}
+                    </button>
+                    <button className="ghost compact nowrap" type="button" onClick={() => removeQueued(item)}>
+                      {t.cancel}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <textarea
               ref={composerRef}
               rows={1}
@@ -2819,16 +3403,18 @@ export default function App() {
             />
             <div className="composer-bar">
               <Select
-                className="perm-chip"
-                value={settings.permissionMode}
-                onChange={(value) => patchSettings({ permissionMode: value })}
+                className="perm-mode"
+                dense
+                value={normalizePermissionMode(settings.permissionMode)}
+                onChange={(value) => setPermissionMode(value)}
                 variant="inline"
                 align="start"
                 ariaLabel={t.permissionMode}
-                prefix={<IconShield />}
                 options={PERMISSION_MODES.map((item) => ({
                   id: item.id,
                   label: lang === "en" ? item.labelEn : item.labelZh,
+                  hint: lang === "en" ? item.hintEn : item.hintZh,
+                  icon: permissionModeIcon(item.id, 13),
                 }))}
               />
               <button className="icon-btn context-btn" type="button" onClick={() => setShowContext((value) => !value)}>
@@ -3044,11 +3630,21 @@ export default function App() {
       ) : null}
 
       {pendingPermission ? (
-        <div className="overlay">
-          <div className="modal">
-            <h3>{t.needApprove}</h3>
-            <p>{pendingPermission.title}</p>
-            <div className="actions">
+        <div className="overlay ask-overlay">
+          <div className="ask-modal ask-modal-sm" role="dialog" aria-modal="true" aria-label={t.needApprove}>
+            <div className="ask-modal-head">
+              <div>
+                <div className="ask-kicker">{t.modeAsk}</div>
+                <h3>{t.needApprove}</h3>
+              </div>
+              <button className="icon-btn" type="button" title={t.cancel} onClick={() => void answerPermission(null)}>
+                <IconClose />
+              </button>
+            </div>
+            <div className="ask-modal-body">
+              <p className="ask-permission-title">{pendingPermission.title}</p>
+            </div>
+            <div className="ask-modal-actions">
               <button className="ghost" type="button" onClick={() => void answerPermission(null)}>
                 {t.reject}
               </button>
@@ -3068,53 +3664,76 @@ export default function App() {
       ) : null}
 
       {pendingQuestion ? (
-        <div className="overlay">
-          <div className="modal wide">
-            <h3>{t.grokNeedsChoice}</h3>
-            {pendingQuestion.questions.map((question) => (
-              <div key={question.question} className="question">
-                <strong>{question.question}</strong>
-                {question.options.map((option) => {
-                  const selectedOpts = questionAnswers[question.question] || [];
-                  const on = selectedOpts.includes(option.label);
-                  return (
-                    <label key={option.label} className="check">
-                      <input
-                        type={question.multiSelect ? "checkbox" : "radio"}
-                        checked={on}
-                        onChange={() => {
-                          setQuestionAnswers((current) => {
-                            const prev = current[question.question] || [];
-                            if (question.multiSelect) {
-                              return {
-                                ...current,
-                                [question.question]: on ? prev.filter((item) => item !== option.label) : [...prev, option.label],
-                              };
-                            }
-                            return { ...current, [question.question]: [option.label] };
-                          });
-                        }}
-                      />
-                      <span>
-                        {option.label}
-                        <em>{option.description}</em>
-                      </span>
-                    </label>
-                  );
-                })}
-                <input
-                  placeholder={lang === "en" ? "Optional notes" : "补充说明（可选）"}
-                  value={questionNotes[question.question] || ""}
-                  onChange={(event) => setQuestionNotes((current) => ({ ...current, [question.question]: event.target.value }))}
-                />
+        <div className="overlay ask-overlay">
+          <div className="ask-modal" role="dialog" aria-modal="true" aria-label={t.grokNeedsChoice}>
+            <div className="ask-modal-head">
+              <div>
+                <div className="ask-kicker">{pendingQuestion.planMode ? t.modePlan : t.modeAsk}</div>
+                <h3>{t.grokNeedsChoice}</h3>
               </div>
-            ))}
-            <div className="actions">
+              <button className="icon-btn" type="button" title={t.cancel} onClick={() => void answerQuestions("cancelled")}>
+                <IconClose />
+              </button>
+            </div>
+            <div className="ask-modal-body">
+              {pendingQuestion.questions.map((question) => {
+                const selectedOpts = questionAnswers[question.question] || [];
+                return (
+                  <div key={question.question} className="ask-question">
+                    <div className="ask-question-title">
+                      <strong>{question.question}</strong>
+                      <span>{question.multiSelect ? t.askSelectMany : t.askSelectOne}</span>
+                    </div>
+                    <div className="ask-options">
+                      {question.options.map((option) => {
+                        const on = selectedOpts.includes(option.label);
+                        return (
+                          <button
+                            key={option.label}
+                            type="button"
+                            className={`ask-option${on ? " on" : ""}`}
+                            onClick={() => {
+                              setQuestionAnswers((current) => {
+                                const prev = current[question.question] || [];
+                                if (question.multiSelect) {
+                                  return {
+                                    ...current,
+                                    [question.question]: on
+                                      ? prev.filter((item) => item !== option.label)
+                                      : [...prev, option.label],
+                                  };
+                                }
+                                return { ...current, [question.question]: [option.label] };
+                              });
+                            }}
+                          >
+                            <span className="ask-option-mark" aria-hidden />
+                            <span className="ask-option-copy">
+                              <strong>{option.label}</strong>
+                              {option.description ? <em>{option.description}</em> : null}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <input
+                      className="ask-note"
+                      placeholder={t.askOptionalNote}
+                      value={questionNotes[question.question] || ""}
+                      onChange={(event) =>
+                        setQuestionNotes((current) => ({ ...current, [question.question]: event.target.value }))
+                      }
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div className="ask-modal-actions">
               <button className="ghost" type="button" onClick={() => void answerQuestions("cancelled")}>
                 {t.cancel}
               </button>
               <button className="primary" type="button" onClick={() => void answerQuestions("accepted")}>
-                {t.submit}
+                {t.askContinue}
               </button>
             </div>
           </div>
@@ -3122,12 +3741,27 @@ export default function App() {
       ) : null}
 
       {pendingPlan ? (
-        <div className="overlay">
-          <div className="modal wide">
-            <h3>{t.reviewPlan}</h3>
-            <pre className="log">{pendingPlan.content}</pre>
-            <input value={planFeedback} placeholder={lang === "en" ? "Feedback" : "修改意见"} onChange={(event) => setPlanFeedback(event.target.value)} />
-            <div className="actions">
+        <div className="overlay ask-overlay">
+          <div className="ask-modal" role="dialog" aria-modal="true" aria-label={t.reviewPlan}>
+            <div className="ask-modal-head">
+              <div>
+                <div className="ask-kicker">{t.modePlan}</div>
+                <h3>{t.reviewPlan}</h3>
+              </div>
+              <button className="icon-btn" type="button" title={t.cancel} onClick={() => void answerPlan(false)}>
+                <IconClose />
+              </button>
+            </div>
+            <div className="ask-modal-body">
+              <pre className="ask-plan">{pendingPlan.content}</pre>
+              <input
+                className="ask-note"
+                value={planFeedback}
+                placeholder={lang === "en" ? "Feedback" : "修改意见"}
+                onChange={(event) => setPlanFeedback(event.target.value)}
+              />
+            </div>
+            <div className="ask-modal-actions">
               <button className="ghost" type="button" onClick={() => void answerPlan(false)}>
                 {t.requestChanges}
               </button>
