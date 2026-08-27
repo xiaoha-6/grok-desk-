@@ -16,6 +16,7 @@ pub const SKIP_DIRS: &[&str] = &[
     ".grok",
     "grokdesk-relay",
 ];
+pub const SHOW_DOT_DIRS: &[&str] = &[".vscode", ".cursor", ".github", ".grok"];
 pub const MAX_ENTRIES: usize = 250;
 pub const MAX_FILE_BYTES: u64 = 400_000;
 
@@ -53,7 +54,10 @@ pub fn list_workspace(root: &str, rel: Option<&str>) -> Result<Vec<WorkspaceEntr
             continue;
         }
         let is_dir = item.path().is_dir();
-        if is_dir && (name.starts_with('.') || SKIP_DIRS.contains(&name.as_str())) {
+        if is_dir && SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        if is_dir && name.starts_with('.') && !SHOW_DOT_DIRS.contains(&name.as_str()) {
             continue;
         }
         let child = if rel.unwrap_or("").is_empty() {
@@ -142,6 +146,212 @@ fn resolve_in_root(root: &str, rel: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
+pub fn write_workspace_file(root: &str, rel: &str, content: &str) -> Result<(), String> {
+    if content.len() as u64 > MAX_FILE_BYTES * 8 {
+        return Err("文件太大，无法写入".into());
+    }
+    let path = resolve_in_root_for_write(root, rel)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("无法创建目录：{err}"))?;
+    }
+    fs::write(&path, content.as_bytes()).map_err(|err| format!("无法写入文件：{err}"))
+}
+
+pub fn search_workspace(root: &str, query: &str, limit: usize) -> Result<Vec<WorkspaceEntry>, String> {
+    let root_path = resolve_in_root(root, "")?;
+    let needle = query.trim().to_ascii_lowercase();
+    let mut out = Vec::new();
+    walk_search(&root_path, "", &needle, limit.max(1).min(400), &mut out)?;
+    Ok(out)
+}
+
+fn walk_search(dir: &Path, rel: &str, needle: &str, limit: usize, out: &mut Vec<WorkspaceEntry>) -> Result<(), String> {
+    if out.len() >= limit {
+        return Ok(());
+    }
+    let reader = match fs::read_dir(dir) {
+        Ok(items) => items,
+        Err(_) => return Ok(()),
+    };
+    let mut entries: Vec<_> = reader.flatten().collect();
+    entries.sort_by_key(|item| item.file_name());
+    for item in entries {
+        if out.len() >= limit {
+            break;
+        }
+        let name = item.file_name().to_string_lossy().to_string();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let is_dir = item.path().is_dir();
+        if name.starts_with('.') || (is_dir && SKIP_DIRS.contains(&name.as_str())) {
+            continue;
+        }
+        let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let hay = child.to_ascii_lowercase();
+        if needle.is_empty() || hay.contains(needle) || name.to_ascii_lowercase().contains(needle) {
+            out.push(WorkspaceEntry {
+                name,
+                path: child.replace('\\', "/"),
+                is_dir,
+            });
+        }
+        if is_dir {
+            walk_search(&item.path(), &child, needle, limit, out)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrepHit {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+}
+
+pub fn grep_workspace(root: &str, query: &str, limit: usize) -> Result<Vec<GrepHit>, String> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_path = resolve_in_root(root, "")?;
+    let mut out = Vec::new();
+    walk_grep(&root_path, "", &needle.to_ascii_lowercase(), limit.max(1).min(80), &mut out)?;
+    Ok(out)
+}
+
+fn walk_grep(dir: &Path, rel: &str, needle: &str, limit: usize, out: &mut Vec<GrepHit>) -> Result<(), String> {
+    if out.len() >= limit {
+        return Ok(());
+    }
+    let reader = match fs::read_dir(dir) {
+        Ok(items) => items,
+        Err(_) => return Ok(()),
+    };
+    let mut entries: Vec<_> = reader.flatten().collect();
+    entries.sort_by_key(|item| item.file_name());
+    for item in entries {
+        if out.len() >= limit {
+            break;
+        }
+        let name = item.file_name().to_string_lossy().to_string();
+        if name == "." || name == ".." || name.starts_with('.') {
+            continue;
+        }
+        let is_dir = item.path().is_dir();
+        if is_dir && SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        if is_dir {
+            walk_grep(&item.path(), &child, needle, limit, out)?;
+            continue;
+        }
+        let meta = match fs::metadata(item.path()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if meta.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let bytes = match fs::read(item.path()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for (index, line) in text.lines().enumerate() {
+            if out.len() >= limit {
+                break;
+            }
+            if line.to_ascii_lowercase().contains(needle) {
+                let clipped: String = line.chars().take(160).collect();
+                out.push(GrepHit {
+                    path: child.replace('\\', "/"),
+                    line: (index + 1) as u32,
+                    text: clipped,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+const RULE_FILES: &[&str] = &["AGENTS.md", "GROK.md", ".cursorrules", ".grok/rules.md"];
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRules {
+    pub path: String,
+    pub content: String,
+}
+
+pub fn read_project_rules(root: &str) -> Result<Option<ProjectRules>, String> {
+    for rel in RULE_FILES {
+        if let Ok(file) = read_workspace_file(root, rel) {
+            return Ok(Some(ProjectRules {
+                path: (*rel).into(),
+                content: file.content,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub fn write_project_rules(root: &str, content: &str) -> Result<ProjectRules, String> {
+    let rel = RULE_FILES
+        .iter()
+        .find(|item| read_workspace_file(root, item).is_ok())
+        .copied()
+        .unwrap_or("AGENTS.md");
+    write_workspace_file(root, rel, content)?;
+    Ok(ProjectRules {
+        path: rel.into(),
+        content: content.to_string(),
+    })
+}
+
+fn resolve_in_root_for_write(root: &str, rel: &str) -> Result<PathBuf, String> {
+    let root = PathBuf::from(root.trim());
+    if root.as_os_str().is_empty() {
+        return Err("还没有工作目录".into());
+    }
+    let root = fs::canonicalize(&root).map_err(|err| format!("工作目录无效：{err}"))?;
+    let cleaned = rel.replace('\\', "/");
+    let mut cur = root.clone();
+    for part in cleaned.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err("路径不允许跳出工作目录".into());
+        }
+        cur.push(part);
+    }
+    if cur.exists() {
+        let canon = fs::canonicalize(&cur).unwrap_or(cur.clone());
+        if !canon.starts_with(&root) {
+            return Err("路径超出工作目录".into());
+        }
+        return Ok(canon);
+    }
+    if let Some(parent) = cur.parent() {
+        if parent.exists() {
+            let parent_canon = fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
+            if !parent_canon.starts_with(&root) {
+                return Err("路径超出工作目录".into());
+            }
+        } else if !parent.starts_with(&root) {
+            return Err("路径超出工作目录".into());
+        }
+    }
+    Ok(cur)
+}
+
 pub fn language_for_name(path: &str) -> String {
     match Path::new(path)
         .extension()
@@ -158,6 +368,7 @@ pub fn language_for_name(path: &str) -> String {
         "json" => "json".into(),
         "toml" => "toml".into(),
         "md" => "markdown".into(),
+        "lua" => "lua".into(),
         "css" => "css".into(),
         "html" => "html".into(),
         "yml" | "yaml" => "yaml".into(),
@@ -206,6 +417,9 @@ mod tests {
         assert_eq!(file.language, "rust");
         assert_eq!(language_for_name("src/main.rs"), "rust");
         assert!(file.content.contains("fn main"));
+        write_workspace_file(root, "src/main.rs", "fn main() { println!(\"hi\"); }\n").unwrap();
+        let updated = read_workspace_file(root, "src/main.rs").unwrap();
+        assert!(updated.content.contains("println"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

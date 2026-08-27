@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { fileLabel, lineDiff } from "./diff";
+import { CodeDiffView } from "./CodeDiffView";
 import { CategoryIcon, EventKindIcon, IconChevronRight } from "./icons";
 import {
   categoryTitle,
@@ -14,33 +14,8 @@ import {
   visibleEvents,
   type ActivityCategory,
 } from "./timeline";
-import type { FileDiff, Lang, TimelineEvent } from "./types";
-
-function CodeDiff({ diff, lang }: { diff: FileDiff; lang: Lang }) {
-  const oldText = diff.oldText.length > 8000 ? `${diff.oldText.slice(0, 8000)}\n…` : diff.oldText;
-  const newText = diff.newText.length > 8000 ? `${diff.newText.slice(0, 8000)}\n…` : diff.newText;
-  const lines = lineDiff(oldText, newText);
-  const path = fileLabel(diff.path);
-  return (
-    <div className="code-diff">
-      {path ? <div className="diff-path">{path}</div> : null}
-      <div className="diff-body">
-        {lines.length ? (
-          lines.map((line, index) => (
-            <div key={`${line.kind}-${index}`} className={`diff-line ${line.kind}`}>
-              <span className="diff-mark">{line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}</span>
-              <span className="diff-text">{line.text || " "}</span>
-            </div>
-          ))
-        ) : (
-          <div className="diff-line eq">
-            <span className="diff-text">{lang === "en" ? "No changes" : "无改动"}</span>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
+import type { Lang, TimelineEvent } from "./types";
+import { fill, t as translate } from "./i18n";
 
 function Disclosure({
   open,
@@ -67,6 +42,7 @@ function clip(text: string, max = 1600) {
 }
 
 function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang; startOpen?: boolean }) {
+  const copy = translate(lang);
   const hasDiff = Boolean(event.diffs?.length);
   const [open, setOpen] = useState(Boolean(startOpen && (hasDiff || event.kind === "edit" || event.status === "in_progress")));
   const status = event.status ? statusLabel(event.status, lang) : "";
@@ -88,11 +64,11 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
       {open ? (
         <div className="timeline-detail">
           {hasDiff
-            ? event.diffs!.map((diff, index) => <CodeDiff key={`${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />)
+            ? event.diffs!.map((diff, index) => <CodeDiffView key={`${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />)
             : null}
           {!hasDiff && event.input ? (
             <div className="timeline-block">
-              <div className="timeline-kicker">{lang === "en" ? "Input" : "输入"}</div>
+              <div className="timeline-kicker">{copy.input}</div>
               <pre>{clip(event.input)}</pre>
             </div>
           ) : null}
@@ -102,7 +78,7 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
             ) : (
               <div className="timeline-block">
                 <div className="timeline-kicker">
-                  {event.kind === "plan" ? (lang === "en" ? "Plan" : "内容") : lang === "en" ? "Result" : "结果"}
+                  {event.kind === "plan" ? copy.content : copy.result}
                 </div>
                 <pre>{clip(event.output)}</pre>
               </div>
@@ -141,7 +117,7 @@ function CategoryGroup({
         <div className="timeline-children">
           {hidden > 0 ? (
             <div className="timeline-folded">
-              {lang === "en" ? `${hidden} earlier steps folded` : `已折叠 ${hidden} 个早期步骤`}
+              {fill(translate(lang).foldedSteps, { n: hidden })}
             </div>
           ) : null}
           {shown.map((event) => (
@@ -223,7 +199,7 @@ export function InlineEdits({
           </div>
           {event.diffs?.length
             ? event.diffs.map((diff, index) => (
-                <CodeDiff key={`${event.id}-${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />
+                <CodeDiffView key={`${event.id}-${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />
               ))
             : event.input || event.output ? (
               <pre className="inline-edit-body">{clip(event.input || event.output || "", 6000)}</pre>
@@ -256,7 +232,7 @@ export function ActivityTimeline({
         <span className="timeline-ico">
           <CategoryIcon category="reasoning" />
         </span>
-        <span>{lang === "en" ? "Process" : "过程"}</span>
+        <span>{translate(lang).process}</span>
         <span className="timeline-count">{visible.length}</span>
       </Disclosure>
       {open ? (

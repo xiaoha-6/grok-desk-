@@ -554,9 +554,7 @@ struct SidebarAccountFooter: View {
 
     private var quotaText: String {
         if let remaining = active?.quota?.weeklyRemainingPercent {
-            return model.settings.effectiveLanguage == "en"
-                ? "\(Int(remaining.rounded()))% weekly usage remaining"
-                : "本周剩余 \(Int(remaining.rounded()))%"
+            return L10n.format("本周剩余 %d%%", language: model.settings.effectiveLanguage, Int(remaining.rounded()))
         }
         return L10n.text(model.accounts.isEmpty ? "尚未配置" : "额度待刷新", language: model.settings.effectiveLanguage)
     }
@@ -677,7 +675,7 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, 34).padding(.top, 34).padding(.bottom, 28)
                 }
-                .defaultScrollAnchor(.bottom)
+                .defaultScrollAnchor(isNearLatestMessage ? .bottom : .top)
                 .coordinateSpace(name: "chat-message-scroll")
                 .onPreferenceChange(ChatLatestMessagePositionKey.self) { bottomY in
                     isNearLatestMessage = bottomY <= viewport.size.height + 72
@@ -704,6 +702,9 @@ struct ChatView: View {
                 .onChange(of: latestMessageSignal) { _, _ in
                     guard isNearLatestMessage else { return }
                     scheduleFollowLatest(proxy, conversationID: model.selectedConversationID)
+                }
+                .onChange(of: isNearLatestMessage) { _, nearLatest in
+                    if !nearLatest { followLatestTask?.cancel() }
                 }
                 .onDisappear { followLatestTask?.cancel() }
             }
@@ -1371,7 +1372,7 @@ private struct TimelineEventRow: View {
         VStack(alignment: .leading, spacing: 0) {
             TimelineDisclosureButton(isExpanded: $expanded) {
                 Image(systemName: icon).frame(width: 13)
-                Text(L10n.text(event.title, language: locale.identifier.hasPrefix("en") ? "en" : "zh-Hans")).lineLimit(1)
+                Text(L10n.text(event.title, language: L10n.languageCode(from: locale))).lineLimit(1)
                 if let status = event.status, !status.isEmpty {
                     Text(LocalizedStringKey(statusLabel(status))).foregroundStyle(statusColor(status))
                 }
@@ -2351,8 +2352,8 @@ struct SettingsView: View {
                 Divider()
                 SettingsRow(title: "语言", detail: "切换 GrokDesk 界面语言") {
                     Picker("语言", selection: appLanguage) {
-                        // Language names use endonyms so users can always recognize the switch target.
                         Text(verbatim: "简体中文").tag("zh-Hans")
+                        Text(verbatim: "繁體中文").tag("zh-Hant")
                         Text(verbatim: "English").tag("en")
                     }.labelsHidden().frame(width: 150)
                 }

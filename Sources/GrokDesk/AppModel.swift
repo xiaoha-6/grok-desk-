@@ -197,7 +197,7 @@ final class AppModel: ObservableObject {
     }
 
     func completeLanguageOnboarding(language: String) {
-        guard ["zh-Hans", "en"].contains(language) else { return }
+        guard ["zh-Hans", "zh-Hant", "en"].contains(language) else { return }
         settings.language = language
         settings.hasCompletedLanguageOnboarding = true
         needsLanguageOnboarding = false
@@ -296,15 +296,13 @@ final class AppModel: ObservableObject {
             case .success(let binary):
                 self.settings.grokBinary = binary
                 self.runtimeInstallSucceeded = true
-                self.runtimeInstallLog += self.settings.effectiveLanguage == "en"
-                    ? "Installed successfully: \(binary)\n"
-                    : "安装完成：\(binary)\n"
+                self.runtimeInstallLog += L10n.format("安装完成：%@", language: self.settings.effectiveLanguage, binary) + "\n"
                 self.statusText = L10n.text("Grok Build 已安装", language: self.settings.effectiveLanguage)
                 self.persist()
                 self.refreshAvailableModels()
             case .failure(let error):
                 self.runtimeInstallError = error.localizedDescription
-                self.runtimeInstallLog += (self.settings.effectiveLanguage == "en" ? "Installation failed: " : "安装失败：")
+                self.runtimeInstallLog += L10n.text("安装失败：", language: self.settings.effectiveLanguage)
                     + error.localizedDescription + "\n"
                 self.statusText = L10n.text("Grok Build 安装失败", language: self.settings.effectiveLanguage)
             }

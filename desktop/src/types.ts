@@ -1,3 +1,7 @@
+import type { Lang } from "./i18n";
+
+export type { Lang };
+
 export type RuntimeStatus = {
   installed: boolean;
   path: string | null;
@@ -32,14 +36,93 @@ export type SessionInfo = {
 };
 
 export type DiffLine = {
+  kind: "eq" | "del" | "add" | "collapse";
+  text: string;
+};
+
+export type TokenSpan = {
   kind: "eq" | "del" | "add";
   text: string;
+};
+
+export type AnnotatedDiffLine = {
+  kind: "eq" | "del" | "add" | "collapse";
+  text: string;
+  oldNo?: number;
+  newNo?: number;
+  tokens?: TokenSpan[];
 };
 
 export type WorkspaceEntry = {
   name: string;
   path: string;
   isDir: boolean;
+};
+
+export type GrepHit = {
+  path: string;
+  line: number;
+  text: string;
+};
+
+export type ProjectRules = {
+  path: string;
+  content: string;
+};
+
+export type GitFile = {
+  path: string;
+  status: string;
+  staged?: boolean;
+};
+
+export type GitRemote = {
+  name: string;
+  url: string;
+};
+
+export type GitStatus = {
+  available: boolean;
+  branch: string;
+  ahead: number;
+  behind: number;
+  dirty: boolean;
+  files: GitFile[];
+  remotes?: GitRemote[];
+  message: string;
+};
+
+export type GitCommit = {
+  hash: string;
+  short: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  relTime: string;
+  refs: string;
+};
+
+export type GitReview = {
+  base: string;
+  files: string[];
+  diff: string;
+};
+
+export type GithubRepo = {
+  name: string;
+  url: string;
+};
+
+export type GithubIdentity = {
+  login: string;
+  name: string;
+  source: string;
+  repos: GithubRepo[];
+};
+
+export type SnapshotFile = {
+  path: string;
+  content: string | null;
 };
 
 export type FileDiff = {
@@ -289,9 +372,12 @@ export type AppSettings = {
   extraArguments: string;
   routingMode: string;
   preferredAccountId?: string | null;
+  keybindings?: Record<string, string>;
+  gitAutoCommit?: boolean;
+  gitAutoPush?: boolean;
+  gitAutoCommitMessage?: string;
 };
 
-export type Lang = "zh" | "en";
 export type Theme = "system" | "light" | "dark";
 export type View = "chat" | "settings";
 export type SettingsPage =
@@ -301,6 +387,7 @@ export type SettingsPage =
   | "ssh"
   | "agent"
   | "compatibility"
+  | "keyboard"
   | "skills"
   | "accounts"
   | "archived";
@@ -364,36 +451,46 @@ export const PERMISSION_MODES = [
   {
     id: "default",
     labelZh: "每次确认",
+    labelHant: "每次確認",
     labelEn: "Ask before edits",
     hintZh: "改文件或跑命令前都先问你",
+    hintHant: "改檔案或跑命令前都先問你",
     hintEn: "Ask before file edits and shell commands",
   },
   {
     id: "acceptEdits",
     labelZh: "自动接受编辑",
+    labelHant: "自動接受編輯",
     labelEn: "Accept edits",
     hintZh: "文件修改自动通过，其它操作仍会确认",
+    hintHant: "檔案修改自動通過，其它操作仍會確認",
     hintEn: "Auto-approve file edits; still confirm other actions",
   },
   {
     id: "plan",
     labelZh: "规划模式",
+    labelHant: "規劃模式",
     labelEn: "Plan mode",
     hintZh: "先出计划，你确认后再动手",
+    hintHant: "先出計畫，你確認後再動手",
     hintEn: "Draft a plan first, then wait for approval",
   },
   {
     id: "auto",
     labelZh: "自动执行",
+    labelHant: "自動執行",
     labelEn: "Auto",
     hintZh: "工具调用自动执行，少打断",
+    hintHant: "工具呼叫自動執行，少打斷",
     hintEn: "Run tools automatically with fewer prompts",
   },
   {
     id: "bypassPermissions",
     labelZh: "完全访问",
+    labelHant: "完全存取",
     labelEn: "Full access",
     hintZh: "跳过确认（高风险）",
+    hintHant: "略過確認（高風險）",
     hintEn: "Skip confirmations (higher risk)",
   },
 ];
@@ -406,16 +503,20 @@ export function normalizePermissionMode(mode: string | undefined | null): string
   return value;
 }
 
-export function permissionModeLabel(mode: string | undefined | null, lang: "zh" | "en") {
+export function permissionModeLabel(mode: string | undefined | null, lang: Lang) {
   const id = normalizePermissionMode(mode);
   const item = PERMISSION_MODES.find((entry) => entry.id === id) || PERMISSION_MODES[0];
-  return lang === "en" ? item.labelEn : item.labelZh;
+  if (lang === "en") return item.labelEn;
+  if (lang === "zh-Hant") return item.labelHant;
+  return item.labelZh;
 }
 
-export function permissionModeHint(mode: string | undefined | null, lang: "zh" | "en") {
+export function permissionModeHint(mode: string | undefined | null, lang: Lang) {
   const id = normalizePermissionMode(mode);
   const item = PERMISSION_MODES.find((entry) => entry.id === id) || PERMISSION_MODES[0];
-  return lang === "en" ? item.hintEn : item.hintZh;
+  if (lang === "en") return item.hintEn;
+  if (lang === "zh-Hant") return item.hintHant;
+  return item.hintZh;
 }
 
 export function defaultSettings(): AppSettings {
@@ -431,5 +532,9 @@ export function defaultSettings(): AppSettings {
     extraArguments: "",
     routingMode: "quota",
     preferredAccountId: null,
+    keybindings: {},
+    gitAutoCommit: false,
+    gitAutoPush: false,
+    gitAutoCommitMessage: "xiaoha: {title}",
   };
 }

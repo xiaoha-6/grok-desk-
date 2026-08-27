@@ -1,4 +1,5 @@
-import type { TimelineEvent } from "./types";
+import type { Lang, TimelineEvent } from "./types";
+import { t as translate } from "./i18n";
 
 export type ActivityCategory =
   | "reasoning"
@@ -36,32 +37,21 @@ const REDUNDANT = new Set([
   "updating plan",
 ]);
 
-export function categoryTitle(category: ActivityCategory, lang: "zh" | "en") {
-  const zh: Record<ActivityCategory, string> = {
-    reasoning: "思考过程",
-    skills: "Skills 与扩展",
-    files: "文件与搜索",
-    commands: "命令与任务",
-    hooks: "Hooks",
-    context: "上下文与记忆",
-    plan: "执行计划",
-    interactions: "权限与交互",
-    system: "运行与系统",
-    other: "其他操作",
+export function categoryTitle(category: ActivityCategory, lang: Lang) {
+  const copy = translate(lang);
+  const titles: Record<ActivityCategory, string> = {
+    reasoning: copy.catReasoning,
+    skills: copy.catSkills,
+    files: copy.catFiles,
+    commands: copy.catCommands,
+    hooks: copy.catHooks,
+    context: copy.catContext,
+    plan: copy.catPlan,
+    interactions: copy.catInteractions,
+    system: copy.catSystem,
+    other: copy.catOther,
   };
-  const en: Record<ActivityCategory, string> = {
-    reasoning: "Thinking",
-    skills: "Skills & extensions",
-    files: "Files & search",
-    commands: "Commands & tasks",
-    hooks: "Hooks",
-    context: "Context & memory",
-    plan: "Plan",
-    interactions: "Permissions",
-    system: "Runtime",
-    other: "Other",
-  };
-  return lang === "en" ? en[category] : zh[category];
+  return titles[category];
 }
 
 export function isEditEvent(event: TimelineEvent) {
@@ -91,15 +81,16 @@ export function isCommandEvent(event: TimelineEvent) {
   ].some((item) => haystack.includes(item));
 }
 
-export function commandTitle(event: TimelineEvent, lang: "zh" | "en") {
+export function commandTitle(event: TimelineEvent, lang: Lang) {
+  const copy = translate(lang);
   const haystack = `${event.kind} ${event.title}`.toLowerCase();
   if (haystack.includes("compile") || haystack.includes("build") || haystack.includes("cargo") || haystack.includes("pnpm")) {
-    return lang === "en" ? "Build" : "编译";
+    return copy.cmdBuild;
   }
   if (haystack.includes("terminal") || haystack.includes("shell") || haystack.includes("bash")) {
-    return lang === "en" ? "Terminal" : "终端";
+    return copy.cmdTerminal;
   }
-  return lang === "en" ? "Command" : "命令";
+  return copy.cmdCommand;
 }
 
 export function editTitle(event: TimelineEvent) {
@@ -162,14 +153,15 @@ export function groupRuns(events: TimelineEvent[]): ActivityRun[] {
   return result;
 }
 
-export function statusLabel(status: string, lang: "zh" | "en") {
+export function statusLabel(status: string, lang: Lang) {
+  const copy = translate(lang);
   const value = status.toLowerCase();
-  if (value === "completed" || value === "success") return lang === "en" ? "Done" : "完成";
-  if (value === "failed" || value === "error") return lang === "en" ? "Failed" : "失败";
-  if (value === "pending") return lang === "en" ? "Pending" : "等待";
-  if (value === "in_progress" || value === "running") return lang === "en" ? "Running" : "运行中";
-  if (value === "approved") return lang === "en" ? "Approved" : "已允许";
-  if (value === "cancelled") return lang === "en" ? "Cancelled" : "已取消";
+  if (value === "completed" || value === "success") return copy.statusDone;
+  if (value === "failed" || value === "error") return copy.statusFailed;
+  if (value === "pending") return copy.statusPending;
+  if (value === "in_progress" || value === "running") return copy.statusRunning;
+  if (value === "approved") return copy.statusApproved;
+  if (value === "cancelled") return copy.statusCancelled;
   return status;
 }
 

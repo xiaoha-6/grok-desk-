@@ -9,8 +9,8 @@ enum ChatInitialScrollRegression {
                 "the bounded recent-message window must be measured eagerly before applying its bottom anchor")
         require(!source.contains("LazyVStack(alignment: .leading, spacing: 26)"),
                 "the transcript still uses lazy height estimation that can position the viewport in blank space")
-        require(source.contains(".defaultScrollAnchor(.bottom)"),
-                "the measured transcript must begin directly at its latest message")
+        require(source.contains(".defaultScrollAnchor(isNearLatestMessage ? .bottom : .top)"),
+                "the transcript must follow the latest message only while the viewport is already near the bottom")
         require(source.contains("private static let messagePageSize = 12"),
                 "long chats must render a small, bounded initial message page")
         require(!source.contains("visibleMessageLimit = 80"),

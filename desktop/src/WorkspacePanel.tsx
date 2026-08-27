@@ -4,11 +4,21 @@ import "./monacoSetup";
 import Editor, { DiffEditor } from "@monaco-editor/react";
 import { Tree, type NodeRendererProps, type TreeApi } from "react-arborist";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
-import { fileLabel } from "./diff";
+import { diffStats, fileLabel, applyHunk, diffHunks, type DiffHunk } from "./diff";
 import { FileKindIcon, fileBadge, fileExtension } from "./fileIcons";
-import { IconChevronRight, IconClose } from "./icons";
+import { HunkOverlay } from "./HunkOverlay";
+import { IconCheck, IconChevronRight, IconClose, IconCodePane, IconDebug, IconFiles, IconGit, IconPanelLeft, IconUndo } from "./icons";
 import type { Copy } from "./i18n";
-import type { FileDiff, SshTarget, WorkspaceEntry } from "./types";
+import { fill } from "./i18n";
+import { chordsMatch, toMonacoKeybinding, withShortcut } from "./keybindings";
+import { MarkdownPreview } from "./MarkdownPreview";
+import { MONACO_THEME_DARK, MONACO_THEME_LIGHT } from "./monacoTheme";
+import { RunDebugView } from "./RunDebugView";
+import { SourceControlView } from "./SourceControlView";
+import type { PanelChannel } from "./TerminalPanel";
+import type { RunJob } from "./launch";
+import type { FileDiff, GitStatus, ProjectRules, SshTarget, WorkspaceEntry } from "./types";
+import type { editor as MonacoNs } from "monaco-editor";  
 
 export type { WorkspaceEntry };
 
@@ -41,23 +51,54 @@ type Props = {
   focusPath?: string;
   focusTick?: number;
   copy: Copy;
+  side?: "left" | "right";
   onClose: () => void;
+  onMoveSide?: () => void;
   onPickFolder?: () => void;
   onConnectSsh?: () => void;
   width?: number;
+  restoreTick?: number;
+  saveChord?: string;
+  gitAutoCommit?: boolean;
+  gitAutoPush?: boolean;
+  gitAutoCommitMessage?: string;
+  onGitSettings?: (patch: { gitAutoCommit?: boolean; gitAutoPush?: boolean; gitAutoCommitMessage?: string }) => void;
+  onRun?: (job: RunJob) => void;
+  onOpenPanel?: (channel: PanelChannel) => void;
+  onLog?: (line: string) => void;
+  onAskAgent?: (text: string) => void;
 };
 
-export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focusTick = 0, copy, onClose, onPickFolder, onConnectSsh, width }: Props) {
+export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focusTick = 0, restoreTick = 0, saveChord = "mod+s", copy, side = "right", onClose, onMoveSide, onPickFolder, onConnectSsh, width, gitAutoCommit = false, gitAutoPush = false, gitAutoCommitMessage = "xiaoha: {title}", onGitSettings, onRun, onOpenPanel, onLog, onAskAgent }: Props) {
   const [expanded, setExpanded] = useState<Record<string, WorkspaceEntry[]>>({});
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activePath, setActivePath] = useState("");
   const [file, setFile] = useState<WorkspaceFile | null>(null);
   const [error, setError] = useState("");
   const [tab, setTab] = useState<"file" | "diff">("file");
+  const [sideBySide, setSideBySide] = useState(false);
+  const [mdMode, setMdMode] = useState<"preview" | "source" | "split">("preview");
+  const [reviews, setReviews] = useState<Record<string, { incoming: string; oldText: string; newText: string }>>({});
+  const [reviewEditor, setReviewEditor] = useState<MonacoNs.IStandaloneCodeEditor | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [git, setGit] = useState<GitStatus | null>(null);
+  const [activity, setActivity] = useState<"files" | "scm" | "run">("files");
+  const [gitBusy, setGitBusy] = useState(false);
+  const [scmDiffs, setScmDiffs] = useState<Record<string, FileDiff>>({});
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [rules, setRules] = useState<ProjectRules | null>(null);
+  const [rulesDraft, setRulesDraft] = useState("");
+  const [pendingClose, setPendingClose] = useState<{ kind: "tab" | "panel"; path?: string } | null>(null);
   const filesRef = useRef<Record<string, WorkspaceFile>>({});
   const openTabsRef = useRef<OpenTab[]>([]);
   const activePathRef = useRef("");
   const cwdRef = useRef(cwd);
+  const draftsRef = useRef<Record<string, string>>({});
+  const scmDiffsRef = useRef<Record<string, FileDiff>>({});
+  const saveFileRef = useRef<(rel?: string) => Promise<boolean>>(async () => false);
+  const fileEditorRef = useRef<MonacoNs.IStandaloneCodeEditor | null>(null);
+  const saveChordRef = useRef(saveChord);
+  saveChordRef.current = saveChord;
   const tabStripRef = useRef<HTMLDivElement | null>(null);
   const treeRef = useRef<TreeApi<TreeNode> | undefined>(undefined);
   const expandedRef = useRef(expanded);
@@ -66,6 +107,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   openTabsRef.current = openTabs;
   activePathRef.current = activePath;
   cwdRef.current = cwd;
+  draftsRef.current = drafts;
   const treeHost = useElementSize();
   const editorTheme = useEditorTheme();
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
@@ -83,8 +125,11 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
       const rel = toRelative(cwd, diff.path || "");
       if (rel) map.set(rel, diff);
     }
+    for (const [rel, diff] of Object.entries(scmDiffs)) {
+      map.set(rel, diff);
+    }
     return map;
-  }, [cwd, diffs]);
+  }, [cwd, diffs, scmDiffs]);
 
   const loadDir = useCallback(
     async (rel: string, force = false) => {
@@ -110,6 +155,16 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     activePathRef.current = "";
     setError("");
     setTab("file");
+    setMdMode("preview");
+    setReviews({});
+    setReviewEditor(null);
+    setDrafts({});
+    setScmDiffs({});
+    scmDiffsRef.current = {};
+    setGit(null);
+    setActivity("files");
+    setRulesOpen(false);
+    setPendingClose(null);
     void loadDir("", true);
   }, [cwd, loadDir]);
 
@@ -117,8 +172,9 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     async (rel: string) => {
       if (!cwd || !rel) return;
       try {
-        const next = await invoke<WorkspaceFile>("read_workspace_file", { root: cwd, path: rel, ssh: ssh || null });
+        const loaded = await invoke<WorkspaceFile>("read_workspace_file", { root: cwd, path: rel, ssh: ssh || null });
         if (cwdRef.current !== cwd) return;
+        const next = isBinaryFile(rel, loaded.content) ? { ...loaded, language: "binary", content: "", truncated: true } : loaded;
         filesRef.current[rel] = next;
         if (activePathRef.current === rel) {
           setFile(next);
@@ -126,6 +182,23 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         }
       } catch (err) {
         if (cwdRef.current !== cwd) return;
+        if (isFolderError(err)) {
+          delete filesRef.current[rel];
+          setOpenTabs((current) => {
+            const nextTabs = current.filter((item) => item.path !== rel);
+            openTabsRef.current = nextTabs;
+            return nextTabs;
+          });
+          if (activePathRef.current === rel) {
+            setFile(null);
+            setError("");
+            setActivePath("");
+            activePathRef.current = "";
+          }
+          setActivity("files");
+          void loadDir(rel);
+          return;
+        }
         delete filesRef.current[rel];
         if (activePathRef.current === rel) {
           setFile(null);
@@ -133,12 +206,12 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         }
       }
     },
-    [cwd, ssh],
+    [cwd, loadDir, ssh],
   );
 
   const showTab = useCallback(
     (item: OpenTab) => {
-      const view = item.view === "diff" && diffByPath.has(item.path) ? "diff" : "file";
+      const view = item.view === "diff" && (diffByPath.has(item.path) || Boolean(scmDiffsRef.current[item.path])) ? "diff" : "file";
       activePathRef.current = item.path;
       setActivePath(item.path);
       setTab(view);
@@ -152,9 +225,18 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   const openFile = useCallback(
     async (rel: string, preferDiff = false) => {
       if (!cwd || !rel) return;
+      const normalized = rel.replace(/\/+$/, "");
+      const listed = Object.values(expandedRef.current)
+        .flat()
+        .find((item) => item.path === rel || item.path === normalized);
+      if (listed?.isDir || rel.endsWith("/")) {
+        setActivity("files");
+        void loadDir(normalized);
+        return;
+      }
       const existing = openTabsRef.current.find((item) => item.path === rel);
       const view: "file" | "diff" =
-        preferDiff && diffByPath.has(rel) ? "diff" : existing ? existing.view : "file";
+        preferDiff && (diffByPath.has(rel) || Boolean(scmDiffsRef.current[rel])) ? "diff" : existing ? existing.view : "file";
       const nextTab = { path: rel, view };
       const nextTabs = existing
         ? openTabsRef.current.map((item) => (item.path === rel ? nextTab : item))
@@ -164,11 +246,48 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
       showTab(nextTab);
       await loadFile(rel);
     },
-    [cwd, diffByPath, loadFile, showTab],
+    [cwd, diffByPath, loadDir, loadFile, showTab],
   );
 
+  const openGitDiff = useCallback(
+    async (rel: string, staged = false) => {
+      if (!cwd || !rel) return;
+      try {
+        const diff = await invoke<{ path: string; oldText: string; newText: string }>("git_file_diff", {
+          root: cwd,
+          path: rel,
+          staged,
+          ssh: ssh || null,
+        });
+        const next = { path: rel, oldText: diff.oldText || "", newText: diff.newText || "" };
+        scmDiffsRef.current = { ...scmDiffsRef.current, [rel]: next };
+        setScmDiffs(scmDiffsRef.current);
+        await openFile(rel, next.oldText !== next.newText);
+      } catch (err) {
+        setError(String(err));
+        await openFile(rel);
+      }
+    },
+    [cwd, openFile, ssh],
+  );
+
+  const isDirty = useCallback((rel: string) => {
+    const draft = draftsRef.current[rel];
+    if (draft == null) return false;
+    return draft !== (filesRef.current[rel]?.content ?? "");
+  }, []);
+
   const closeTab = useCallback(
-    (rel: string) => {
+    (rel: string, force = false) => {
+      if (!force && isDirty(rel)) {
+        setPendingClose({ kind: "tab", path: rel });
+        return;
+      }
+      setDrafts((current) => {
+        const next = { ...current };
+        delete next[rel];
+        return next;
+      });
       const current = openTabsRef.current;
       const index = current.findIndex((item) => item.path === rel);
       if (index < 0) return;
@@ -176,6 +295,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
       openTabsRef.current = nextTabs;
       setOpenTabs(nextTabs);
       delete filesRef.current[rel];
+      if (pendingClose?.path === rel) setPendingClose(null);
       if (activePathRef.current !== rel) return;
       const neighbor = nextTabs[index] || nextTabs[index - 1];
       if (!neighbor) {
@@ -188,7 +308,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
       }
       showTab(neighbor);
     },
-    [showTab],
+    [isDirty, pendingClose?.path, showTab],
   );
 
   const setActiveView = useCallback((view: "file" | "diff") => {
@@ -269,9 +389,150 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
 
   const activeRel = toRelative(cwd, activePath || file?.path || "");
   const activeDiff = diffByPath.get(activeRel);
-  const showDiff = tab === "diff" && Boolean(activeDiff);
+  const incomingKey = activeDiff
+    ? `${activeDiff.oldText.length}:${activeDiff.newText.length}:${activeDiff.oldText.slice(0, 48)}:${activeDiff.newText.slice(0, 48)}`
+    : "";
+  const review = activeRel && activeDiff
+    ? reviews[activeRel]?.incoming === incomingKey
+      ? reviews[activeRel]
+      : { incoming: incomingKey, oldText: activeDiff.oldText, newText: activeDiff.newText }
+    : null;
+  const hunks = review ? diffHunks(review.oldText, review.newText) : [];
+  const showDiff = tab === "diff" && Boolean(review) && hunks.length > 0;
   const language = monacoLanguage(file?.language || "", file?.path || activeRel);
+  const isMd = isMarkdownPath(activeRel, file?.language || language);
+  const previewText = review?.newText ?? drafts[activeRel] ?? file?.content ?? "";
+  const showPreview = isMd && (mdMode === "preview" || mdMode === "split");
+  const showCode = !isMd || mdMode !== "preview" || showDiff;
+  const stats = review ? diffStats(review.oldText, review.newText) : null;
+  const diffOptions = useMemo(() => monacoDiffOptions(sideBySide, hunks.length > 0), [sideBySide, hunks.length]);
+  const editorOptions = useMemo(() => monacoFileOptions(Boolean(file?.truncated), hunks.length > 0), [file?.truncated, hunks.length]);
   const hasOpenTabs = openTabs.length > 0;
+
+  useEffect(() => {
+    setReviewEditor(null);
+    setMdMode(isMarkdownPath(activeRel) ? "preview" : "source");
+  }, [activeRel]);
+
+  const writeActive = useCallback(
+    async (rel: string, content: string) => {
+      await invoke("write_workspace_file", { root: cwd, path: rel, content, ssh: ssh || null });
+      const prev = filesRef.current[rel];
+      const next: WorkspaceFile = {
+        path: rel,
+        language: prev?.language || "text",
+        content,
+        truncated: false,
+        size: content.length,
+      };
+      filesRef.current[rel] = next;
+      setDrafts((current) => {
+        if (current[rel] == null) return current;
+        const copyDraft = { ...current };
+        delete copyDraft[rel];
+        return copyDraft;
+      });
+      if (activePathRef.current === rel) setFile(next);
+    },
+    [cwd, ssh],
+  );
+
+  const refreshGit = useCallback(async () => {
+    if (!cwd) {
+      setGit(null);
+      return;
+    }
+    try {
+      const next = await invoke<GitStatus>("git_status", { root: cwd, ssh: ssh || null });
+      setGit(next);
+    } catch {
+      setGit(null);
+    }
+  }, [cwd, ssh]);
+
+  const saveFile = useCallback(
+    async (rel?: string) => {
+      const path = rel || activePathRef.current;
+      if (!path || !isDirty(path)) return false;
+      const content = draftsRef.current[path];
+      if (content == null) return false;
+      try {
+        await writeActive(path, content);
+        setError("");
+        void refreshGit();
+        return true;
+      } catch (err) {
+        setError(String(err));
+        return false;
+      }
+    },
+    [isDirty, refreshGit, writeActive],
+  );
+  saveFileRef.current = saveFile;
+
+  const requestClosePanel = useCallback(() => {
+    const dirtyTab = openTabsRef.current.find((item) => isDirty(item.path));
+    if (dirtyTab) {
+      setPendingClose({ kind: "panel", path: dirtyTab.path });
+      showTab(dirtyTab);
+      return;
+    }
+    onClose();
+  }, [isDirty, onClose, showTab]);
+
+  useEffect(() => {
+    void refreshGit();
+  }, [refreshGit, restoreTick]);
+
+  useEffect(() => {
+    if (activity !== "scm" || !cwd) return;
+    const timer = window.setInterval(() => void refreshGit(), 4000);
+    return () => window.clearInterval(timer);
+  }, [activity, cwd, refreshGit]);
+
+  useEffect(() => {
+    if (!restoreTick) return;
+    setDrafts({});
+    for (const tab of openTabsRef.current) void loadFile(tab.path);
+  }, [loadFile, restoreTick]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!chordsMatch(event, saveChordRef.current)) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA") && !target.closest(".workspace")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void saveFileRef.current();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+
+  const applyReview = useCallback(
+    async (action: "accept" | "reject", hunk?: DiffHunk) => {
+      if (!activeRel || !review) return;
+      const next = hunk
+        ? applyHunk(review.oldText, review.newText, hunk, action)
+        : action === "accept"
+          ? { oldText: review.newText, newText: review.newText }
+          : { oldText: review.oldText, newText: review.oldText };
+      setReviews((current) => ({
+        ...current,
+        [activeRel]: { incoming: incomingKey, ...next },
+      }));
+      if (next.newText !== review.newText) {
+        try {
+          await writeActive(activeRel, next.newText);
+          setError("");
+        } catch (err) {
+          setError(String(err));
+        }
+      }
+      if (next.oldText === next.newText) setTab("file");
+    },
+    [activeRel, incomingKey, review, writeActive],
+  );
 
   useEffect(() => {
     const host = tabStripRef.current;
@@ -284,14 +545,14 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     (props: NodeRendererProps<TreeNode>) => (
       <WorkspaceTreeNode
         {...props}
-        dirty={changed.has(props.node.data.path) || diffByPath.has(props.node.data.path)}
+        dirty={changed.has(props.node.data.path) || diffByPath.has(props.node.data.path) || isDirty(props.node.data.path)}
       />
     ),
-    [changed, diffByPath],
+    [changed, diffByPath, isDirty],
   );
 
   return (
-    <aside className="workspace" style={width ? { width, minWidth: width, flex: "0 0 auto" } : undefined}>
+    <aside className={`workspace${side === "left" ? " side-left" : ""}`} style={width ? { width, minWidth: width, flex: "0 0 auto" } : undefined}>
       <header className="workspace-head">
         <div className="workspace-head-title">
           <strong>{copy.codeWorkspace}</strong>
@@ -308,11 +569,95 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
               {copy.localShort}
             </button>
           ) : null}
-          <button className="icon-btn" type="button" onClick={onClose} title={copy.close}>
+          <button className="ghost compact nowrap" type="button" title={copy.projectRules} onClick={() => {
+            setRulesOpen((value) => !value);
+            if (!rules) {
+              void invoke<ProjectRules | null>("read_project_rules", { root: cwd, ssh: ssh || null })
+                .then((next) => {
+                  setRules(next);
+                  setRulesDraft(next?.content || "");
+                })
+                .catch(() => {
+                  setRules(null);
+                  setRulesDraft("");
+                });
+            }
+          }}>
+            {copy.projectRules}
+          </button>
+          {cwd ? (
+            <button
+              className={`ghost compact nowrap${git?.dirty ? " warn" : ""}${activity === "scm" ? " on" : ""}`}
+              type="button"
+              title={git?.available ? (git.dirty ? fill(copy.gitChanges, { count: new Set(git.files.map((item) => item.path)).size }) : copy.gitClean) : copy.gitNotRepo}
+              onClick={() => {
+                setActivity("scm");
+                setRulesOpen(false);
+                void refreshGit();
+              }}
+            >
+              {git?.available ? `${git.branch || copy.gitBranch}${git.dirty ? ` · ${new Set(git.files.map((item) => item.path)).size}` : ""}` : copy.scmTitle}
+            </button>
+          ) : null}
+          {onMoveSide ? (
+            <button
+              className="icon-btn"
+              type="button"
+              title={side === "left" ? copy.workspaceMoveRight : copy.workspaceMoveLeft}
+              onClick={onMoveSide}
+            >
+              {side === "left" ? <IconCodePane /> : <IconPanelLeft />}
+            </button>
+          ) : null}
+          <button className="icon-btn" type="button" onClick={requestClosePanel} title={copy.close}>
             <IconClose />
           </button>
         </div>
       </header>
+      {rulesOpen ? (
+        <div className="workspace-popover">
+          <div className="workspace-popover-head">
+            <strong>{copy.projectRules}</strong>
+            <span>{rules?.path || "AGENTS.md"}</span>
+          </div>
+          <textarea
+            className="workspace-rules"
+            value={rulesDraft}
+            placeholder={copy.projectRulesPlaceholder}
+            onChange={(event) => setRulesDraft(event.target.value)}
+          />
+          <div className="workspace-git-commit">
+            <button
+              className="primary compact"
+              type="button"
+              disabled={!cwd}
+              onClick={() => {
+                void invoke<ProjectRules>("write_project_rules", { root: cwd, content: rulesDraft, ssh: ssh || null })
+                  .then((next) => {
+                    setRules(next);
+                    setRulesDraft(next.content);
+                    setError("");
+                  })
+                  .catch((err) => setError(String(err)));
+              }}
+            >
+              {copy.saveRules}
+            </button>
+          </div>
+        </div>
+      ) : null}
+      <div className="workspace-main">
+      <nav className="ws-activity" aria-label={copy.codeWorkspace}>
+        <button className={activity === "files" ? "on" : ""} type="button" title={copy.explorer} onClick={() => setActivity("files")}>
+          <IconFiles size={16} />
+        </button>
+        <button className={activity === "scm" ? "on" : ""} type="button" title={copy.scmTitle} onClick={() => { setActivity("scm"); void refreshGit(); }}>
+          <IconGit size={16} />
+        </button>
+        <button className={activity === "run" ? "on" : ""} type="button" title={copy.runTitle} onClick={() => setActivity("run")}>
+          <IconDebug size={16} />
+        </button>
+      </nav>
       <Group
         className="workspace-split"
         id="grokdesk.workspace.split.v1"
@@ -321,6 +666,41 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         onLayoutChanged={onLayoutChanged}
       >
         <Panel id="tree" defaultSize="34%" minSize="160px" maxSize="58%" className="workspace-tree">
+          {activity === "scm" ? (
+            <SourceControlView
+              cwd={cwd}
+              ssh={ssh}
+              git={git}
+              copy={copy}
+              busy={gitBusy}
+              autoCommit={gitAutoCommit}
+              autoPush={gitAutoPush}
+              commitTemplate={gitAutoCommitMessage}
+              onRefresh={refreshGit}
+              onOpenFile={(path) => void openFile(path)}
+              onOpenDiff={(path, staged) => void openGitDiff(path, staged)}
+              onBusy={setGitBusy}
+              onError={setError}
+              onLog={onLog}
+              onGitSettings={onGitSettings}
+              onAskAgent={onAskAgent}
+            />
+          ) : activity === "run" ? (
+            <RunDebugView
+              cwd={cwd}
+              ssh={ssh}
+              copy={copy}
+              activeFile={activePath}
+              onOpenFile={(path) => void openFile(path)}
+              onRun={(job) => {
+                onOpenPanel?.("debug");
+                onRun?.(job);
+              }}
+              onLog={onLog}
+            />
+          ) : (
+            <>
+          <span className="kicker">{copy.explorer}</span>
           {changedList.length ? (
             <div className="workspace-changed">
               <span className="kicker">{copy.unsavedEdit}</span>
@@ -352,13 +732,13 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
                   </button>
                 ) : null}
               </div>
-            ) : treeHost.height > 0 ? (
+            ) : (
               <Tree
                 key={cwd}
                 ref={treeRef}
                 data={treeData}
                 width={treeHost.width || "100%"}
-                height={treeHost.height}
+                height={Math.max(treeHost.height, 160)}
                 indent={12}
                 rowHeight={26}
                 padding={4}
@@ -382,13 +762,63 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
               >
                 {TreeNodeRow}
               </Tree>
-            ) : null}
+            )}
           </div>
+            </>
+          )}
         </Panel>
         <Separator className="resize workspace-resize" />
         <Panel id="editor" minSize="220px" className="workspace-editor">
           {hasOpenTabs ? (
             <>
+              {pendingClose ? (
+                <div className="unsaved-banner">
+                  <div>
+                    <strong>{copy.unsavedConfirm}</strong>
+                    <span>{copy.unsavedCloseHint}</span>
+                  </div>
+                  <button className="ghost compact" type="button" onClick={() => setPendingClose(null)}>
+                    {copy.cancel}
+                  </button>
+                  <button
+                    className="ghost compact"
+                    type="button"
+                    onClick={() => {
+                      const target = pendingClose;
+                      setPendingClose(null);
+                      if (target.kind === "tab" && target.path) closeTab(target.path, true);
+                      else onClose();
+                    }}
+                  >
+                    {copy.discardChanges}
+                  </button>
+                  <button
+                    className="primary compact"
+                    type="button"
+                    onClick={() => {
+                      void (async () => {
+                        const target = pendingClose;
+                        if (target.kind === "panel") {
+                          for (const tab of openTabsRef.current) {
+                            if (!isDirty(tab.path)) continue;
+                            const ok = await saveFile(tab.path);
+                            if (!ok) return;
+                          }
+                          setPendingClose(null);
+                          onClose();
+                          return;
+                        }
+                        const ok = await saveFile(target.path);
+                        if (!ok) return;
+                        setPendingClose(null);
+                        if (target.path) closeTab(target.path, true);
+                      })();
+                    }}
+                  >
+                    {copy.saveAndClose}
+                  </button>
+                </div>
+              ) : null}
               <div className="workspace-filebar">
                 <div
                   className="workspace-opentabs"
@@ -411,7 +841,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
                   }}
                 >
                   {openTabs.map((item) => {
-                    const dirty = changed.has(item.path) || diffByPath.has(item.path);
+                    const dirty = changed.has(item.path) || diffByPath.has(item.path) || isDirty(item.path);
                     const on = item.path === activeRel;
                     return (
                       <div
@@ -467,46 +897,147 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
                   })}
                 </div>
                 <div className="workspace-filemeta">
+                  {isDirty(activeRel) ? (
+                    <button className="ghost compact nowrap" type="button" title={withShortcut(copy.saveFile, saveChord)} onClick={() => void saveFile(activeRel)}>
+                      {copy.saveFile}
+                    </button>
+                  ) : null}
                   {file?.truncated ? <em>{copy.fileTruncated}</em> : null}
                   {activeRel ? <em className="ws-lang">{fileBadge(file?.path || activeRel, file?.language)}</em> : null}
-                  {activeDiff ? (
+                  {stats && (showDiff || hunks.length) ? (
+                    <span className="diff-stats workspace-diff-stats">
+                      {stats.added ? <b className="add">+{stats.added}</b> : null}
+                      {stats.removed ? <b className="del">−{stats.removed}</b> : null}
+                    </span>
+                  ) : null}
+                  {isMd ? (
                     <div className="workspace-tabs">
-                      <button className={tab === "file" ? "on" : ""} type="button" onClick={() => setActiveView("file")}>
-                        {copy.fileTab}
+                      <button className={mdMode === "preview" ? "on" : ""} type="button" onClick={() => { setMdMode("preview"); setActiveView("file"); }}>
+                        {copy.mdPreview}
                       </button>
-                      <button className={tab === "diff" ? "on" : ""} type="button" onClick={() => setActiveView("diff")}>
-                        {copy.diffTab}
+                      <button className={mdMode === "source" && !showDiff ? "on" : ""} type="button" onClick={() => { setMdMode("source"); setActiveView("file"); }}>
+                        {copy.mdSource}
+                      </button>
+                      <button className={mdMode === "split" ? "on" : ""} type="button" onClick={() => { setMdMode("split"); setActiveView("file"); }}>
+                        {copy.mdSplit}
+                      </button>
+                    </div>
+                  ) : null}
+                  {hunks.length ? (
+                    <>
+                      <div className="workspace-tabs">
+                        <button className={tab === "file" && mdMode !== "preview" ? "on" : ""} type="button" onClick={() => { setActiveView("file"); if (isMd) setMdMode("source"); }}>
+                          {copy.fileTab}
+                        </button>
+                        <button className={tab === "diff" ? "on" : ""} type="button" onClick={() => { setActiveView("diff"); if (isMd) setMdMode("source"); }}>
+                          {copy.diffTab}
+                        </button>
+                      </div>
+                      <div className="workspace-hunk-actions">
+                        <button type="button" className="hunk-keep" title={copy.keepAll} onClick={() => void applyReview("accept")}>
+                          <IconCheck size={12} />
+                          {copy.keepAll}
+                        </button>
+                        <button type="button" className="hunk-undo" title={copy.undoAll} onClick={() => void applyReview("reject")}>
+                          <IconUndo size={12} />
+                          {copy.undoAll}
+                        </button>
+                      </div>
+                    </>
+                  ) : null}
+                  {showDiff ? (
+                    <div className="workspace-tabs">
+                      <button className={!sideBySide ? "on" : ""} type="button" onClick={() => setSideBySide(false)}>
+                        {copy.diffInline}
+                      </button>
+                      <button className={sideBySide ? "on" : ""} type="button" onClick={() => setSideBySide(true)}>
+                        {copy.diffSplit}
                       </button>
                     </div>
                   ) : null}
                 </div>
               </div>
-              <div className="workspace-monaco">
-                {showDiff && activeDiff ? (
-                  <DiffEditor
-                    original={activeDiff.oldText}
-                    modified={activeDiff.newText}
-                    language={language}
-                    theme={editorTheme}
-                    height="100%"
-                    originalModelPath={`original/${activeRel}`}
-                    modifiedModelPath={`modified/${activeRel}`}
-                    options={MONACO_DIFF_OPTIONS}
-                    loading={<p className="hint">{copy.pickFile}</p>}
-                  />
-                ) : file ? (
-                  <Editor
-                    path={file.path}
-                    value={file.content}
-                    language={language}
-                    theme={editorTheme}
-                    height="100%"
-                    options={MONACO_OPTIONS}
-                    loading={<p className="hint">{copy.pickFile}</p>}
-                  />
-                ) : (
+              <div className={`workspace-monaco${showPreview && showCode ? " split-md" : ""}`}>
+                {showDiff && review ? (
+                  <div className="workspace-monaco-code">
+                    <DiffEditor
+                      key={`${activeRel}-${sideBySide ? "split" : "inline"}-${review.newText.length}`}
+                      original={review.oldText}
+                      modified={review.newText}
+                      language={language}
+                      theme={editorTheme}
+                      height="100%"
+                      originalModelPath={`original/${activeRel}`}
+                      modifiedModelPath={`modified/${activeRel}`}
+                      options={diffOptions}
+                      onMount={(instance) => setReviewEditor(instance.getModifiedEditor())}
+                      loading={<p className="hint">{copy.pickFile}</p>}
+                    />
+                    {hunks.length ? (
+                      <HunkOverlay
+                        editor={reviewEditor}
+                        hunks={hunks}
+                        copy={copy}
+                        onKeep={(hunk) => void applyReview("accept", hunk)}
+                        onUndo={(hunk) => void applyReview("reject", hunk)}
+                      />
+                    ) : null}
+                  </div>
+                ) : showCode && file?.language === "binary" ? (
+                  <p className="hint">{copy.binaryFile}</p>
+                ) : showCode && file ? (
+                  <div className="workspace-monaco-code">
+                    <Editor
+                      path={file.path}
+                      value={drafts[activeRel] ?? file.content}
+                      language={language}
+                      theme={editorTheme}
+                      height="100%"
+                      options={editorOptions}
+                      onMount={(instance, monacoApi) => {
+                        fileEditorRef.current = instance;
+                        setReviewEditor(instance);
+                        instance.updateOptions({
+                          readOnly: Boolean(file.truncated),
+                          domReadOnly: Boolean(file.truncated),
+                        });
+                        const save = () => {
+                          void saveFileRef.current();
+                        };
+                        const monacoKey = toMonacoKeybinding(saveChordRef.current, monacoApi);
+                        if (monacoKey != null) instance.addCommand(monacoKey, save);
+                      }}
+                      onChange={(value) => {
+                        if (!activeRel || file.truncated) return;
+                        const next = value ?? "";
+                        setDrafts((current) => {
+                          const saved = filesRef.current[activeRel]?.content ?? file.content;
+                          if (next === saved) {
+                            if (current[activeRel] == null) return current;
+                            const copyDraft = { ...current };
+                            delete copyDraft[activeRel];
+                            return copyDraft;
+                          }
+                          if (current[activeRel] === next) return current;
+                          return { ...current, [activeRel]: next };
+                        });
+                      }}
+                      loading={<p className="hint">{copy.pickFile}</p>}
+                    />
+                    {hunks.length ? (
+                      <HunkOverlay
+                        editor={reviewEditor}
+                        hunks={hunks}
+                        copy={copy}
+                        onKeep={(hunk) => void applyReview("accept", hunk)}
+                        onUndo={(hunk) => void applyReview("reject", hunk)}
+                      />
+                    ) : null}
+                  </div>
+                ) : !showPreview ? (
                   <p className="hint">{error || copy.pickFile}</p>
-                )}
+                ) : null}
+                {showPreview ? <MarkdownPreview text={previewText} /> : null}
               </div>
             </>
           ) : (
@@ -514,6 +1045,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
           )}
         </Panel>
       </Group>
+      </div>
     </aside>
   );
 }
@@ -540,24 +1072,36 @@ function WorkspaceTreeNode({ node, style, dragHandle, dirty }: NodeRendererProps
   );
 }
 
+function isBinaryFile(path: string, content?: string) {
+  if (/\.(zip|png|jpe?g|gif|webp|bmp|ico|pdf|dmg|exe|wasm|mp4|mov|gz|7z|rar)$/i.test(path)) return true;
+  const head = (content || "").slice(0, 800);
+  if (!head) return false;
+  if (head.startsWith("PK")) return true;
+  return head.includes("\0");
+}
+
+function isFolderError(err: unknown) {
+  const text = String(err);
+  return /文件夹|資料夾|folder/i.test(text);
+}
+
 function useElementSize() {
-  const ref = useRef<HTMLDivElement | null>(null);
+  const [node, setNode] = useState<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
+    if (!node) return;
     const update = () => {
       setSize({
-        width: Math.max(0, Math.floor(el.clientWidth)),
-        height: Math.max(0, Math.floor(el.clientHeight)),
+        width: Math.max(0, Math.floor(node.clientWidth)),
+        height: Math.max(0, Math.floor(node.clientHeight)),
       });
     };
     update();
     const observer = new ResizeObserver(update);
-    observer.observe(el);
+    observer.observe(node);
     return () => observer.disconnect();
-  }, []);
-  return { ref, ...size };
+  }, [node]);
+  return { ref: setNode, ...size };
 }
 
 function useEditorTheme() {
@@ -579,9 +1123,12 @@ function useEditorTheme() {
 
 function editorThemeFromDom() {
   const mode = document.documentElement.dataset.theme;
-  if (mode === "dark") return "vs-dark";
-  if (mode === "light") return "light";
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "light";
+  const dark = mode === "dark" || (mode !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  return dark ? MONACO_THEME_DARK : MONACO_THEME_LIGHT;
+}
+
+function isMarkdownPath(path: string, language?: string) {
+  return language === "markdown" || /\.mdx?$/i.test(path);
 }
 
 function monacoLanguage(language: string, path: string) {
@@ -597,6 +1144,8 @@ function monacoLanguage(language: string, path: string) {
     rs: "rust",
     py: "python",
     md: "markdown",
+    mdx: "markdown",
+    lua: "lua",
     yml: "yaml",
     yaml: "yaml",
     sh: "shell",
@@ -643,15 +1192,14 @@ function toRelative(cwd: string, raw: string) {
 }
 
 const MONACO_OPTIONS = {
-  readOnly: true,
   minimap: { enabled: false },
-  fontSize: 12,
-  lineHeight: 18,
+  fontSize: 13,
+  lineHeight: 20,
   fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
   scrollBeyondLastLine: false,
   wordWrap: "on" as const,
   renderLineHighlight: "line" as const,
-  padding: { top: 8, bottom: 16 },
+  padding: { top: 10, bottom: 18 },
   smoothScrolling: true,
   automaticLayout: true,
   glyphMargin: false,
@@ -660,13 +1208,47 @@ const MONACO_OPTIONS = {
   renderWhitespace: "selection" as const,
   overviewRulerLanes: 0,
   hideCursorInOverviewRuler: true,
+  roundedSelection: true,
+  cursorBlinking: "smooth" as const,
   scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
 };
 
-const MONACO_DIFF_OPTIONS = {
-  ...MONACO_OPTIONS,
-  renderSideBySide: false,
-  renderIndicators: true,
-  originalEditable: false,
-  ignoreTrimWhitespace: false,
-};
+function monacoFileOptions(truncated: boolean, reviewing = false) {
+  return {
+    ...MONACO_OPTIONS,
+    readOnly: truncated,
+    domReadOnly: truncated,
+    glyphMargin: reviewing,
+  };
+}
+
+function monacoDiffOptions(sideBySide: boolean, reviewing: boolean) {
+  return {
+    ...MONACO_OPTIONS,
+    glyphMargin: reviewing,
+    renderSideBySide: sideBySide,
+    useInlineViewWhenSpaceIsLimited: true,
+    compactMode: !sideBySide,
+    renderIndicators: true,
+    originalEditable: false,
+    readOnly: true,
+    ignoreTrimWhitespace: false,
+    renderMarginRevertIcon: false,
+    renderGutterMenu: false,
+    renderOverviewRuler: false,
+    enableSplitViewResizing: sideBySide,
+    diffAlgorithm: "advanced" as const,
+    diffWordWrap: "on" as const,
+    hideUnchangedRegions: {
+      enabled: true,
+      contextLineCount: 3,
+      minimumLineCount: 4,
+      revealLineCount: 8,
+    },
+    experimental: {
+      useTrueInlineView: !sideBySide,
+      showMoves: true,
+      showEmptyDecorations: true,
+    },
+  };
+}

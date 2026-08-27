@@ -1,4 +1,5 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   IconArchive,
   IconBolt,
@@ -6,6 +7,7 @@ import {
   IconChevronLeft,
   IconGear,
   IconHand,
+  IconKeyboard,
   IconPerson,
   IconPencil,
   IconPlan,
@@ -15,6 +17,7 @@ import {
   IconSpark,
   IconTerminal,
 } from "./icons";
+import { KeybindingsEditor } from "./KeybindingsEditor";
 import type { Copy } from "./i18n";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
@@ -22,6 +25,8 @@ import {
   EFFORTS,
   PERMISSION_MODES,
   mergeModelOptions,
+  permissionModeHint,
+  permissionModeLabel,
   type AccountRecord,
   type AppSettings,
   type CatalogModel,
@@ -33,6 +38,7 @@ import {
   type SkillRecord,
   type SshTarget,
   type Theme,
+  type ProjectRules,
 } from "./types";
 
 export function SettingsRow({
@@ -114,6 +120,75 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (value: boolean
   );
 }
 
+function ProjectRulesEditor({
+  cwd,
+  ssh,
+  copy,
+}: {
+  cwd: string;
+  ssh?: SshTarget | null;
+  copy: Copy;
+}) {
+  const root = ssh?.remotePath || cwd;
+  const [draft, setDraft] = useState("");
+  const [path, setPath] = useState("AGENTS.md");
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    if (!root) {
+      setDraft("");
+      return;
+    }
+    let cancelled = false;
+    void invoke<ProjectRules | null>("read_project_rules", { root, ssh: ssh || null })
+      .then((next) => {
+        if (cancelled) return;
+        setDraft(next?.content || "");
+        setPath(next?.path || "AGENTS.md");
+        setMessage("");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDraft("");
+        setPath("AGENTS.md");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [root, ssh]);
+  return (
+    <SettingsRow title={copy.projectRules} detail={copy.projectRulesDetail}>
+      <div className="rules-field">
+        <textarea
+          className="rules-editor"
+          value={draft}
+          placeholder={copy.projectRulesPlaceholder}
+          onChange={(event) => setDraft(event.target.value)}
+        />
+        <div className="rules-field-bar">
+          <em>{path}</em>
+          <button
+            className="ghost compact"
+            type="button"
+            disabled={!root}
+            onClick={() => {
+              void invoke<ProjectRules>("write_project_rules", { root, content: draft, ssh: ssh || null })
+                .then((next) => {
+                  setPath(next.path);
+                  setDraft(next.content);
+                  setMessage(copy.rulesSaved);
+                })
+                .catch((err) => setMessage(String(err)));
+            }}
+          >
+            {copy.saveRules}
+          </button>
+        </div>
+        {message ? <div className="row-detail">{message}</div> : null}
+      </div>
+    </SettingsRow>
+  );
+}
+
 export function SettingsView(props: {
   t: Copy;
   lang: Lang;
@@ -185,6 +260,7 @@ export function SettingsView(props: {
     { id: "ssh", title: copy.ssh, icon: <IconTerminal /> },
     { id: "agent", title: copy.agent, icon: <IconSpark size={15} /> },
     { id: "compatibility", title: copy.compatibility, icon: <IconSliders /> },
+    { id: "keyboard", title: copy.kbPage, icon: <IconKeyboard /> },
     { id: "skills", title: copy.skills, icon: <IconBox /> },
     { id: "accounts", title: copy.accounts, icon: <IconPerson /> },
     { id: "archived", title: copy.archived, icon: <IconArchive /> },
@@ -264,8 +340,9 @@ export function SettingsView(props: {
                     value={props.lang}
                     onChange={(value) => props.setLang(value as Lang)}
                     options={[
-                      { id: "zh", label: "简体中文" },
-                      { id: "en", label: "English" },
+                      { id: "zh", label: copy.simplifiedChinese },
+                      { id: "zh-Hant", label: copy.traditionalChinese },
+                      { id: "en", label: copy.englishName },
                     ]}
                   />
                 </SettingsRow>
@@ -297,6 +374,26 @@ export function SettingsView(props: {
                       </button>
                     ) : null}
                   </div>
+                </SettingsRow>
+                <ProjectRulesEditor cwd={props.cwd} ssh={props.ssh} copy={copy} />
+                <SettingsRow title={copy.scmAutoCommit} detail={copy.scmAutoCommitDetail}>
+                  <Toggle
+                    value={Boolean(props.settings.gitAutoCommit)}
+                    onChange={(value) => props.patchSettings({ gitAutoCommit: value })}
+                  />
+                </SettingsRow>
+                <SettingsRow title={copy.scmAutoPush} detail={copy.scmAutoPushDetail}>
+                  <Toggle
+                    value={Boolean(props.settings.gitAutoPush)}
+                    onChange={(value) => props.patchSettings({ gitAutoPush: value })}
+                  />
+                </SettingsRow>
+                <SettingsRow title={copy.scmCommitTemplate} detail={copy.scmAutoCommitDetail}>
+                  <input
+                    value={props.settings.gitAutoCommitMessage || "xiaoha: {title}"}
+                    spellCheck={false}
+                    onChange={(event) => props.patchSettings({ gitAutoCommitMessage: event.target.value })}
+                  />
                 </SettingsRow>
                 <SettingsRow title={copy.effort} detail={copy.modelDetail}>
                   <Select
@@ -501,8 +598,8 @@ export function SettingsView(props: {
                   onChange={(value) => props.patchSettings({ permissionMode: value })}
                   options={PERMISSION_MODES.map((item) => ({
                     id: item.id,
-                    label: props.lang === "en" ? item.labelEn : item.labelZh,
-                    hint: props.lang === "en" ? item.hintEn : item.hintZh,
+                    label: permissionModeLabel(item.id, props.lang),
+                    hint: permissionModeHint(item.id, props.lang),
                     icon:
                       item.id === "acceptEdits" ? (
                         <IconPencil size={14} />
@@ -559,6 +656,14 @@ export function SettingsView(props: {
                 />
               </SettingsRow>
             </section>
+          )}
+
+          {props.settingsPage === "keyboard" && (
+            <KeybindingsEditor
+              copy={copy}
+              overrides={props.settings.keybindings || {}}
+              onChange={(keybindings) => props.patchSettings({ keybindings })}
+            />
           )}
 
           {props.settingsPage === "skills" && (

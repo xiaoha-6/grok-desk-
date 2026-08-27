@@ -1,7 +1,13 @@
 import SwiftUI
 
 extension AppSettings {
-    var effectiveLanguage: String { language == "en" ? "en" : "zh-Hans" }
+    var effectiveLanguage: String {
+        switch language {
+        case "en": return "en"
+        case "zh-Hant": return "zh-Hant"
+        default: return "zh-Hans"
+        }
+    }
     var effectiveAppearance: String {
         ["system", "light", "dark"].contains(appearance ?? "") ? appearance! : "system"
     }
@@ -19,26 +25,44 @@ extension AppSettings {
 /// SwiftUI literals use Localizable.strings automatically; this helper covers
 /// dynamic labels where `LocalizedStringKey` would otherwise be lost.
 enum L10n {
+    static func languageCode(from locale: Locale) -> String {
+        let id = locale.identifier.replacingOccurrences(of: "_", with: "-")
+        if id.hasPrefix("en") { return "en" }
+        if id.localizedCaseInsensitiveContains("Hant") || id.hasPrefix("zh-TW") || id.hasPrefix("zh-HK") || id.hasPrefix("zh-MO") {
+            return "zh-Hant"
+        }
+        return "zh-Hans"
+    }
+
     static func text(_ key: String, language: String) -> String {
-        guard language == "en" else { return key }
-        // Dynamic strings must use the same table as SwiftUI literals. Keeping
-        // a second hand-maintained dictionary caused parts of one screen to
-        // switch language while adjacent labels stayed in Chinese.
-        if let bundle = englishBundle {
+        if language == "zh-Hans" || language.hasPrefix("zh-Hans") { return key }
+        if let bundle = bundle(for: language) {
             let localized = bundle.localizedString(forKey: key, value: key, table: nil)
             if localized != key { return localized }
         }
-        return englishFallback[key] ?? key
+        if language.hasPrefix("en") { return englishFallback[key] ?? key }
+        return key
     }
 
     static func format(_ key: String, language: String, _ arguments: CVarArg...) -> String {
         String(format: text(key, language: language),
-               locale: Locale(identifier: language == "en" ? "en" : "zh-Hans"),
+               locale: Locale(identifier: language),
                arguments: arguments)
+    }
+
+    private static func bundle(for language: String) -> Bundle? {
+        if language.hasPrefix("en") { return englishBundle }
+        if language == "zh-Hant" { return hantBundle }
+        return nil
     }
 
     private static let englishBundle: Bundle? = {
         guard let url = Bundle.main.url(forResource: "en", withExtension: "lproj") else { return nil }
+        return Bundle(url: url)
+    }()
+
+    private static let hantBundle: Bundle? = {
+        guard let url = Bundle.main.url(forResource: "zh-Hant", withExtension: "lproj") else { return nil }
         return Bundle(url: url)
     }()
 
@@ -88,6 +112,9 @@ enum L10n {
         "加载更早消息（%@ 条）": "Load earlier messages (%@)",
         "跳到最新消息": "Jump to latest message",
         "使用情况": "Context usage",
-        "Context window：%d%% 已使用（剩余 %d%%）\n%@ / %@ tokens": "Context window: %d%% used (%d%% left)\n%@ / %@ tokens"
+        "Context window：%d%% 已使用（剩余 %d%%）\n%@ / %@ tokens": "Context window: %d%% used (%d%% left)\n%@ / %@ tokens",
+        "本周剩余 %d%%": "%d%% weekly remaining",
+        "安装完成：%@": "Installed: %@",
+        "安装失败：": "Installation failed: "
     ]
 }

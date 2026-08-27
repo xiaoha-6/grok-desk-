@@ -1,8 +1,10 @@
 mod accounts;
 mod acp;
 mod config;
+mod git;
 mod install;
 mod media;
+mod pty;
 mod runtime;
 mod sessions;
 mod ssh;
@@ -18,10 +20,12 @@ use config::{
     parse_deeplink, write_config, ModelCatalog, ModelListRequest, RelayImport, RelayQuota,
 };
 use install::{install_official, InstallEventSink};
+use pty::{pty_close, pty_detect, pty_open, pty_resize, pty_write};
 use runtime::{grok_home, runtime_status, RuntimeStatus};
 use sessions::{LocalSessionHistory, LocalSessionSummary};
 use ssh::{SshConfigHost, SshProbe, SshTarget};
-use workspace::{WorkspaceEntry, WorkspaceFile};
+use git::{GitCommit, GitFileDiff, GitReview, GitStatus, GithubIdentity, SnapshotFile};
+use workspace::{GrepHit, ProjectRules, WorkspaceEntry, WorkspaceFile};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
@@ -215,6 +219,310 @@ async fn read_workspace_file(
             ssh::read_remote_file(&target, &path)
         } else {
             workspace::read_workspace_file(&root, &path)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn write_workspace_file(
+    root: String,
+    path: String,
+    content: String,
+    ssh: Option<SshTarget>,
+) -> Result<(), String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::write_remote_file(&target, &path, &content)
+        } else {
+            workspace::write_workspace_file(&root, &path, &content)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn search_workspace(
+    root: String,
+    query: String,
+    limit: Option<u32>,
+    ssh: Option<SshTarget>,
+) -> Result<Vec<WorkspaceEntry>, String> {
+    let cap = limit.unwrap_or(80) as usize;
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::search_remote_workspace(&target, &query, cap)
+        } else {
+            workspace::search_workspace(&root, &query, cap)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn grep_workspace(
+    root: String,
+    query: String,
+    limit: Option<u32>,
+    ssh: Option<SshTarget>,
+) -> Result<Vec<GrepHit>, String> {
+    let cap = limit.unwrap_or(50) as usize;
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::grep_remote_workspace(&target, &query, cap)
+        } else {
+            workspace::grep_workspace(&root, &query, cap)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn read_project_rules(root: String, ssh: Option<SshTarget>) -> Result<Option<ProjectRules>, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_read_rules(&target)
+        } else {
+            workspace::read_project_rules(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn write_project_rules(root: String, content: String, ssh: Option<SshTarget>) -> Result<ProjectRules, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_write_rules(&target, &content)
+        } else {
+            workspace::write_project_rules(&root, &content)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_status(root: String, ssh: Option<SshTarget>) -> Result<GitStatus, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_status(&target)
+        } else {
+            git::status(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_commit(
+    root: String,
+    message: String,
+    ssh: Option<SshTarget>,
+    all: Option<bool>,
+) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_commit(&target, &message, all)
+        } else {
+            git::commit(&root, &message, all)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_init(root: String, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_init(&target)
+        } else {
+            git::init(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_set_remote(
+    root: String,
+    url: String,
+    name: Option<String>,
+    ssh: Option<SshTarget>,
+) -> Result<String, String> {
+    let remote_name = name.unwrap_or_else(|| "origin".into());
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_set_remote(&target, &remote_name, &url)
+        } else {
+            git::set_remote(&root, &remote_name, &url)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_stage(root: String, paths: Vec<String>, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_stage(&target, &paths)
+        } else {
+            git::stage(&root, &paths)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_unstage(root: String, paths: Vec<String>, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_unstage(&target, &paths)
+        } else {
+            git::unstage(&root, &paths)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_push(root: String, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_push(&target)
+        } else {
+            git::push(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_pull(root: String, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_pull(&target)
+        } else {
+            git::pull(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_fetch(root: String, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_fetch(&target)
+        } else {
+            git::fetch(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_discard(root: String, paths: Vec<String>, ssh: Option<SshTarget>) -> Result<String, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_discard(&target, &paths)
+        } else {
+            git::discard(&root, &paths)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_log(root: String, limit: Option<u32>, ssh: Option<SshTarget>) -> Result<Vec<GitCommit>, String> {
+    let cap = limit.unwrap_or(40);
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_log(&target, cap)
+        } else {
+            git::log(&root, cap)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_file_diff(
+    root: String,
+    path: String,
+    staged: Option<bool>,
+    ssh: Option<SshTarget>,
+) -> Result<GitFileDiff, String> {
+    let staged = staged.unwrap_or(false);
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_file_diff(&target, &path, staged)
+        } else {
+            git::file_diff(&root, &path, staged)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn git_github_accounts() -> Result<Vec<GithubIdentity>, String> {
+    run_blocking(|| Ok(git::github_identities())).await
+}
+
+#[tauri::command]
+async fn git_review(root: String, ssh: Option<SshTarget>) -> Result<GitReview, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_git_review(&target)
+        } else {
+            git::review(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn capture_checkpoint(root: String, ssh: Option<SshTarget>) -> Result<Vec<SnapshotFile>, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_capture_snapshot(&target)
+        } else {
+            git::capture_snapshot(&root)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn restore_checkpoint(
+    root: String,
+    files: Vec<SnapshotFile>,
+    ssh: Option<SshTarget>,
+) -> Result<(), String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::remote_restore_snapshot(&target, &files)
+        } else {
+            git::restore_snapshot(&root, &files)
         }
     })
     .await
@@ -474,6 +782,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::default())
+        .manage(Arc::new(pty::PtyHub::new()))
         .setup(|app| {
             #[cfg(desktop)]
             {
@@ -521,6 +830,27 @@ pub fn run() {
             pick_ssh_identity,
             list_workspace,
             read_workspace_file,
+            write_workspace_file,
+            search_workspace,
+            grep_workspace,
+            read_project_rules,
+            write_project_rules,
+            git_status,
+            git_commit,
+            git_init,
+            git_set_remote,
+            git_stage,
+            git_unstage,
+            git_push,
+            git_pull,
+            git_fetch,
+            git_discard,
+            git_log,
+            git_file_diff,
+            git_review,
+            git_github_accounts,
+            capture_checkpoint,
+            restore_checkpoint,
             list_accounts,
             save_account_state,
             add_account,
@@ -529,7 +859,12 @@ pub fn run() {
             discard_account_home,
             confirm_account,
             refresh_account_quota,
-            list_skills
+            list_skills,
+            pty_open,
+            pty_write,
+            pty_resize,
+            pty_close,
+            pty_detect
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrokDesk");

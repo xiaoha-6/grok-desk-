@@ -1,5 +1,6 @@
 import { loader } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
+import { registerMonacoThemes } from "./monacoTheme";
 import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import cssWorker from "monaco-editor/language/css/css.worker.js?worker";
 import htmlWorker from "monaco-editor/language/html/html.worker.js?worker";
@@ -17,3 +18,4 @@ window.MonacoEnvironment = {
 };
 
 loader.config({ monaco });
+registerMonacoThemes();

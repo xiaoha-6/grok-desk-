@@ -27,6 +27,7 @@ import {
   IconClose,
   IconCompose,
   IconCodePane,
+  IconPanelLeft,
   IconFolder,
   IconGauge,
   IconGear,
@@ -37,18 +38,30 @@ import {
   IconPencil,
   IconPlan,
   IconRefresh,
+  IconSearch,
   IconShield,
   IconSidebar,
   GrokMark,
   IconStop,
   IconTerminal,
+  IconSsh,
 } from "./icons";
-import { t as translate, type Copy } from "./i18n";
+import { detectLang, fill, htmlLang, parseLang, t as translate, type Copy } from "./i18n";
+import {
+  chordsMatch,
+  formatChord,
+  isImeEvent,
+  resolvedBindings,
+  withShortcut,
+} from "./keybindings";
 import { MessageBody } from "./markdown";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
+import { QuickOpen } from "./QuickOpen";
 import { SettingsView } from "./SettingsView";
-import { isRedundantExtension, jsonText } from "./timeline";
+import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
+import type { RunJob } from "./launch";
+import { isCommandEvent, isRedundantExtension, jsonText } from "./timeline";
 import {
   canonicalModelId,
   defaultSettings,
@@ -56,6 +69,8 @@ import {
   mergeModelOptions,
   normalizePermissionMode,
   PERMISSION_MODES,
+  permissionModeHint,
+  permissionModeLabel,
   type AccountRecord,
   type AccountState,
   type AcpTurnDone,
@@ -85,6 +100,7 @@ import {
   type SshConfigHost,
   type SshProbe,
   type SshTarget,
+  type SnapshotFile,
   type WorkspaceEntry,
   type Theme,
   type TimelineEvent,
@@ -101,6 +117,7 @@ const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const STORAGE_KEY = "grokdesk.workspace.v3";
 const LEGACY_KEYS = ["grokdesk.workspace.v2", "grokdesk.workspace.v1"];
 const WorkspacePanel = lazy(() => import("./WorkspacePanel").then((mod) => ({ default: mod.WorkspacePanel })));
+const TerminalPanel = lazy(() => import("./TerminalPanel").then((mod) => ({ default: mod.TerminalPanel })));
 
 function uid() {
   return crypto.randomUUID();
@@ -214,21 +231,36 @@ function sshLabel(target: SshTarget, path = target.remotePath) {
   return `${target.user || "root"}@${target.host}:${folder}`;
 }
 
-function friendlyError(raw: string) {
+function isMissingCredentials(raw: string) {
+  return /GROKDESK_NO_CREDENTIALS|还没有可用的登录或 API Key|還沒有可用的登入或 API Key|no login or api key/i.test(
+    raw,
+  );
+}
+
+function localizeThrown(error: unknown, copy: Copy) {
+  const msg = String((error as { message?: string })?.message ?? error ?? "").trim();
+  if (!msg) return copy.acpRequestFailed;
+  if (/GROKDESK_IMAGE_TOO_LARGE|图片太大|圖片太大/i.test(msg)) return copy.imageTooLarge;
+  if (/GROKDESK_IMAGE_READ_FAILED|无法读取图片|無法讀取圖片/i.test(msg)) return copy.cannotReadImage;
+  if (isMissingCredentials(msg)) return copy.needCredentials;
+  return msg;
+}
+
+function friendlyError(raw: string, copy: Copy) {
   const text = String(raw || "")
     .replace(/^GROKDESK_NO_CREDENTIALS:\s*/i, "")
-    .trim() || "ACP 请求失败";
+    .trim() || copy.acpRequestFailed;
   if (/上游/.test(text) || /upstream (?:service )?(?:temporarily )?unavailable/i.test(text)) {
     return text;
   }
   if (/502|bad gateway|temporarily unavailable/i.test(text)) {
-    return `${text}\n上游模型服务暂时不可用。这通常是中转站或 xAI 上游波动，不是本机 Grok Build 没装好。请稍后重试。`;
+    return `${text}\n${copy.upstreamUnavailable}`;
   }
   if (/503/.test(text)) {
-    return `${text}\n上游暂时过载（503）。请稍后重试。`;
+    return `${text}\n${copy.upstreamOverloaded}`;
   }
-  if (/weekly limit|run out of credits|free usage limit|status 402|额度不足|周限额/i.test(text)) {
-    return `${text}\n这是官方 Grok 的周额度/登录限制，不是中转站余额。中转站显示「额度不限」时，请开一个新对话，让桌面端走中转站而不是 grok.com。`;
+  if (/weekly limit|run out of credits|free usage limit|status 402|额度不足|周限额|額度不足|週限額/i.test(text)) {
+    return `${text}\n${copy.officialQuotaHint}`;
   }
   return text;
 }
@@ -236,14 +268,14 @@ function friendlyError(raw: string) {
 function isUserCancelError(raw?: string) {
   const text = String(raw || "").trim();
   if (!text) return false;
-  return /连接已取消|cancelled by user|session\/cancel|user cancel|canceled by the user|prompt cancelled|turn cancelled/i.test(
+  return /连接已取消|連線已取消|cancelled by user|session\/cancel|user cancel|canceled by the user|prompt cancelled|turn cancelled/i.test(
     text,
   );
 }
 
-function sealAssistantMessage(message: ChatMessage, options?: { error?: string; stopped?: boolean }): ChatMessage {
+function sealAssistantMessage(message: ChatMessage, options?: { error?: string; stopped?: boolean; copy?: Copy }): ChatMessage {
   const cancelled = Boolean(options?.stopped || isUserCancelError(options?.error));
-  const err = options?.error && !cancelled ? friendlyError(options.error) : undefined;
+  const err = options?.error && !cancelled ? friendlyError(options.error, options.copy || translate("zh")) : undefined;
   return {
     ...message,
     streaming: false,
@@ -270,6 +302,107 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+      const joined = value.join(" ").trim();
+      if (joined) return joined;
+    }
+  }
+  return "";
+}
+
+function parseJsonRecord(text?: string): Record<string, unknown> | undefined {
+  const raw = text?.trim();
+  if (!raw || (raw[0] !== "{" && raw[0] !== "[")) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) return asRecord(parsed[0]);
+    return asRecord(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function extractShellCommand(inputRec?: Record<string, unknown>, input?: string) {
+  const rec = inputRec || parseJsonRecord(input) || {};
+  const nested = asRecord(rec.command) || asRecord(rec.cmd);
+  return firstString(
+    rec.command,
+    rec.cmd,
+    rec.script,
+    rec.bash,
+    rec.shell_command,
+    rec.shellCommand,
+    rec.commandLine,
+    rec.command_line,
+    rec.argv,
+    nested?.command,
+    nested?.cmd,
+    nested?.script,
+    parseJsonRecord(input)?.command,
+    parseJsonRecord(input)?.cmd,
+  );
+}
+
+function extractShellOutput(output?: string) {
+  const raw = (output || "").trim();
+  if (!raw) return "";
+  const rec = parseJsonRecord(raw);
+  if (!rec) return raw;
+  const nested = rec.content;
+  const fromFields = firstString(rec.output, rec.stdout, rec.stderr, rec.text, rec.result, rec.content);
+  if (fromFields && typeof rec.content !== "object") return fromFields;
+  if (Array.isArray(nested)) {
+    const lines = nested
+      .map((item) => {
+        const row = asRecord(item);
+        return firstString(row?.text, row?.output, row?.stdout, typeof item === "string" ? item : "");
+      })
+      .filter(Boolean);
+    if (lines.length) return lines.join("\n");
+  }
+  const nestedRec = asRecord(nested);
+  const nestedText = firstString(nestedRec?.text, nestedRec?.output, nestedRec?.stdout);
+  return nestedText || fromFields || raw;
+}
+
+function terminalJobTitle(command: string, fallback: string) {
+  const line = (command || fallback).split("\n")[0].trim();
+  if (line.length <= 28) return line || fallback;
+  return `${line.slice(0, 27)}…`;
+}
+
+function upsertAgentJob(current: AgentTermJob[], next: AgentTermJob): AgentTermJob[] {
+  const existing = current.find((item) => item.id === next.id);
+  if (!existing) return [...current, next];
+  return current.map((item) =>
+    item.id === next.id
+      ? {
+          ...item,
+          title: next.title || item.title,
+          command: next.command || item.command,
+          output: next.output || item.output,
+          status: next.status || item.status,
+        }
+      : item,
+  );
+}
+
+function agentJobFromEvent(event: TimelineEvent): AgentTermJob | null {
+  if (!isCommandEvent(event)) return null;
+  const id = event.id.replace(/^tool-/, "");
+  const command = extractShellCommand(parseJsonRecord(event.input), event.input);
+  return {
+    id,
+    title: terminalJobTitle(command, event.title),
+    command: command || event.title,
+    output: extractShellOutput(event.output),
+    status: event.status || "pending",
+  };
+}
+
 function contentText(update: Record<string, unknown>) {
   const content = asRecord(update.content);
   return String(content?.text ?? update.text ?? "");
@@ -281,22 +414,23 @@ function toolMeta(update: Record<string, unknown>) {
 }
 
 const MAX_LIVE_EVENTS = 80;
+let uiLang: Lang = "zh";
 
-function compactEvents(events: TimelineEvent[]): TimelineEvent[] {
+function compactEvents(events: TimelineEvent[], copy: Copy = translate(uiLang)): TimelineEvent[] {
   if (events.length <= MAX_LIVE_EVENTS) return events;
   const dropped = events.length - MAX_LIVE_EVENTS;
   return [
     {
       id: "folded-events",
       kind: "context",
-      title: `已折叠 ${dropped} 个早期步骤`,
+      title: fill(copy.foldedSteps, { n: dropped }),
       status: "completed",
     },
     ...events.slice(-MAX_LIVE_EVENTS),
   ];
 }
 
-function upsertEvent(events: TimelineEvent[], event: TimelineEvent) {
+function upsertEvent(events: TimelineEvent[], event: TimelineEvent, copy: Copy = translate(uiLang)) {
   const index = events.findIndex((item) => item.id === event.id);
   if (index >= 0) {
     const next = [...events];
@@ -307,9 +441,9 @@ function upsertEvent(events: TimelineEvent[], event: TimelineEvent) {
       output: event.output ?? next[index].output,
       diffs: event.diffs?.length ? event.diffs : next[index].diffs,
     };
-    return compactEvents(next);
+    return compactEvents(next, copy);
   }
-  return compactEvents([...events, event]);
+  return compactEvents([...events, event], copy);
 }
 
 function extensionKind(method: string) {
@@ -323,23 +457,22 @@ function extensionKind(method: string) {
 }
 
 function extensionTitle(method: string, params: Record<string, unknown>, lang: Lang) {
+  const copy = translate(lang);
   if (method.toLowerCase().includes("hook")) {
     const event = String(params.event_name || params.eventName || "hook");
     const tool = params.tool_name || params.toolName;
     return `Hook · ${event}${tool ? ` · ${tool}` : ""}`;
   }
-  const titles: Record<string, [string, string]> = {
-    task_backgrounded: ["任务已转入后台", "Task moved to background"],
-    task_completed: ["后台任务完成", "Background task finished"],
-    retry_state: ["Runtime 正在重试", "Runtime is retrying"],
-    memory_flush_started: ["正在写入 Memory", "Writing memory"],
-    memory_flush_completed: ["Memory 写入完成", "Memory written"],
-    turn_completed: ["本轮执行完成", "Turn completed"],
-    session_recap: ["Session 回顾", "Session recap"],
+  const titles: Record<string, string> = {
+    task_backgrounded: copy.taskBackgrounded,
+    task_completed: copy.taskCompleted,
+    retry_state: copy.runtimeRetrying,
+    memory_flush_started: copy.writingMemory,
+    memory_flush_completed: copy.memoryWritten,
+    turn_completed: copy.turnCompleted,
+    session_recap: copy.sessionRecap,
   };
-  const pair = titles[method];
-  if (pair) return lang === "en" ? pair[1] : pair[0];
-  return method.replace(/_/g, " ");
+  return titles[method] || method.replace(/_/g, " ");
 }
 
 function formatTokens(value: number) {
@@ -366,12 +499,13 @@ function migrateSettings(saved?: Partial<AppSettings>): AppSettings {
   if (!saved?.contextWindowTokens || saved.contextWindowTokens === LEGACY_CONTEXT_WINDOW) {
     merged.contextWindowTokens = DEFAULT_CONTEXT_WINDOW;
   }
+  merged.keybindings = saved?.keybindings && typeof saved.keybindings === "object" ? saved.keybindings : {};
   return merged;
 }
 
 function isGenericTitle(title: string) {
   const value = (title || "").trim();
-  return !value || value === "Grok Session" || value === "新对话" || value === "New chat";
+  return !value || value === "Grok Session" || value === translate("zh").newChat || value === translate("zh-Hant").newChat || value === translate("en").newChat;
 }
 
 function mergeConversationMessages(left: ChatMessage[] = [], right: ChatMessage[] = []): ChatMessage[] {
@@ -415,6 +549,42 @@ function mergeConversationMessages(left: ChatMessage[] = [], right: ChatMessage[
   for (const item of rest) push(item);
   for (const item of pinned) push(item);
   return order.map((key) => byId.get(key)!);
+}
+
+/** Keep sticky user bubbles in chronological place (above the live reply), not tacked on the end. */
+function withStickyOutgoing(base: ChatMessage[], sticky: ChatMessage[]): ChatMessage[] {
+  if (!sticky.length) return base;
+  const stickyById = new Map(sticky.filter((item) => item.id).map((item) => [item.id, item]));
+  const seen = new Set<string>();
+  const next: ChatMessage[] = [];
+  for (const item of base) {
+    if (item.id && stickyById.has(item.id)) {
+      next.push(stickyById.get(item.id)!);
+      seen.add(item.id);
+      continue;
+    }
+    next.push(item);
+  }
+  for (const item of sticky) {
+    if (item.id && seen.has(item.id)) continue;
+    if (item.queued) {
+      next.push(item);
+      continue;
+    }
+    const idx = next.findIndex((message) => message.role === "assistant" && message.streaming);
+    if (idx >= 0) next.splice(idx, 0, item);
+    else next.push(item);
+  }
+  return next;
+}
+
+function assistantLivePhase(message: ChatMessage): "thinking" | "working" | null {
+  if (message.role !== "assistant" || !message.streaming) return null;
+  const hasOutput =
+    Boolean(message.text) ||
+    message.media.length > 0 ||
+    message.events.some((event) => event.kind !== "thought");
+  return hasOutput ? "working" : "thinking";
 }
 
 function betterConversation(current: Conversation, incoming: Conversation) {
@@ -644,7 +814,7 @@ function isImagePath(path: string) {
 function fileToAttachment(file: File): Promise<PromptAttachment> {
   return new Promise((resolve, reject) => {
     if (file.size > MAX_IMAGE_BYTES) {
-      reject(new Error("图片太大，请控制在 25MB 以内"));
+      reject(new Error("GROKDESK_IMAGE_TOO_LARGE"));
       return;
     }
     const reader = new FileReader();
@@ -657,7 +827,7 @@ function fileToAttachment(file: File): Promise<PromptAttachment> {
         name: file.name || "paste.png",
       });
     };
-    reader.onerror = () => reject(reader.error || new Error("无法读取图片"));
+    reader.onerror = () => reject(reader.error || new Error("GROKDESK_IMAGE_READ_FAILED"));
     reader.readAsDataURL(file);
   });
 }
@@ -708,6 +878,10 @@ type PersistShape = {
   sidebarWidth?: number;
   workspaceWidth?: number;
   showWorkspace?: boolean;
+  showTerminal?: boolean;
+  showSidebar?: boolean;
+  workspaceSide?: "left" | "right";
+  terminalHeight?: number;
   settings?: Partial<AppSettings>;
   availableModels?: CatalogModel[];
   relayReady?: boolean;
@@ -726,17 +900,111 @@ function loadPersist(): PersistShape {
   }
 }
 
+function mentionQuery(text: string, cursor: number) {
+  const before = text.slice(0, cursor);
+  const match = before.match(/(^|[\s])@([^\s@]*)$/);
+  if (!match) return null;
+  return { start: cursor - match[2].length - 1, query: match[2] };
+}
+
+function checkpointKey(conversationId: string, userId: string) {
+  return `${conversationId}:${userId}`;
+}
+
+function previousUserId(messages: ChatMessage[], assistantId: string) {
+  let prev = "";
+  for (const message of messages) {
+    if (message.role === "user") prev = message.id;
+    if (message.id === assistantId) return prev;
+  }
+  return prev;
+}
+
+function relPath(cwd: string, raw: string) {
+  const path = String(raw || "").replace(/\\/g, "/");
+  const root = String(cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!path) return "";
+  if (root && (path === root || path.startsWith(`${root}/`))) return path.slice(root.length + 1);
+  return path.replace(/^\.\//, "");
+}
+
+async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | null) {
+  let next = text.trim();
+  if (!cwd) return next;
+  const mentions = [...text.matchAll(/(?:^|[\s])@([^\s@]+)/g)].map((item) => item[1]);
+  const seen = new Set<string>();
+  for (const path of mentions) {
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    try {
+      const file = await invoke<{ content: string; truncated: boolean }>("read_workspace_file", {
+        root: cwd,
+        path,
+        ssh: ssh || null,
+      });
+      if (file.truncated || file.content.length > 80_000) {
+        next += `\n\n<file path="${path}">\n[file too large to inline]\n</file>`;
+      } else {
+        next += `\n\n<file path="${path}">\n${file.content}\n</file>`;
+      }
+    } catch {
+      try {
+        const entries = await invoke<WorkspaceEntry[]>("list_workspace", { root: cwd, path, ssh: ssh || null });
+        const names = (Array.isArray(entries) ? entries : []).slice(0, 40).map((item) => item.path).join("\n");
+        next += `\n\n<folder path="${path}">\n${names}\n</folder>`;
+      } catch {
+        // ignore missing mentions
+      }
+    }
+  }
+  try {
+    const rules = await invoke<{ path: string; content: string } | null>("read_project_rules", { root: cwd, ssh: ssh || null });
+    if (rules?.content.trim()) {
+      next += `\n\n<project_rules path="${rules.path}">\n${rules.content.slice(0, 20_000)}\n</project_rules>`;
+    }
+  } catch {
+    // no rules file is fine
+  }
+  return next;
+}
+
+function notifyTurnDone(copy: Copy, ok: boolean) {
+  if (typeof document === "undefined" || !document.hidden) return;
+  const title = ok ? copy.notifyTurnDone : copy.notifyTurnFailed;
+  try {
+    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+      new Notification(title, { body: copy.turnCompleted });
+    }
+  } catch {
+    // webview may not expose Notification
+  }
+  void import("@tauri-apps/api/window")
+    .then(({ getCurrentWindow }) => getCurrentWindow().requestUserAttention(1))
+    .catch(() => undefined);
+}
+
 export default function App() {
   const saved = useMemo(loadPersist, []);
-  const [lang, setLang] = useState<Lang>(saved.lang === "en" ? "en" : "zh");
+  const [lang, setLang] = useState<Lang>(() => parseLang(saved.lang) || detectLang());
   const [theme, setTheme] = useState<Theme>(saved.theme || "system");
   const [view, setView] = useState<View>("chat");
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("general");
-  const [showSidebar, setShowSidebar] = useState(true);
+  const [showSidebar, setShowSidebar] = useState(saved.showSidebar !== false);
   const [showInspector, setShowInspector] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(Boolean(saved.showWorkspace));
+  const [workspaceSide, setWorkspaceSide] = useState<"left" | "right">(saved.workspaceSide === "left" ? "left" : "right");
+  const [showTerminal, setShowTerminal] = useState(Boolean(saved.showTerminal));
+  const [terminalHeight, setTerminalHeight] = useState(Math.min(420, Math.max(160, saved.terminalHeight || 220)));
+  const [agentTermJobs, setAgentTermJobs] = useState<AgentTermJob[]>([]);
+  const [panelChannel, setPanelChannel] = useState<PanelChannel>("terminal");
+  const [panelOutput, setPanelOutput] = useState<string[]>([]);
+  const [runJob, setRunJob] = useState<RunJob | null>(null);
   const [workspaceFocusPath, setWorkspaceFocusPath] = useState("");
   const [workspaceFocusTick, setWorkspaceFocusTick] = useState(0);
+  const [workspaceRestoreTick, setWorkspaceRestoreTick] = useState(0);
+  const [paletteMode, setPaletteMode] = useState<null | "file" | "grep">(null);
+  const [mention, setMention] = useState<{ start: number; query: string; items: WorkspaceEntry[]; index: number } | null>(null);
+  const [checkpointFlags, setCheckpointFlags] = useState<Record<string, true>>({});
   const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [showUsageCard, setShowUsageCard] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(Math.min(400, Math.max(220, saved.sidebarWidth || 280)));
@@ -855,7 +1123,14 @@ export default function App() {
   const historyBusyRef = useRef(false);
   const historyLockedRef = useRef(false);
   const historyEpochRef = useRef(0);
+  const checkpointsRef = useRef(new Map<string, SnapshotFile[]>());
+  const turnUserIdRef = useRef("");
+  const mentionRef = useRef(mention);
+  mentionRef.current = mention;
+  const imeRef = useRef({ composing: false, until: 0 });
+  const newChatRef = useRef(() => {});
   const userPinnedRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
   const promptQueueRef = useRef<QueuedPrompt[]>([]);
   const sendTextRef = useRef<(
     text: string,
@@ -863,6 +1138,9 @@ export default function App() {
     options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean },
   ) => Promise<void>>(async () => {});
   const shownCountRef = useRef(VIEW_PAGE);
+  const showTerminalRef = useRef(showTerminal);
+  const workspaceRootRef = useRef("");
+  const activeSshRef = useRef<SshTarget | null>(null);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
   runningRef.current = running;
@@ -878,6 +1156,7 @@ export default function App() {
   relayQuotaRef.current = relayQuota;
   relayReadyRef.current = relayReady;
   shownCountRef.current = shownCount;
+  showTerminalRef.current = showTerminal;
   sendTextRef.current = sendText;
 
   useEffect(() => {
@@ -886,19 +1165,34 @@ export default function App() {
   }, [conversations, selectedId]);
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
+
+  useEffect(() => {
+    if (!showTerminal) {
+      setAgentTermJobs([]);
+      return;
+    }
+    if (!runningRef.current) return;
+    const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+    const last = [...(conversation?.messages || [])].reverse().find((item) => item.role === "assistant");
+    const jobs = (last?.events || [])
+      .map(agentJobFromEvent)
+      .filter((item): item is AgentTermJob => Boolean(item));
+    if (jobs.length) setAgentTermJobs(jobs);
+  }, [showTerminal]);
   const visibleMessages = useMemo(() => {
     const base = selected?.messages || [];
     if (!stickyOutgoing.length) return base;
-    const stickyIds = new Set(stickyOutgoing.map((item) => item.id).filter(Boolean));
     // Prefer sticky copies for outgoing user bubbles so a mid-turn conversations rewrite
-    // cannot blank the transcript. Keep non-sticky messages as-is.
-    const withoutStickyDupes = base.filter((item) => !item.id || !stickyIds.has(item.id));
-    return [...withoutStickyDupes, ...stickyOutgoing];
+    // cannot blank the transcript. Overlay in place so the user turn stays above Grok.
+    return withStickyOutgoing(base, stickyOutgoing);
   }, [selected?.messages, stickyOutgoing]);
   const homeDir = status?.homeDir || "";
   const sessionCwd = selected?.cwd || cwd;
   const activeSsh = selected?.ssh || (isSshWorkspace(sessionCwd) ? parseSshWorkspace(sessionCwd) : null);
   const workspaceRoot = activeSsh ? activeSsh.remotePath : usableWorkspace(sessionCwd, homeDir);
+  workspaceRootRef.current = workspaceRoot;
+  activeSshRef.current = activeSsh;
+  const keys = resolvedBindings(settings.keybindings);
   const projectName = activeSsh ? sshLabel(activeSsh, workspaceRoot) : workspaceLabel(sessionCwd, homeDir, t.home);
   const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing;
   const relayConfigured = Boolean(relayQuota?.configured || relayReady);
@@ -920,9 +1214,7 @@ export default function App() {
       ? relayQuota?.name || form.name || t.xiaohaRelay
       : activeAccount?.name || t.askAccount;
   const quotaText = usingOfficialQuota
-    ? lang === "en"
-      ? `${Math.round(activeAccount!.quota!.weeklyRemainingPercent!)}% weekly remaining`
-      : `本周剩余 ${Math.round(activeAccount!.quota!.weeklyRemainingPercent!)}%`
+    ? fill(t.weeklyRemaining, { n: Math.round(activeAccount!.quota!.weeklyRemainingPercent!) })
     : relayQuotaText
       || (activeAccount?.loggedIn
         ? t.quotaPending
@@ -953,7 +1245,8 @@ export default function App() {
   );
 
   useEffect(() => {
-    document.documentElement.lang = lang === "en" ? "en" : "zh-CN";
+    uiLang = lang;
+    document.documentElement.lang = htmlLang(lang);
     document.documentElement.dataset.theme = theme;
   }, [lang, theme]);
 
@@ -988,13 +1281,88 @@ export default function App() {
         sidebarWidth,
         workspaceWidth,
         showWorkspace,
+        showTerminal,
+        showSidebar,
+        workspaceSide,
+        terminalHeight,
         settings,
         form: { ...form, apiKey: "" },
         availableModels,
         relayReady,
       }),
     );
-  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, workspaceWidth, showWorkspace, form, settings, availableModels, relayReady]);
+  }, [lang, theme, model, cwd, selectedId, conversations, sidebarWidth, workspaceWidth, showWorkspace, showTerminal, showSidebar, workspaceSide, terminalHeight, form, settings, availableModels, relayReady]);
+
+  useEffect(() => {
+    if (!mention || !workspaceRoot) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void invoke<WorkspaceEntry[]>("search_workspace", {
+        root: workspaceRoot,
+        query: mention.query,
+        limit: 20,
+        ssh: activeSsh || null,
+      })
+        .then((rows) => {
+          if (cancelled) return;
+          setMention((current) =>
+            current ? { ...current, items: Array.isArray(rows) ? rows.slice(0, 12) : [], index: 0 } : current,
+          );
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setMention((current) => (current ? { ...current, items: [], index: 0 } : current));
+        });
+    }, 60);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeSsh, mention?.query, mention?.start, workspaceRoot]);
+
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      const map = resolvedBindings(settingsRef.current.keybindings);
+      if (chordsMatch(event, map.quickOpen)) {
+        event.preventDefault();
+        setView("chat");
+        setPaletteMode("file");
+        return;
+      }
+      if (chordsMatch(event, map.projectSearch)) {
+        event.preventDefault();
+        setView("chat");
+        setPaletteMode("grep");
+        return;
+      }
+      if (chordsMatch(event, map.openSettings)) {
+        event.preventDefault();
+        setView("settings");
+        return;
+      }
+      if (chordsMatch(event, map.toggleSidebar)) {
+        event.preventDefault();
+        setShowSidebar((value) => !value);
+        return;
+      }
+      if (chordsMatch(event, map.toggleWorkspace)) {
+        event.preventDefault();
+        setShowWorkspace((value) => !value);
+        return;
+      }
+      if (chordsMatch(event, map.toggleTerminal)) {
+        event.preventDefault();
+        setShowTerminal((value) => !value);
+        return;
+      }
+      if (chordsMatch(event, map.newChat)) {
+        event.preventDefault();
+        newChatRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   useEffect(() => {
     setUsage((current) =>
@@ -1072,18 +1440,19 @@ export default function App() {
 
   const updateFollowState = useCallback((el: HTMLElement) => {
     const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const pinned = gap < 48;
-    followRef.current = pinned;
-    userPinnedRef.current = !pinned;
-    syncJumpButton(el);
-
-    // 修复：当 Grok 正在处理时，强制保持在底部（防止消息被“不见”）
-    if (runningRef.current) {
-      el.scrollTop = el.scrollHeight;
+    const scrolledUp = el.scrollTop + 1 < lastScrollTopRef.current;
+    lastScrollTopRef.current = el.scrollTop;
+    // Wheel/trackpad up unpins even while still close to the bottom, so a
+    // streaming token cannot snatch the viewport back. Rubber-band past the
+    // bottom keeps gap <= 0 and must not count as a user unpin.
+    if (scrolledUp && gap >= 1) {
+      followRef.current = false;
+      userPinnedRef.current = true;
+    } else if (gap < 48) {
       followRef.current = true;
       userPinnedRef.current = false;
-      setShowJumpToBottom(false);
     }
+    syncJumpButton(el);
   }, [syncJumpButton]);
 
   const scrollToBottom = useCallback((force = false) => {
@@ -1091,6 +1460,7 @@ export default function App() {
     if (!el) return;
     if (!force && (userPinnedRef.current || !followRef.current)) return;
     el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
     followRef.current = true;
     userPinnedRef.current = false;
     setShowJumpToBottom(false);
@@ -1124,7 +1494,7 @@ export default function App() {
 
   const finishTurn = useCallback((error?: string) => {
     const cancelled = isUserCancelError(error);
-    const err = error && !cancelled ? friendlyError(error) : undefined;
+    const err = error && !cancelled ? friendlyError(error, tRef.current) : undefined;
     setConversations((list) => {
       const next = list.map((item) => {
         if (item.id !== selectedIdRef.current) return item;
@@ -1134,7 +1504,7 @@ export default function App() {
         const sealed = item.messages.map((message) => {
           if (message.role === "assistant" && message.streaming) {
             sealedLive = true;
-            return sealAssistantMessage(message, { error, stopped: cancelled });
+            return sealAssistantMessage(message, { error, stopped: cancelled, copy: tRef.current });
           }
           return message;
         });
@@ -1163,6 +1533,29 @@ export default function App() {
     setRunning(false);
     runningRef.current = false;
     setStatusText(cancelled ? tRef.current.stopped : err || tRef.current.ready);
+    notifyTurnDone(tRef.current, !cancelled && !err);
+    if (!cancelled && !err && settingsRef.current.gitAutoCommit) {
+      const root = workspaceRootRef.current;
+      if (root) {
+        const conv = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+        const lastUser = [...(conv?.messages || [])].reverse().find((item) => item.role === "user");
+        const title = (lastUser?.text || conv?.title || "update").replace(/\s+/g, " ").trim().slice(0, 72);
+        const template = settingsRef.current.gitAutoCommitMessage || "xiaoha: {title}";
+        const message = template.split("{title}").join(title || "update");
+        const ssh = activeSshRef.current;
+        void invoke<string>("git_commit", { root, message, ssh: ssh || null, all: null })
+          .then((out) => {
+            setPanelOutput((current) => [...current.slice(-200), `git commit: ${message}${out ? `\n${out}` : ""}`]);
+            if (!settingsRef.current.gitAutoPush) return;
+            return invoke<string>("git_push", { root, ssh: ssh || null }).then((push) => {
+              setPanelOutput((current) => [...current.slice(-200), push || "git push"]);
+            });
+          })
+          .catch((fail) => {
+            setPanelOutput((current) => [...current.slice(-200), String(fail)]);
+          });
+      }
+    }
     window.setTimeout(() => {
       const next = promptQueueRef.current.shift();
       setQueuedPrompts([...promptQueueRef.current]);
@@ -1177,6 +1570,7 @@ export default function App() {
 
   const handleAcpUpdate = useCallback(
     (payload: AcpUpdate) => {
+      const copy = translate(lang);
       const params = payload.params || {};
       const meta = asRecord(params._meta);
       if (payload.method === "x.ai/models/update" || payload.method === "_x.ai/models/update") {
@@ -1204,7 +1598,7 @@ export default function App() {
             assistant.events = upsertEvent(assistant.events, {
               id: `permission-${Date.now()}`,
               kind: "permission",
-              title: lang === "en" ? "Allowed automatically" : "已自动允许操作",
+              title: t.allowedAutomatically,
               status: "approved",
             });
           });
@@ -1249,7 +1643,7 @@ export default function App() {
           assistant.events = upsertEvent(assistant.events, {
             id: "thought",
             kind: "thought",
-            title: lang === "en" ? "Thinking" : "思考过程",
+            title: copy.thinking,
             output: assistant.thought,
           });
         } else if (type === "tool_call" || type === "tool_call_update") {
@@ -1257,7 +1651,7 @@ export default function App() {
           const metaTool = toolMeta(update);
           const kind = String(update.kind || metaTool?.kind || metaTool?.name || "other");
           const rawTitle = String(
-            update.title || metaTool?.label || metaTool?.name || update.name || (lang === "en" ? "Tool" : "工具调用"),
+            update.title || metaTool?.label || metaTool?.name || update.name || copy.toolCall,
           );
           const diffs = extractFileDiffs(update);
           const inputRec = asRecord(update.rawInput ?? update.input ?? update.raw_input);
@@ -1286,17 +1680,53 @@ export default function App() {
             output,
             diffs: diffs.length ? diffs : undefined,
           });
+          if (
+            showTerminalRef.current &&
+            isCommandEvent({
+              id: `tool-${id}`,
+              kind: isEdit ? "edit" : kind,
+              title,
+              status: String(update.status || "pending"),
+              input,
+              output,
+              diffs: diffs.length ? diffs : undefined,
+            })
+          ) {
+            const command = extractShellCommand(inputRec, input);
+            setAgentTermJobs((current) =>
+              upsertAgentJob(current, {
+                id,
+                title: terminalJobTitle(command, title),
+                command: command || title,
+                output: extractShellOutput(output),
+                status: String(update.status || "pending"),
+              }),
+            );
+          }
           if (editPath && isEdit) {
             setWorkspaceFocusPath(editPath);
             setWorkspaceFocusTick((tick) => tick + 1);
             setShowWorkspace(true);
+            const convId = selectedIdRef.current;
+            const userId = turnUserIdRef.current;
+            if (convId && userId) {
+              const key = checkpointKey(convId, userId);
+              const current = [...(checkpointsRef.current.get(key) || [])];
+              for (const diff of diffs) {
+                const path = relPath(conversation.cwd || cwdRef.current, diff.path || editPath);
+                if (!path || current.some((item) => item.path === path)) continue;
+                current.push({ path, content: diff.oldText ? diff.oldText : null });
+              }
+              checkpointsRef.current.set(key, current);
+              if (current.length) setCheckpointFlags((flags) => ({ ...flags, [key]: true }));
+            }
           }
         } else if (type === "plan") {
           const entries = (update.entries as Array<Record<string, unknown>> | undefined) || [];
           assistant.events = upsertEvent(assistant.events, {
             id: "plan",
             kind: "plan",
-            title: lang === "en" ? "Plan" : "执行计划",
+            title: copy.execPlan,
             output: entries
               .map((entry) => `[${entry.status || "pending"}] ${entry.content || entry.text || ""}`)
               .join("\n"),
@@ -1305,7 +1735,7 @@ export default function App() {
           assistant.events = upsertEvent(assistant.events, {
             id: "active-compaction",
             kind: "compaction",
-            title: lang === "en" ? "Auto-compacting context" : "正在自动压缩上下文",
+            title: copy.autoCompacting,
             status: `${update.percentage || usagePercent}%`,
           });
         } else if (type === "auto_compact_completed") {
@@ -1318,18 +1748,18 @@ export default function App() {
           assistant.events = upsertEvent(assistant.events, {
             id: "active-compaction",
             kind: "compaction",
-            title: lang === "en" ? "Context compacted" : "上下文已自动压缩",
+            title: copy.contextCompacted,
             status: "completed",
             input: update.tokens_before || update.tokensBefore
-              ? `${lang === "en" ? "Before" : "压缩前"}：${formatTokens(Number(update.tokens_before ?? update.tokensBefore))} tokens`
+              ? `${copy.compactBefore}：${formatTokens(Number(update.tokens_before ?? update.tokensBefore))} tokens`
               : undefined,
-            output: `${lang === "en" ? "After" : "压缩后"}：${formatTokens(after)} tokens`,
+            output: `${copy.compactAfter}：${formatTokens(after)} tokens`,
           });
         } else if (type === "auto_compact_failed") {
           assistant.events = upsertEvent(assistant.events, {
             id: "active-compaction",
             kind: "compaction",
-            title: lang === "en" ? "Auto-compact failed" : "自动压缩失败",
+            title: copy.autoCompactFailed,
             status: "failed",
             output: String(update.error || ""),
           });
@@ -1362,6 +1792,7 @@ export default function App() {
     requestId: string;
     params: Record<string, unknown>;
   }) => {
+    const copy = translate(lang);
     const params = payload.params || {};
     if (payload.method === "x.ai/ask_user_question") {
       const questions = ((params.questions as Array<Record<string, unknown>>) || []).map((value) => ({
@@ -1382,7 +1813,7 @@ export default function App() {
         assistant.events = upsertEvent(assistant.events, {
           id: `interaction-${payload.requestId}`,
           kind: "question",
-          title: lang === "en" ? "Grok needs more information" : "Grok 请求补充信息",
+          title: copy.grokNeedsInfo,
           status: "pending",
           input: jsonText(params),
         });
@@ -1398,7 +1829,7 @@ export default function App() {
         assistant.events = upsertEvent(assistant.events, {
           id: `interaction-${payload.requestId}`,
           kind: "interaction",
-          title: lang === "en" ? "Review the plan" : "Grok 请求确认计划",
+          title: copy.grokNeedsPlan,
           status: "pending",
           input: jsonText(params),
         });
@@ -1408,19 +1839,19 @@ export default function App() {
     const tool = asRecord(params.toolCall) || asRecord(params.tool_call) || {};
     const options = ((params.options as Array<Record<string, unknown>>) || []).map((option) => ({
       id: String(option.optionId || option.option_id || option.id || ""),
-      name: String(option.name || (lang === "en" ? "Allow" : "允许")),
+      name: String(option.name || copy.allow),
       kind: String(option.kind || ""),
     }));
     setPendingPermission({
       id: payload.requestId,
-      title: String(tool.title || (lang === "en" ? "Grok wants to run an action" : "Grok 请求执行操作")),
+      title: String(tool.title || copy.grokWantsAction),
       options,
     });
     mutateAssistant((assistant) => {
       assistant.events = upsertEvent(assistant.events, {
         id: `interaction-${payload.requestId}`,
         kind: "permission",
-        title: String(tool.title || (lang === "en" ? "Permission request" : "Grok 请求执行操作")),
+        title: String(tool.title || copy.grokWantsAction),
         status: "pending",
         input: jsonText(params),
       });
@@ -1504,7 +1935,7 @@ export default function App() {
         events: (item.events || []).map((event) => ({
           id: event.id || uid(),
           kind: event.kind || "other",
-          title: event.title || event.kind || "工具调用",
+          title: event.title || event.kind || t.toolCall,
           status: event.status,
           input: event.input,
           output: event.output,
@@ -1584,14 +2015,18 @@ export default function App() {
   }, [selectedId, scrollToBottom]);
 
   useLayoutEffect(() => {
+    scrollToBottom();
     const el = transcriptRef.current;
     if (el) syncJumpButton(el);
-  }, [selected?.messages, shownCount, running, syncJumpButton]);
+  }, [selected?.messages, shownCount, running, scrollToBottom, syncJumpButton]);
 
   useEffect(() => {
     const root = transcriptRef.current;
     if (!root) return;
-    const sync = () => syncJumpButton(root);
+    const sync = () => {
+      scrollToBottom();
+      syncJumpButton(root);
+    };
     const observer = new ResizeObserver(sync);
     observer.observe(root);
     Array.from(root.children).forEach((child) => observer.observe(child));
@@ -1602,7 +2037,7 @@ export default function App() {
       observer.disconnect();
       window.removeEventListener("resize", sync);
     };
-  }, [selectedId, selected?.messages.length, shownCount, syncJumpButton]);
+  }, [selectedId, selected?.messages.length, shownCount, scrollToBottom, syncJumpButton]);
 
   useEffect(() => {
     const root = transcriptRef.current;
@@ -1802,7 +2237,7 @@ export default function App() {
     setSettingsPage("runtime");
     try {
       const path = await invoke<string>("install_runtime");
-      setInstallLog((log) => `${log}${lang === "en" ? "Installed: " : "安装完成："}${path}\n`);
+      setInstallLog((log) => `${log}${t.installedPrefix}${path}\n`);
       await refresh();
     } catch (error) {
       setInstallError(String(error));
@@ -1880,7 +2315,7 @@ export default function App() {
               if (!isImagePath(path)) continue;
               void invoke<PromptAttachment>("read_image_file", { path })
                 .then((item) => addPendingImagesRef.current([item]))
-                .catch((error) => setStatusText(String(error)));
+                .catch((error) => setStatusText(localizeThrown(error, tRef.current)));
             }
           } else {
             setDragOver(false);
@@ -1899,40 +2334,6 @@ export default function App() {
       stops.forEach((stop) => stop());
     };
   }, [ensureConversation, loadAccounts, loadLocalSessions, loadRelayModels, loadRelayQuota, loadSessionHistory, refresh, refreshQuotas, refreshSkills]);
-
-  useEffect(() => {
-    const onKey = (event: globalThis.KeyboardEvent) => {
-      const meta = event.metaKey || event.ctrlKey;
-      if (meta && event.key.toLowerCase() === "n") {
-        event.preventDefault();
-        const blank = conversationsRef.current.find(
-          (item) => item.messages.length === 0 && !item.archivedAt && !item.grokSessionId,
-        );
-        if (blank) {
-          setSelectedId(blank.id);
-          setView("chat");
-          return;
-        }
-        const created: Conversation = {
-          id: uid(),
-          title: tRef.current.newChat,
-          cwd: usableWorkspace(cwdRef.current, statusRef.current?.homeDir || ""),
-          messages: [],
-          updatedAt: Date.now(),
-        };
-        setConversations((list) => [created, ...list]);
-        setSelectedId(created.id);
-        setView("chat");
-        setPrompt("");
-      }
-      if (meta && event.key === ",") {
-        event.preventDefault();
-        setView("settings");
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
 
   function newConversation(account?: AccountRecord) {
     const blank = conversations.find((item) => item.messages.length === 0 && !item.archivedAt && !item.grokSessionId);
@@ -1968,6 +2369,8 @@ export default function App() {
     followRef.current = true;
     setShowJumpToBottom(false);
   }
+
+  newChatRef.current = () => newConversation();
 
   function selectConversation(id: string) {
     const item = conversations.find((entry) => entry.id === id);
@@ -2133,7 +2536,7 @@ export default function App() {
       }
       applyCwd(picked, null);
     } catch (error) {
-      setStatusText(String(error));
+      setStatusText(localizeThrown(error, t));
     }
   }
 
@@ -2235,8 +2638,8 @@ export default function App() {
     if (sshTarget?.auth === "password" && !String(sshTarget.password || "").trim()) {
       setShowSshModal(true);
       setSshForm({ ...emptySshTarget(), ...sshTarget, password: "" });
-      setSshError("远程密码登录需要重新输入密码后再发送。");
-      setStatusText("请重新输入 SSH 密码");
+      setSshError(t.reenterSshPassword);
+      setStatusText(t.reenterSshPasswordStatus);
       return;
     }
     const relayOn = Boolean(relayQuotaRef.current?.configured || relayReadyRef.current);
@@ -2265,7 +2668,7 @@ export default function App() {
     followRef.current = true;
     setShowJumpToBottom(false);
     const title =
-      conversation.title === translate("zh").newChat || conversation.title === translate("en").newChat
+      conversation.title === translate("zh").newChat || conversation.title === translate("zh-Hant").newChat || conversation.title === translate("en").newChat
         ? (text.trim() || attachments[0]?.name || t.newChat).slice(0, 28)
         : conversation.title;
     const existingUser = options?.messageId
@@ -2296,6 +2699,7 @@ export default function App() {
     userPinnedRef.current = false;
     followRef.current = true;
     setShownCount((count) => Math.max(count, conversation.messages.length + 2, VIEW_PAGE));
+    turnUserIdRef.current = user.id;
     const optimisticMessages = existingUser
       ? [
           ...conversation.messages.map((item) => (item.id === existingUser.id ? user : item)).filter((item) => !item.queued || item.id === user.id),
@@ -2312,8 +2716,16 @@ export default function App() {
     );
     setStickyOutgoing((current) => [...current.filter((item) => item.id !== user.id), user]);
     requestAnimationFrame(() => scrollToBottom(true));
+    if (typeof Notification !== "undefined" && Notification.permission === "default") {
+      void Notification.requestPermission().catch(() => undefined);
+    }
     try {
       const workspaceCwd = sshTarget ? sshWorkspaceId(sshTarget) : conversation.cwd || cwdRef.current;
+      const promptCwd = sshTarget?.remotePath || conversation.cwd || cwdRef.current;
+      const checkpointPromise = promptCwd
+        ? invoke<SnapshotFile[]>("capture_checkpoint", { root: promptCwd, ssh: sshTarget || null }).catch(() => [])
+        : Promise.resolve([] as SnapshotFile[]);
+      const expanded = await expandPromptContext(text.trim(), promptCwd, sshTarget || null);
       const session = await invoke<SessionInfo>("ensure_session", {
         options: {
           model: canonicalModelId(modelRef.current),
@@ -2355,15 +2767,21 @@ export default function App() {
         return next;
       });
       setStatusText(t.running);
+      const snapshot = await checkpointPromise;
+      const key = checkpointKey(conversation.id, user.id);
+      if (snapshot.length) {
+        checkpointsRef.current.set(key, snapshot);
+        setCheckpointFlags((flags) => ({ ...flags, [key]: true }));
+      }
       await invoke("send_prompt", {
-        text: text.trim(),
+        text: expanded,
         attachments: attachments.length ? attachments : null,
       });
     } catch (error) {
       if (turnId !== turnIdRef.current) return;
       setPendingImages(attachments);
       const message = String(error);
-      if (/GROKDESK_NO_CREDENTIALS|还没有可用的登录或 API Key/.test(message)) {
+      if (isMissingCredentials(message)) {
         setView("settings");
         setSettingsPage("relay");
       }
@@ -2378,7 +2796,7 @@ export default function App() {
   async function stopTurn() {
     turnIdRef.current += 1;
     // Freeze the live assistant first so cancel/stop cannot blank the transcript.
-    finishTurn("连接已取消");
+    finishTurn(t.connectionCancelled);
     try {
       await invoke("cancel_turn");
     } catch {
@@ -2481,10 +2899,49 @@ export default function App() {
     await sendText(lastUser.text, extras);
   }
 
+  function isImeBlocked(event: { nativeEvent?: globalThis.KeyboardEvent } & { isComposing?: boolean; keyCode?: number; key?: string }) {
+    const native = event.nativeEvent || (event as globalThis.KeyboardEvent);
+    if (isImeEvent(native)) return true;
+    if (imeRef.current.composing) return true;
+    if (Date.now() < imeRef.current.until) return true;
+    return false;
+  }
   function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (isImeBlocked(event)) return;
+    const menu = mentionRef.current;
+    if (menu) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setMention((current) => current && { ...current, index: Math.min(current.items.length - 1, current.index + 1) });
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setMention((current) => current && { ...current, index: Math.max(0, current.index - 1) });
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        const item = menu.items[menu.index];
+        if (item) {
+          event.preventDefault();
+          insertMention(item.path);
+          return;
+        }
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMention(null);
+        return;
+      }
+    }
+    const map = resolvedBindings(settingsRef.current.keybindings);
+    if (chordsMatch(event.nativeEvent, map.sendMessage)) {
       event.preventDefault();
       void send();
+      return;
+    }
+    if (chordsMatch(event.nativeEvent, map.newLine)) {
+      return;
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
       pasteHandledRef.current = false;
@@ -2529,7 +2986,7 @@ export default function App() {
       try {
         addPendingImages(await Promise.all(images.map(fileToAttachment)));
       } catch (error) {
-        setStatusText(String(error));
+        setStatusText(localizeThrown(error, t));
       }
       return;
     }
@@ -2543,7 +3000,7 @@ export default function App() {
       const native = await invoke<PromptAttachment | null>("read_clipboard_image");
       if (native?.data) addPendingImages([native]);
     } catch (error) {
-      setStatusText(String(error));
+      setStatusText(localizeThrown(error, t));
     }
   }
 
@@ -2555,7 +3012,42 @@ export default function App() {
     try {
       addPendingImages(await Promise.all(files.map(fileToAttachment)));
     } catch (error) {
-      setStatusText(String(error));
+      setStatusText(localizeThrown(error, t));
+    }
+  }
+
+  function insertMention(path: string) {
+    const menu = mentionRef.current;
+    const el = composerRef.current;
+    if (!menu || !el) return;
+    const cursor = el.selectionStart ?? prompt.length;
+    const next = `${prompt.slice(0, menu.start)}@${path} ${prompt.slice(cursor)}`;
+    setPrompt(next);
+    setMention(null);
+    requestAnimationFrame(() => {
+      const pos = menu.start + path.length + 2;
+      el.focus();
+      el.setSelectionRange(pos, pos);
+      resizeComposer();
+    });
+  }
+
+  async function restoreTurn(userMessageId: string) {
+    const key = checkpointKey(selectedId || "", userMessageId);
+    const files = checkpointsRef.current.get(key) || [];
+    if (!files.length || !workspaceRoot) {
+      setStatusText(t.restoreTurnEmpty);
+      return;
+    }
+    setStatusText(t.restoringTurn);
+    try {
+      await invoke("restore_checkpoint", { root: workspaceRoot, files, ssh: activeSsh || null });
+      setWorkspaceRestoreTick((tick) => tick + 1);
+      setWorkspaceFocusTick((tick) => tick + 1);
+      setShowWorkspace(true);
+      setStatusText(t.restoredTurn);
+    } catch (error) {
+      setStatusText(localizeThrown(error, t));
     }
   }
 
@@ -2601,9 +3093,6 @@ export default function App() {
       followRef.current = false;
       userPinnedRef.current = true;
     }
-    const el = transcriptRef.current;
-    if (!el) return;
-    requestAnimationFrame(() => updateFollowState(el));
   }
 
   function beginResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -2623,8 +3112,9 @@ export default function App() {
   function beginWorkspaceResize(event: ReactPointerEvent<HTMLDivElement>) {
     const start = workspaceWidth;
     const origin = event.clientX;
+    const sign = workspaceSide === "left" ? 1 : -1;
     const move = (next: PointerEvent) => {
-      setWorkspaceWidth(Math.min(920, Math.max(380, start - (next.clientX - origin))));
+      setWorkspaceWidth(Math.min(920, Math.max(380, start + sign * (next.clientX - origin))));
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -2652,7 +3142,7 @@ export default function App() {
         });
       });
     } catch (error) {
-      setStatusText(String(error));
+      setStatusText(localizeThrown(error, t));
     }
     setPendingPermission(null);
   }
@@ -2674,7 +3164,7 @@ export default function App() {
         },
       });
     } catch (error) {
-      setStatusText(String(error));
+      setStatusText(localizeThrown(error, t));
     }
     setPendingQuestion(null);
     setQuestionAnswers({});
@@ -2692,7 +3182,7 @@ export default function App() {
         },
       });
     } catch (error) {
-      setStatusText(String(error));
+      setStatusText(localizeThrown(error, t));
     }
     setPendingPlan(null);
     setPlanFeedback("");
@@ -2943,22 +3433,36 @@ export default function App() {
         onDeleteArchived={deleteConversation}
       />
       {sshModal}
+      <QuickOpen
+        open={paletteMode != null}
+        mode={paletteMode || "file"}
+        cwd={workspaceRoot}
+        ssh={activeSsh}
+        copy={t}
+        onClose={() => setPaletteMode(null)}
+        onOpenFile={(path) => {
+          setShowWorkspace(true);
+          setWorkspaceFocusPath(path);
+          setWorkspaceFocusTick((tick) => tick + 1);
+          setView("chat");
+        }}
+      />
       </>
     );
   }
 
   return (
-    <div className="app" onClick={() => setShowAccountMenu(false)}>
+    <div className={`app${workspaceSide === "left" ? " ws-left" : " ws-right"}`} onClick={() => setShowAccountMenu(false)}>
       {showSidebar ? (
         <>
           <aside className="sidebar" style={{ width: sidebarWidth }}>
             <div className="brand-row">
               <GrokMark size={22} className="brand-mark" />
               <div className="brand-name">{t.brand}</div>
-              <button className="icon-btn" type="button" title={t.hideSidebar} onClick={() => setShowSidebar(false)}>
+              <button className="icon-btn" type="button" title={withShortcut(t.hideSidebar, keys.toggleSidebar)} onClick={() => setShowSidebar(false)}>
                 <IconSidebar />
               </button>
-              <button className="icon-btn" type="button" title={t.newChat} onClick={() => newConversation()}>
+              <button className="icon-btn" type="button" title={withShortcut(t.newChat, keys.newChat)} onClick={() => newConversation()}>
                 <IconCompose />
               </button>
             </div>
@@ -3059,24 +3563,19 @@ export default function App() {
               ) : null}
             </div>
           </aside>
-          <div className="resize" onPointerDown={beginResize} />
+          <div className="resize sidebar-edge" onPointerDown={beginResize} />
         </>
       ) : null}
 
       <main className="main">
         <header className="chat-header">
           <div className="crumb">
-            {!showSidebar ? (
-              <button className="icon-btn" type="button" title={t.showSidebar} onClick={() => setShowSidebar(true)}>
-                <IconSidebar />
-              </button>
-            ) : null}
             <button className="crumb-folder" type="button" title={t.pickWorkspace} onClick={() => void pickWorkspaceFolder()}>
               <IconFolder />
               <span>{workspaceRoot ? projectName : t.chooseFolder}</span>
             </button>
             <button className="icon-btn" type="button" title={t.sshConnect} onClick={() => void openSshModal()}>
-              <IconTerminal />
+              <IconSsh />
             </button>
             <span className="sep">
               <IconChevronRight />
@@ -3093,12 +3592,39 @@ export default function App() {
               <div className="live quiet">{osLabel}</div>
             ) : null}
             <button
+              className={`icon-btn${showSidebar ? " on" : ""}`}
+              type="button"
+              title={withShortcut(showSidebar ? t.hideSidebar : t.showSidebar, keys.toggleSidebar)}
+              onClick={() => setShowSidebar((value) => !value)}
+            >
+              <IconSidebar />
+            </button>
+            <button
               className={`icon-btn${showWorkspace ? " on" : ""}`}
               type="button"
-              title={showWorkspace ? t.hideWorkspace : t.showWorkspace}
+              title={withShortcut(showWorkspace ? t.hideWorkspace : t.showWorkspace, keys.toggleWorkspace)}
               onClick={() => setShowWorkspace((value) => !value)}
             >
-              <IconCodePane />
+              {workspaceSide === "left" ? <IconPanelLeft /> : <IconCodePane />}
+            </button>
+            {showWorkspace ? (
+              <button
+                className="icon-btn"
+                type="button"
+                title={workspaceSide === "left" ? t.workspaceMoveRight : t.workspaceMoveLeft}
+                onClick={() => setWorkspaceSide((value) => (value === "left" ? "right" : "left"))}
+              >
+                {workspaceSide === "left" ? <IconCodePane /> : <IconPanelLeft />}
+              </button>
+            ) : null}
+            <button
+              className={`header-tool${showTerminal ? " on" : ""}`}
+              type="button"
+              title={withShortcut(showTerminal ? t.hideTerminal : t.showTerminal, keys.toggleTerminal)}
+              onClick={() => setShowTerminal((value) => !value)}
+            >
+              <IconTerminal />
+              <span>{t.terminal}</span>
             </button>
             <button
               className={`icon-btn${showInspector ? " on" : ""}`}
@@ -3111,7 +3637,15 @@ export default function App() {
             <button
               className="icon-btn"
               type="button"
-              title={t.settings}
+              title={withShortcut(t.quickOpen, keys.quickOpen)}
+              onClick={() => setPaletteMode("file")}
+            >
+              <IconSearch />
+            </button>
+            <button
+              className="icon-btn"
+              type="button"
+              title={withShortcut(t.settings, keys.openSettings)}
               onClick={() => {
                 setView("settings");
                 setSettingsPage("general");
@@ -3169,7 +3703,12 @@ export default function App() {
             ) : (
               <div className="messages">
                 <div ref={topSentinelRef} className="history-sentinel" />
-                {visibleMessages.slice(Math.max(0, visibleMessages.length - shownCount)).map((message) => (
+                {visibleMessages.slice(Math.max(0, visibleMessages.length - shownCount)).map((message) => {
+                  const livePhase = assistantLivePhase(message);
+                  const showThinkingBar =
+                    livePhase === "thinking" && !(message.thought && !message.events.length);
+                  const showWorkingBar = livePhase === "working";
+                  return (
                   <article key={message.id} className={`row ${message.role}`}>
                     <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
                       {message.role === "user" && editingMessageId === message.id ? (
@@ -3180,7 +3719,14 @@ export default function App() {
                             autoFocus
                             rows={Math.min(8, Math.max(2, editingDraft.split("\n").length))}
                             onChange={(event) => setEditingDraft(event.target.value)}
+                            onCompositionStart={() => {
+                              imeRef.current = { composing: true, until: 0 };
+                            }}
+                            onCompositionEnd={() => {
+                              imeRef.current = { composing: false, until: Date.now() + 120 };
+                            }}
                             onKeyDown={(event) => {
+                              if (isImeBlocked(event)) return;
                               if (event.key === "Enter" && !event.shiftKey) {
                                 event.preventDefault();
                                 void saveEditedMessage();
@@ -3212,10 +3758,10 @@ export default function App() {
                           />
                         </>
                       ) : message.thought ? (
-                        <details className="thought" open={(message.streaming || Boolean(message.stopped)) && !message.text}>
+                        <details className="thought" open={(livePhase === "thinking" || Boolean(message.stopped)) && !message.text}>
                           <summary>
-                            {message.streaming ? <ThinkingOrbs /> : null}
-                            {message.streaming ? (
+                            {livePhase === "thinking" ? <ThinkingOrbs /> : null}
+                            {livePhase === "thinking" ? (
                               <TextShimmer>{t.thinkingNow}</TextShimmer>
                             ) : (
                               t.thinking
@@ -3224,11 +3770,7 @@ export default function App() {
                           <pre>{message.thought}</pre>
                         </details>
                       ) : null}
-                      {message.role === "assistant" &&
-                      message.streaming &&
-                      !message.events.length &&
-                      !message.thought &&
-                      !message.text ? (
+                      {showThinkingBar ? (
                         <div className="thinking-bar">
                           <ThinkingOrbs />
                           <TextShimmer>{t.thinkingNow}</TextShimmer>
@@ -3251,7 +3793,7 @@ export default function App() {
                           </a>
                         ),
                       )}
-                      {message.streaming ? (
+                      {showWorkingBar ? (
                         <div className="working">
                           <ThinkingOrbs />
                           <TextShimmer>{t.working}</TextShimmer>
@@ -3272,6 +3814,23 @@ export default function App() {
                           </button>
                         </div>
                       ) : null}
+                      {message.role === "assistant" && !message.streaming ? (() => {
+                        const userId = previousUserId(visibleMessages, message.id);
+                        const key = checkpointKey(selected?.id || "", userId);
+                        if (!userId || !checkpointFlags[key]) return null;
+                        return (
+                          <div className="user-actions">
+                            <button
+                              className="ghost compact nowrap"
+                              type="button"
+                              title={t.restoreTurnHint}
+                              onClick={() => void restoreTurn(userId)}
+                            >
+                              {t.restoreTurn}
+                            </button>
+                          </div>
+                        );
+                      })() : null}
                       {message.role === "user" && editingMessageId !== message.id ? (
                         <div className="user-actions">
                           {message.queued ? <span className="queued-pill">{t.queuedToSend}</span> : null}
@@ -3282,7 +3841,8 @@ export default function App() {
                       ) : null}
                     </div>
                   </article>
-                ))}
+                  );
+                })}
               </div>
             )}
           </section>
@@ -3390,17 +3950,55 @@ export default function App() {
                 ))}
               </div>
             ) : null}
-            <textarea
-              ref={composerRef}
-              rows={1}
-              value={prompt}
-              placeholder={pendingImages.length ? t.pasteImage : t.composer}
-              onChange={(event) => {
-                setPrompt(event.target.value);
-                requestAnimationFrame(resizeComposer);
-              }}
-              onKeyDown={onComposerKey}
-            />
+            <div className="composer-input-wrap">
+              {mention?.items.length ? (
+                <div className="mention-menu" role="listbox" aria-label={t.mentionFiles}>
+                  {mention.items.map((item, index) => (
+                    <button
+                      key={item.path}
+                      type="button"
+                      className={index === mention.index ? "on" : ""}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        insertMention(item.path);
+                      }}
+                    >
+                      <span>{item.name}</span>
+                      <em>{item.path}{item.isDir ? "/" : ""}</em>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <textarea
+                ref={composerRef}
+                rows={1}
+                value={prompt}
+                placeholder={pendingImages.length ? t.pasteImage : t.composer}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setPrompt(value);
+                  const found = mentionQuery(value, event.target.selectionStart || 0);
+                  setMention(found ? { start: found.start, query: found.query, items: mentionRef.current?.query === found.query ? mentionRef.current.items : [], index: 0 } : null);
+                  requestAnimationFrame(resizeComposer);
+                }}
+                onClick={(event) => {
+                  const found = mentionQuery(prompt, event.currentTarget.selectionStart || 0);
+                  if (!found) setMention(null);
+                }}
+                onKeyUp={(event) => {
+                  if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === "Tab" || event.key === "Escape") return;
+                  const found = mentionQuery(prompt, event.currentTarget.selectionStart || 0);
+                  if (!found) setMention(null);
+                }}
+                onCompositionStart={() => {
+                  imeRef.current = { composing: true, until: 0 };
+                }}
+                onCompositionEnd={() => {
+                  imeRef.current = { composing: false, until: Date.now() + 120 };
+                }}
+                onKeyDown={onComposerKey}
+              />
+            </div>
             <div className="composer-bar">
               <Select
                 className="perm-mode"
@@ -3412,8 +4010,8 @@ export default function App() {
                 ariaLabel={t.permissionMode}
                 options={PERMISSION_MODES.map((item) => ({
                   id: item.id,
-                  label: lang === "en" ? item.labelEn : item.labelZh,
-                  hint: lang === "en" ? item.hintEn : item.hintZh,
+                  label: permissionModeLabel(item.id, lang),
+                  hint: permissionModeHint(item.id, lang),
                   icon: permissionModeIcon(item.id, 13),
                 }))}
               />
@@ -3446,7 +4044,7 @@ export default function App() {
                   <IconStop />
                 </button>
               ) : (
-                <button className="send" type="button" disabled={!canSend} title={t.sendHint} onClick={() => void send()}>
+                <button className="send" type="button" disabled={!canSend} title={`${formatChord(keys.sendMessage)} ${t.cmdSendMessage} · ${formatChord(keys.newLine)} ${t.composerNewLine}`} onClick={() => void send()}>
                   <IconArrowUp />
                 </button>
               )}
@@ -3476,6 +4074,24 @@ export default function App() {
             ) : null}
           </div>
         </footer>
+        {showTerminal ? (
+          <Suspense fallback={<div className="term-pane" style={{ height: terminalHeight }} />}>
+            <TerminalPanel
+              cwd={workspaceRoot || homeDir}
+              ssh={activeSsh}
+              theme={theme}
+              copy={t}
+              height={terminalHeight}
+              agentJobs={agentTermJobs}
+              channel={panelChannel}
+              onChannel={setPanelChannel}
+              outputLines={panelOutput}
+              runJob={runJob}
+              onResize={setTerminalHeight}
+              onClose={() => setShowTerminal(false)}
+            />
+          </Suspense>
+        ) : null}
       </main>
 
       {showWorkspace ? (
@@ -3489,11 +4105,35 @@ export default function App() {
               diffs={fileDiffs}
               focusPath={workspaceFocusPath}
               focusTick={workspaceFocusTick}
+              restoreTick={workspaceRestoreTick}
+              saveChord={keys.saveFile}
               copy={t}
+              side={workspaceSide}
               onClose={() => setShowWorkspace(false)}
+              onMoveSide={() => setWorkspaceSide((value) => (value === "left" ? "right" : "left"))}
               onPickFolder={() => void pickWorkspaceFolder()}
               onConnectSsh={() => void openSshModal()}
               width={workspaceWidth}
+              gitAutoCommit={Boolean(settings.gitAutoCommit)}
+              gitAutoPush={Boolean(settings.gitAutoPush)}
+              gitAutoCommitMessage={settings.gitAutoCommitMessage || "xiaoha: {title}"}
+              onGitSettings={(patch) => patchSettings(patch)}
+              onOpenPanel={(next) => {
+                setShowTerminal(true);
+                setPanelChannel(next);
+              }}
+              onRun={(job) => {
+                setShowTerminal(true);
+                setPanelChannel("debug");
+                setRunJob(job);
+                setPanelOutput((current) => [...current.slice(-200), `$ ${job.argv.join(" ")}`]);
+              }}
+              onLog={(line) => setPanelOutput((current) => [...current.slice(-200), line])}
+              onAskAgent={(text) => {
+                setView("chat");
+                setShowSidebar(true);
+                setPrompt(text);
+              }}
             />
           </Suspense>
         </>
@@ -3757,7 +4397,7 @@ export default function App() {
               <input
                 className="ask-note"
                 value={planFeedback}
-                placeholder={lang === "en" ? "Feedback" : "修改意见"}
+                placeholder={t.planFeedback}
                 onChange={(event) => setPlanFeedback(event.target.value)}
               />
             </div>
@@ -3772,6 +4412,19 @@ export default function App() {
           </div>
         </div>
       ) : null}
+      <QuickOpen
+        open={paletteMode != null}
+        mode={paletteMode || "file"}
+        cwd={workspaceRoot}
+        ssh={activeSsh}
+        copy={t}
+        onClose={() => setPaletteMode(null)}
+        onOpenFile={(path) => {
+          setShowWorkspace(true);
+          setWorkspaceFocusPath(path);
+          setWorkspaceFocusTick((tick) => tick + 1);
+        }}
+      />
     </div>
   );
 }

@@ -398,6 +398,502 @@ with open(path, 'rb') as handle:
     })
 }
 
+pub fn write_remote_file(target: &SshTarget, rel: &str, content: &str) -> Result<(), String> {
+    let rel = sanitize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("还没有选择文件".into());
+    }
+    if content.len() as u64 > MAX_FILE_BYTES * 8 {
+        return Err("文件太大，无法写入".into());
+    }
+    let remote = join_remote(&target.remote_path, &rel);
+    let script = format!(
+        r#"python3 -c "import os,sys
+path=os.path.expanduser(sys.argv[1])
+parent=os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+data=sys.stdin.buffer.read()
+with open(path,'wb') as handle:
+    handle.write(data)
+" {path}"#,
+        path = sh_single(&remote),
+    );
+    let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, Some(content.as_bytes()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    Ok(())
+}
+
+pub fn search_remote_workspace(target: &SshTarget, query: &str, limit: usize) -> Result<Vec<WorkspaceEntry>, String> {
+    let limit = limit.max(1).min(400);
+    let script = format!(
+        r#"python3 -c "import os,sys
+root=os.path.expanduser(sys.argv[1])
+needle=sys.argv[2].lower()
+limit=int(sys.argv[3])
+skip={skip}
+out=0
+def emit(kind, rel):
+    global out
+    print(kind + '\t' + rel.replace('\\\\','/'))
+    out += 1
+    return out >= limit
+if os.path.isdir(root):
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip and not d.startswith('.')]
+        rel=os.path.relpath(dirpath, root)
+        rel='' if rel=='.' else rel.replace('\\\\','/')
+        for name in files:
+            if name.startswith('.'):
+                continue
+            path=name if not rel else rel+'/'+name
+            if (not needle) or needle in path.lower() or needle in name.lower():
+                if emit('F', path):
+                    raise SystemExit(0)
+        for name in dirs:
+            path=name if not rel else rel+'/'+name
+            if (not needle) or needle in path.lower() or needle in name.lower():
+                if emit('D', path):
+                    raise SystemExit(0)
+" {root} {query} {limit}"#,
+        skip = r"{'.git','node_modules','target','dist','build','.next','__pycache__','.venv','venv','vendor','.grok','grokdesk-relay'}",
+        root = sh_single(&target.remote_path),
+        query = sh_single(query.trim()),
+        limit = limit,
+    );
+    let output = run_ssh(target, &script, SSH_LONG_TIMEOUT_SECS, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() && !stdout.contains('\t') {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let Some((kind, path)) = line.split_once('\t') else { continue };
+        let path = path.trim().replace('\\', "/");
+        if path.is_empty() { continue; }
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        entries.push(WorkspaceEntry {
+            name,
+            path,
+            is_dir: kind == "D" || kind == "d",
+        });
+    }
+    Ok(entries)
+}
+
+pub fn grep_remote_workspace(target: &SshTarget, query: &str, limit: usize) -> Result<Vec<crate::workspace::GrepHit>, String> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.max(1).min(80);
+    let script = format!(
+        r#"python3 -c "import os,sys
+root=os.path.expanduser(sys.argv[1])
+needle=sys.argv[2].lower()
+limit=int(sys.argv[3])
+skip={skip}
+count=0
+if os.path.isdir(root) and needle:
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip and not d.startswith('.')]
+        rel=os.path.relpath(dirpath, root)
+        rel='' if rel=='.' else rel.replace('\\\\','/')
+        for name in files:
+            if name.startswith('.'):
+                continue
+            path=os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(path)>400000:
+                    continue
+                with open(path,'rb') as handle:
+                    data=handle.read()
+                if b'\0' in data:
+                    continue
+                text=data.decode('utf-8','replace')
+            except Exception:
+                continue
+            relpath=name if not rel else rel+'/'+name
+            for i,line in enumerate(text.splitlines(),1):
+                if needle in line.lower():
+                    print(relpath + '\t' + str(i) + '\t' + line[:160].replace('\t',' '))
+                    count += 1
+                    if count>=limit:
+                        raise SystemExit(0)
+" {root} {query} {limit}"#,
+        skip = r"{'.git','node_modules','target','dist','build','.next','__pycache__','.venv','venv','vendor','.grok','grokdesk-relay'}",
+        root = sh_single(&target.remote_path),
+        query = sh_single(needle),
+        limit = limit,
+    );
+    let output = run_ssh(target, &script, SSH_LONG_TIMEOUT_SECS, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() && !stdout.contains('\t') {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    let mut hits = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let Some(path) = parts.next() else { continue };
+        let Some(line_no) = parts.next() else { continue };
+        let text = parts.next().unwrap_or("").trim();
+        let path = path.trim().replace('\\', "/");
+        if path.is_empty() { continue; }
+        hits.push(crate::workspace::GrepHit {
+            path,
+            line: line_no.parse().unwrap_or(0),
+            text: text.to_string(),
+        });
+    }
+    Ok(hits)
+}
+
+pub fn remote_git_status(target: &SshTarget) -> Result<crate::git::GitStatus, String> {
+    let script = format!(
+        "cd {path} && git status --porcelain=v1 -b",
+        path = sh_single(&target.remote_path),
+    );
+    let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not a git repository") || stdout.contains("not a git repository") {
+            return Ok(crate::git::GitStatus {
+                available: false,
+                branch: String::new(),
+                ahead: 0,
+                behind: 0,
+                dirty: false,
+                files: Vec::new(),
+                remotes: Vec::new(),
+                message: "不是 Git 仓库".into(),
+            });
+        }
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    let mut status = crate::git::parse_porcelain(&stdout);
+    status.remotes = remote_git_remotes(target).unwrap_or_default();
+    Ok(status)
+}
+
+fn remote_git_script(target: &SshTarget, command: &str, timeout: u64) -> Result<String, String> {
+    let script = format!(
+        "cd {path} && {command}",
+        path = sh_single(&target.remote_path),
+        command = command,
+    );
+    let output = run_ssh(target, &script, timeout, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not a git repository") || stdout.contains("not a git repository") {
+            return Err("不是 Git 仓库".into());
+        }
+        return Err(ssh_error(&stderr, &stdout, output.status.code()));
+    }
+    Ok(stdout)
+}
+
+fn quote_git_paths(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| sh_single(path))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn remote_git_remotes(target: &SshTarget) -> Result<Vec<crate::git::GitRemote>, String> {
+    let stdout = remote_git_script(target, "git remote -v", SSH_TIMEOUT_SECS)?;
+    Ok(crate::git::parse_remotes(&stdout))
+}
+
+pub fn remote_git_init(target: &SshTarget) -> Result<String, String> {
+    remote_git_script(target, "git init", SSH_TIMEOUT_SECS)
+}
+
+pub fn remote_git_set_remote(target: &SshTarget, name: &str, url: &str) -> Result<String, String> {
+    let name = name.trim();
+    let url = url.trim();
+    if name.is_empty() {
+        return Err("请填写远程名称".into());
+    }
+    if url.is_empty() {
+        return Err("请填写远程仓库地址".into());
+    }
+    let remotes = remote_git_remotes(target).unwrap_or_default();
+    let command = if remotes.iter().any(|item| item.name == name) {
+        format!("git remote set-url {name} {url}", name = sh_single(name), url = sh_single(url))
+    } else {
+        format!("git remote add {name} {url}", name = sh_single(name), url = sh_single(url))
+    };
+    remote_git_script(target, &command, SSH_TIMEOUT_SECS)
+}
+
+pub fn remote_git_stage(target: &SshTarget, paths: &[String]) -> Result<String, String> {
+    let command = if paths.is_empty() {
+        "git add -A".to_string()
+    } else {
+        format!("git add -- {}", quote_git_paths(paths))
+    };
+    remote_git_script(target, &command, SSH_LONG_TIMEOUT_SECS)
+}
+
+pub fn remote_git_unstage(target: &SshTarget, paths: &[String]) -> Result<String, String> {
+    let command = if paths.is_empty() {
+        "git restore --staged . || git reset HEAD".to_string()
+    } else {
+        let quoted = quote_git_paths(paths);
+        format!("git restore --staged -- {quoted} || git reset HEAD -- {quoted}")
+    };
+    remote_git_script(target, &command, SSH_LONG_TIMEOUT_SECS)
+}
+
+pub fn remote_git_commit(target: &SshTarget, message: &str, all: Option<bool>) -> Result<String, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Err("请填写提交说明".into());
+    }
+    let stage_all = all.unwrap_or(true);
+    let command = if stage_all {
+        format!("git add -A && git commit -m {msg}", msg = sh_single(msg))
+    } else {
+        format!("git commit -m {msg}", msg = sh_single(msg))
+    };
+    remote_git_script(target, &command, SSH_LONG_TIMEOUT_SECS)
+}
+
+pub fn remote_git_push(target: &SshTarget) -> Result<String, String> {
+    let remotes = remote_git_remotes(target)?;
+    if remotes.is_empty() {
+        return Err("还没有绑定远程仓库".into());
+    }
+    remote_git_script(
+        target,
+        &format!("git push -u {} HEAD", sh_single(&remotes[0].name)),
+        SSH_LONG_TIMEOUT_SECS,
+    )
+}
+
+pub fn remote_git_pull(target: &SshTarget) -> Result<String, String> {
+    remote_git_script(target, "git pull --ff-only || git pull", SSH_LONG_TIMEOUT_SECS)
+}
+
+pub fn remote_git_fetch(target: &SshTarget) -> Result<String, String> {
+    remote_git_script(target, "git fetch --all --prune", SSH_LONG_TIMEOUT_SECS)
+}
+
+pub fn remote_git_discard(target: &SshTarget, paths: &[String]) -> Result<String, String> {
+    let command = if paths.is_empty() {
+        "git restore --worktree --source=HEAD . 2>/dev/null; git checkout -- . 2>/dev/null; git clean -fd".to_string()
+    } else {
+        let quoted = quote_git_paths(paths);
+        format!(
+            "git restore --worktree --source=HEAD -- {quoted} 2>/dev/null; git checkout -- {quoted} 2>/dev/null; git clean -f -- {quoted}"
+        )
+    };
+    remote_git_script(target, &command, SSH_LONG_TIMEOUT_SECS)
+}
+
+pub fn remote_git_log(target: &SshTarget, limit: u32) -> Result<Vec<crate::git::GitCommit>, String> {
+    let cap = limit.clamp(8, 80);
+    let stdout = remote_git_script(
+        target,
+        &format!("git log -n {cap} --pretty=format:%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%ar%x1f%D"),
+        SSH_TIMEOUT_SECS,
+    )?;
+    Ok(crate::git::parse_log(&stdout))
+}
+
+pub fn remote_git_file_diff(target: &SshTarget, path: &str, staged: bool) -> Result<crate::git::GitFileDiff, String> {
+    let rel = path.replace('\\', "/").trim_start_matches('/').to_string();
+    if rel.is_empty() {
+        return Err("还没有选择文件".into());
+    }
+    let head_spec = sh_single(&format!("HEAD:{rel}"));
+    let index_spec = sh_single(&format!(":{rel}"));
+    let old_text = remote_git_script(
+        target,
+        &format!("git show {head_spec} 2>/dev/null || true"),
+        SSH_TIMEOUT_SECS,
+    )
+    .unwrap_or_default();
+    let new_text = if staged {
+        remote_git_script(
+            target,
+            &format!("git show {index_spec} 2>/dev/null || true"),
+            SSH_TIMEOUT_SECS,
+        )
+        .unwrap_or_default()
+    } else {
+        match read_remote_file(target, &rel) {
+            Ok(file) => file.content,
+            Err(_) => String::new(),
+        }
+    };
+    Ok(crate::git::GitFileDiff {
+        path: rel,
+        old_text,
+        new_text,
+    })
+}
+
+pub fn remote_git_review(target: &SshTarget) -> Result<crate::git::GitReview, String> {
+    let base = remote_git_script(
+        target,
+        "for n in origin/main main origin/master master; do git rev-parse --verify $n >/dev/null 2>&1 && echo $n && exit 0; done; echo HEAD",
+        SSH_TIMEOUT_SECS,
+    )?
+    .trim()
+    .to_string();
+    let base = if base.is_empty() { "HEAD".into() } else { base };
+    let quoted = sh_single(&base);
+    let names = remote_git_script(
+        target,
+        &format!("git diff --name-only {quoted}...HEAD; git diff --name-only {quoted}"),
+        SSH_LONG_TIMEOUT_SECS,
+    )
+    .unwrap_or_default();
+    let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in names.lines() {
+        let path = line.trim().replace('\\', "/");
+        if path.is_empty() || !seen.insert(path.clone()) {
+            continue;
+        }
+        files.push(path);
+    }
+    let diff = remote_git_script(target, &format!("git diff {quoted}"), SSH_LONG_TIMEOUT_SECS).unwrap_or_default();
+    Ok(crate::git::GitReview { base, files, diff })
+}
+
+pub fn remote_capture_snapshot(target: &SshTarget) -> Result<Vec<crate::git::SnapshotFile>, String> {
+    let status = remote_git_status(target)?;
+    if !status.available {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for file in status.files {
+        match read_remote_file(target, &file.path) {
+            Ok(item) => out.push(crate::git::SnapshotFile {
+                path: file.path,
+                content: Some(item.content),
+            }),
+            Err(_) if file.status.contains('D') => out.push(crate::git::SnapshotFile {
+                path: file.path,
+                content: None,
+            }),
+            Err(_) => {}
+        }
+    }
+    Ok(out)
+}
+
+pub fn remote_restore_snapshot(target: &SshTarget, files: &[crate::git::SnapshotFile]) -> Result<(), String> {
+    for file in files {
+        match &file.content {
+            Some(content) => write_remote_file(target, &file.path, content)?,
+            None => {
+                let remote = join_remote(&target.remote_path, &file.path);
+                let script = format!("rm -f {path}", path = sh_single(&remote));
+                let _ = run_ssh(target, &script, SSH_TIMEOUT_SECS, None);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn remote_read_rules(target: &SshTarget) -> Result<Option<crate::workspace::ProjectRules>, String> {
+    for rel in ["AGENTS.md", "GROK.md", ".cursorrules", ".grok/rules.md"] {
+        if let Ok(file) = read_remote_file(target, rel) {
+            return Ok(Some(crate::workspace::ProjectRules {
+                path: rel.into(),
+                content: file.content,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub fn remote_write_rules(target: &SshTarget, content: &str) -> Result<crate::workspace::ProjectRules, String> {
+    let rel = match remote_read_rules(target)? {
+        Some(existing) => existing.path,
+        None => "AGENTS.md".into(),
+    };
+    write_remote_file(target, &rel, content)?;
+    Ok(crate::workspace::ProjectRules {
+        path: rel,
+        content: content.to_string(),
+    })
+}
+
+pub fn pty_ssh_command(
+    target: &SshTarget,
+    argv: Option<&[String]>,
+) -> Result<portable_pty::CommandBuilder, String> {
+    let mut cmd = portable_pty::CommandBuilder::new(ssh_binary()?);
+    cmd.arg("-p");
+    cmd.arg(target.port.to_string());
+    cmd.arg("-tt");
+    cmd.arg("-o");
+    cmd.arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o");
+    cmd.arg("ConnectTimeout=12");
+    cmd.arg("-o");
+    cmd.arg("ServerAliveInterval=15");
+    let password = target
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let use_password = target.auth == "password" || password.is_some();
+    if use_password {
+        let askpass = write_askpass()?;
+        cmd.env("SSH_ASKPASS", askpass.to_string_lossy().as_ref());
+        cmd.env("SSH_ASKPASS_REQUIRE", "force");
+        cmd.env("GROKDESK_SSH_PASSWORD", password.unwrap_or_default());
+        if std::env::var_os("DISPLAY").is_none() {
+            cmd.env("DISPLAY", ":0");
+        }
+        cmd.arg("-o");
+        cmd.arg("PreferredAuthentications=password,keyboard-interactive");
+        cmd.arg("-o");
+        cmd.arg("PubkeyAuthentication=no");
+    } else {
+        cmd.arg("-o");
+        cmd.arg("BatchMode=yes");
+        if let Some(identity) = &target.identity_file {
+            cmd.arg("-i");
+            cmd.arg(identity);
+            cmd.arg("-o");
+            cmd.arg("IdentitiesOnly=yes");
+        }
+    }
+    cmd.arg(target.destination());
+    let remote = if let Some(args) = argv.filter(|items| !items.is_empty()) {
+        let command = args.iter().map(|item| sh_single(item)).collect::<Vec<_>>().join(" ");
+        format!(
+            "cd {path} >/dev/null 2>&1 || cd ~; exec {command}",
+            path = sh_single(&target.remote_path),
+            command = command,
+        )
+    } else {
+        format!(
+            "cd {path} >/dev/null 2>&1 || cd ~; exec ${{SHELL:-/bin/sh}} -l",
+            path = sh_single(&target.remote_path),
+        )
+    };
+    cmd.arg(remote);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    Ok(cmd)
+}
+
 pub fn spawn_remote_agent(
     target: &SshTarget,
     model: &str,

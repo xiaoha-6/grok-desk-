@@ -350,4 +350,5 @@
 "选择演示项目" = "Choose a demo project";
 "演示模式仅显示安全的示例项目，不会访问或展示你的本地路径。" = "Demo mode only shows safe sample projects and never exposes your local paths.";
 "已隐藏用户名与绝对路径" = "Username and absolute paths are hidden";
-"工作目录将在新对话生效" = "The workspace change will apply to a new chat";
+"本周剩余 %d%%" = "%d%% weekly remaining";
+"安装完成：%@" = "Installed: %@";

@@ -9,11 +9,16 @@ struct LanguageOnboardingView: View {
     @State private var selectedLanguage: String
 
     init() {
-        let suggestion = Locale.preferredLanguages.first?.hasPrefix("zh") == true ? "zh-Hans" : "en"
-        _selectedLanguage = State(initialValue: suggestion)
+        _selectedLanguage = State(initialValue: Self.suggestedLanguage())
     }
 
-    private var isEnglish: Bool { selectedLanguage == "en" }
+    private var copy: OnboardCopy {
+        switch selectedLanguage {
+        case "en": return .english
+        case "zh-Hant": return .traditional
+        default: return .simplified
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -26,18 +31,24 @@ struct LanguageOnboardingView: View {
                         .interpolation(.high)
                         .frame(width: 76, height: 76)
                         .accessibilityHidden(true)
-                    Text(isEnglish ? "Welcome to GrokDesk" : "欢迎使用 GrokDesk")
+                    Text(copy.title)
                         .font(.system(size: 30, weight: .semibold))
-                    Text(isEnglish ? "Choose the language used throughout the app." : "选择 GrokDesk 的界面语言。")
+                    Text(copy.subtitle)
                         .font(GrokTypography.body)
                         .foregroundStyle(.secondary)
                 }
 
-                HStack(spacing: 14) {
+                VStack(spacing: 10) {
                     languageOption(
                         code: "zh-Hans",
                         title: "简体中文",
                         detail: "使用简体中文界面",
+                        symbol: "globe.asia.australia"
+                    )
+                    languageOption(
+                        code: "zh-Hant",
+                        title: "繁體中文",
+                        detail: "使用繁體中文介面",
                         symbol: "globe.asia.australia"
                     )
                     languageOption(
@@ -48,14 +59,14 @@ struct LanguageOnboardingView: View {
                     )
                 }
 
-                Button(isEnglish ? "Continue" : "继续") {
+                Button(copy.continueTitle) {
                     model.completeLanguageOnboarding(language: selectedLanguage)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
             }
-            .frame(maxWidth: 620)
+            .frame(maxWidth: 520)
             .padding(.horizontal, 48)
             .padding(.vertical, 56)
         }
@@ -96,4 +107,40 @@ struct LanguageOnboardingView: View {
         .buttonStyle(.plain)
         .accessibilityAddTraits(selectedLanguage == code ? .isSelected : [])
     }
+
+    private static func suggestedLanguage() -> String {
+        let preferred = Locale.preferredLanguages.first ?? ""
+        let normalized = preferred.replacingOccurrences(of: "_", with: "-")
+        if normalized.localizedCaseInsensitiveContains("Hant")
+            || normalized.hasPrefix("zh-TW")
+            || normalized.hasPrefix("zh-HK")
+            || normalized.hasPrefix("zh-MO") {
+            return "zh-Hant"
+        }
+        if normalized.hasPrefix("zh") { return "zh-Hans" }
+        if normalized.hasPrefix("en") { return "en" }
+        return "zh-Hans"
+    }
+}
+
+private struct OnboardCopy {
+    let title: String
+    let subtitle: String
+    let continueTitle: String
+
+    static let simplified = OnboardCopy(
+        title: "欢迎使用 GrokDesk",
+        subtitle: "选择 GrokDesk 的界面语言。",
+        continueTitle: "继续"
+    )
+    static let traditional = OnboardCopy(
+        title: "歡迎使用 GrokDesk",
+        subtitle: "選擇 GrokDesk 的介面語言。",
+        continueTitle: "繼續"
+    )
+    static let english = OnboardCopy(
+        title: "Welcome to GrokDesk",
+        subtitle: "Choose the language used throughout the app.",
+        continueTitle: "Continue"
+    )
 }
