@@ -955,13 +955,7 @@ fn value_as_f64(value: &serde_json::Value) -> Option<f64> {
 }
 
 fn hide_window(command: &mut std::process::Command) {
-    let _ = command;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::runtime::hide_console(command);
 }
 
 fn http_json_get(url: &str, api_key: &str) -> Result<serde_json::Value, String> {

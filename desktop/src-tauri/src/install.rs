@@ -23,17 +23,20 @@ pub fn install_official(mut sink: InstallEventSink, cancel: Arc<AtomicBool>) -> 
     #[cfg(target_os = "windows")]
     {
         (sink.on_line)(format!("正在运行官方安装器：{INSTALL_PS1}"));
-        let mut child = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                "irm https://x.ai/cli/install.ps1 | iex",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "irm https://x.ai/cli/install.ps1 | iex",
+        ]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        crate::runtime::hide_console(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|err| format!("无法启动 PowerShell：{err}"))?;
         stream_child(&mut child, &mut sink, &cancel)?;

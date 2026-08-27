@@ -619,12 +619,7 @@ impl AcpClient {
                 path_value.push_str(&existing);
             }
             command.env("PATH", path_value);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                command.creation_flags(CREATE_NO_WINDOW);
-            }
+            crate::runtime::hide_console(&mut command);
             command
                 .spawn()
                 .map_err(|err| format!("无法启动 Grok Agent：{err}"))?

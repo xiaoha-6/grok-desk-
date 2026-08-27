@@ -3,6 +3,18 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// GUI apps on Windows allocate a visible console for every console subprocess
+/// unless CREATE_NO_WINDOW is set. Keep helper tools (git, gh, curl, grok) silent.
+pub fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = command;
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
@@ -82,7 +94,10 @@ fn is_runnable(path: &Path) -> bool {
 }
 
 fn probe_version(path: &Path) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
+    let mut command = Command::new(path);
+    command.arg("--version");
+    hide_console(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() && output.stdout.is_empty() {
         return None;
     }

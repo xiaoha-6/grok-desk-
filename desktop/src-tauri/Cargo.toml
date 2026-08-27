@@ -24,7 +24,7 @@ rfd = "0.15"
 arboard = "3"
 png = "0.17"
 base64 = "0.22"
-portable-pty = "0.8"
+portable-pty = { path = "vendor/portable-pty" }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

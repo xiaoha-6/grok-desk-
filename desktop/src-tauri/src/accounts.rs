@@ -381,12 +381,7 @@ fn run_login(
         path_value.push_str(&existing);
     }
     command.env("PATH", path_value);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::runtime::hide_console(&mut command);
     let mut child = command
         .spawn()
         .map_err(|err| format!("无法启动 grok login：{err}"))?;
@@ -499,12 +494,7 @@ fn billing_request(token: &str, query: Option<&str>) -> Result<Value, String> {
         .arg(&url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    crate::runtime::hide_console(&mut command);
     let output = command
         .output()
         .map_err(|err| format!("无法请求额度接口：{err}"))?;

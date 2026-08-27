@@ -484,8 +484,14 @@ fn capture_num(haystack: &str, key: &str) -> u32 {
         .unwrap_or(0)
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new(if cfg!(windows) { "git.exe" } else { "git" });
+    crate::runtime::hide_console(&mut command);
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(root)
         .args(args)
@@ -601,7 +607,9 @@ fn identity_from_gh() -> Option<GithubIdentity> {
 }
 
 fn gh_output(args: &[&str]) -> Option<String> {
-    let output = Command::new("gh").args(args).output().ok()?;
+    let mut command = Command::new(if cfg!(windows) { "gh.exe" } else { "gh" });
+    crate::runtime::hide_console(&mut command);
+    let output = command.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -665,7 +673,7 @@ fn parse_gh_repos(raw: &str) -> Vec<GithubRepo> {
 }
 
 fn git_global(key: &str) -> Option<String> {
-    let output = Command::new("git").args(["config", "--global", key]).output().ok()?;
+    let output = git_command().args(["config", "--global", key]).output().ok()?;
     if !output.status.success() {
         return None;
     }

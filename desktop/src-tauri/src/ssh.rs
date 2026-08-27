@@ -1179,15 +1179,8 @@ fn spawn_ssh(target: &SshTarget, remote_command: &str) -> Result<std::process::C
         .spawn()
         .map_err(|err| format!("无法启动远程 SSH 会话：{err}"))
 }
-
 fn apply_no_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let _ = command;
+    crate::runtime::hide_console(command);
 }
 
 fn ssh_command(target: &SshTarget) -> Result<Command, String> {
@@ -1273,9 +1266,9 @@ fn ssh_binary() -> Result<PathBuf, String> {
 }
 
 fn which(name: &str) -> Result<PathBuf, String> {
-    if let Ok(output) = Command::new(if cfg!(windows) { "where" } else { "which" })
-        .arg(name)
-        .output()
+    let mut command = Command::new(if cfg!(windows) { "where.exe" } else { "which" });
+    crate::runtime::hide_console(&mut command);
+    if let Ok(output) = command.arg(name).output()
     {
         if output.status.success() {
             if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
