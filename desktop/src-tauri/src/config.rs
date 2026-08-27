@@ -16,6 +16,14 @@ const MANAGED_MODELS: &[(&str, &str, u64)] = &[
     ("grok-composer-2.5-fast", "Grok Composer 2.5 Fast", 500_000),
 ];
 
+const IMAGE_MODELS: &[(&str, &str)] = &[
+    ("grok-imagine-image", "Grok Imagine Image"),
+    ("grok-imagine-edit", "Grok Imagine Edit"),
+];
+
+pub const IMAGE_GEN_MODEL: &str = "grok-imagine-image";
+pub const IMAGE_EDIT_MODEL: &str = "grok-imagine-edit";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayImport {
@@ -237,6 +245,13 @@ pub fn render_config(import: &RelayImport) -> String {
         ));
         written.insert(*id);
     }
+    for (id, display) in IMAGE_MODELS {
+        if written.insert(*id) {
+            body.push_str(&render_image_model_block(
+                id, display, &provider, &api_key, &endpoint,
+            ));
+        }
+    }
     if !written.contains(import.model.as_str()) {
         body.push_str(&render_model_block(
             &import.model,
@@ -256,8 +271,12 @@ pub fn render_config(import: &RelayImport) -> String {
     body.push_str("[features]\n");
     body.push_str("image_gen = true\n");
     body.push_str("video_gen = true\n");
-    body.push_str("image_gen_model_override = \"grok-imagine-image-quality\"\n");
-    body.push_str("image_edit_model_override = \"grok-imagine-edit\"\n");
+    body.push_str(&format!(
+        "image_gen_model_override = \"{IMAGE_GEN_MODEL}\"\n"
+    ));
+    body.push_str(&format!(
+        "image_edit_model_override = \"{IMAGE_EDIT_MODEL}\"\n"
+    ));
     body
 }
 
@@ -272,8 +291,182 @@ description = \"{provider} · Responses\"\n\
 api_key = \"{api_key}\"\n\
 api_backend = \"responses\"\n\
 context_window = {window}\n\
-supports_backend_search = true\n\n"
+        supports_backend_search = true\n\n"
     )
+}
+
+fn render_image_model_block(
+    id: &str,
+    display: &str,
+    provider: &str,
+    api_key: &str,
+    endpoint: &str,
+) -> String {
+    let id_esc = toml_escape(id);
+    let display_esc = toml_escape(display);
+    let endpoint_esc = toml_escape(endpoint);
+    format!(
+        "[model.\"{id_esc}\"]\n\
+model = \"{id_esc}\"\n\
+name = \"{display_esc}\"\n\
+description = \"{provider} · Imagine\"\n\
+api_key = \"{api_key}\"\n\
+api_base_url = \"{endpoint_esc}\"\n\
+context_window = 32768\n\n"
+    )
+}
+
+/// Keep chat on grok-4.6 / grok-4.5, but route Imagine tool calls to grok-imagine-image.
+pub fn ensure_image_gen_routing(grok_home: &Path) -> Result<(), String> {
+    let path = grok_home.join("config.toml");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let original = fs::read_to_string(&path).map_err(|err| format!("读取配置失败：{err}"))?;
+    let mut text = ensure_features_image_gen(&original);
+    if let Some(profile) = read_relay_profile(grok_home) {
+        if !is_official_endpoint(&profile.endpoint) {
+            text = ensure_image_model_blocks(&text, &profile);
+        }
+    }
+    if text != original {
+        atomic_write(&path, text.as_bytes()).map_err(|err| format!("写入配置失败：{err}"))?;
+        restrict_owner_only(&path);
+    }
+    Ok(())
+}
+
+fn ensure_features_image_gen(text: &str) -> String {
+    let mut next = text.to_string();
+    if !section_exists(&next, "features") {
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str("\n[features]\n");
+    }
+    next = upsert_assignment(&next, "features", "image_gen", "true");
+    next = upsert_assignment(
+        &next,
+        "features",
+        "image_gen_model_override",
+        &format!("\"{IMAGE_GEN_MODEL}\""),
+    );
+    next = upsert_assignment(
+        &next,
+        "features",
+        "image_edit_model_override",
+        &format!("\"{IMAGE_EDIT_MODEL}\""),
+    );
+    next
+}
+
+fn ensure_image_model_blocks(text: &str, profile: &RelayProfile) -> String {
+    let mut next = text.to_string();
+    for (id, display) in IMAGE_MODELS {
+        let escaped = toml_escape(id);
+        let quoted_header = format!("[model.\"{escaped}\"]");
+        let bare_header = format!("[model.{id}]");
+        let block = render_image_model_block(
+            id,
+            display,
+            &profile.name,
+            &profile.api_key,
+            &profile.endpoint,
+        );
+        if table_exists(&next, &quoted_header) {
+            next = replace_toml_table(&next, &quoted_header, &block);
+            continue;
+        }
+        if table_exists(&next, &bare_header) {
+            next = replace_toml_table(&next, &bare_header, &block);
+            continue;
+        }
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push('\n');
+        next.push_str(&block);
+    }
+    next
+}
+
+fn table_exists(text: &str, header: &str) -> bool {
+    text.lines().any(|line| line.trim() == header)
+}
+
+fn replace_toml_table(text: &str, header: &str, replacement: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let newline = if text.ends_with('\n') { "\n" } else { "" };
+    let mut start = None;
+    let mut end = lines.len();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if start.is_none() {
+            if trimmed == header {
+                start = Some(index);
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            end = index;
+            break;
+        }
+    }
+    let Some(start) = start else {
+        return text.to_string();
+    };
+    let mut repl: Vec<String> = replacement.trim_end().lines().map(str::to_string).collect();
+    if end < lines.len() && !repl.last().is_some_and(|line| line.is_empty()) {
+        repl.push(String::new());
+    }
+    lines.splice(start..end, repl);
+    let mut out = lines.join("\n");
+    out.push_str(newline);
+    out
+}
+
+fn section_exists(text: &str, section: &str) -> bool {
+    let header = format!("[{section}]");
+    text.lines().any(|line| line.trim() == header)
+}
+
+fn upsert_assignment(text: &str, section: &str, key: &str, value: &str) -> String {
+    let header = format!("[{section}]");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let newline = if text.ends_with('\n') { "\n" } else { "" };
+    let mut in_section = false;
+    let mut found = false;
+    let mut insert_at: Option<usize> = None;
+    for index in 0..lines.len() {
+        let trimmed = lines[index].trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section && insert_at.is_none() {
+                insert_at = Some(index);
+            }
+            in_section = trimmed == header;
+            continue;
+        }
+        if in_section {
+            if let Some((left, _)) = trimmed.split_once('=') {
+                if left.trim() == key {
+                    lines[index] = format!("{key} = {value}");
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    if in_section && insert_at.is_none() {
+        insert_at = Some(lines.len());
+    }
+    if !found {
+        if let Some(at) = insert_at {
+            lines.insert(at, format!("{key} = {value}"));
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push_str(newline);
+    out
 }
 
 pub fn write_config(grok_home: &Path, import: &RelayImport) -> io::Result<ImportResult> {
@@ -284,6 +477,7 @@ pub fn write_config(grok_home: &Path, import: &RelayImport) -> io::Result<Import
     atomic_write(&config_path, rendered.as_bytes())?;
     restrict_owner_only(&config_path);
     let _ = write_relay_sidecar(grok_home, import);
+    let _ = ensure_image_gen_routing(grok_home);
     Ok(ImportResult {
         config_path: config_path.display().to_string(),
         backup_path: backup_path.map(|path| path.display().to_string()),
@@ -500,6 +694,8 @@ pub fn prepare_relay_runtime_home(grok_home: &Path) -> Result<PathBuf, String> {
             let _ = fs::copy(&source, &target);
         }
     }
+    let _ = ensure_image_gen_routing(grok_home);
+    let _ = ensure_image_gen_routing(&home);
     let auth = home.join("auth.json");
     if auth.exists() {
         let _ = fs::remove_file(&auth);
@@ -1057,6 +1253,68 @@ mod tests {
         assert!(cfg.contains("api_key = \"sk-\\\"quoted\\\"\""));
         assert!(cfg.contains("default = \"grok-4.5\""));
         assert!(cfg.contains("[model.\"grok-build-0.1\"]"));
+        assert!(cfg.contains("image_gen_model_override = \"grok-imagine-image\""));
+        assert!(cfg.contains("[model.\"grok-imagine-image\"]"));
+        assert!(cfg.contains("description = \"小哈AI · Imagine\""));
+        let imagine = cfg
+            .split("[model.\"grok-imagine-image\"]")
+            .nth(1)
+            .unwrap()
+            .split("[model.")
+            .next()
+            .unwrap();
+        assert!(imagine.contains("api_base_url = \"https://api.xiaohaweb.com/v1\""));
+        assert!(!imagine.contains("api_backend"));
+    }
+
+    #[test]
+    fn patches_existing_config_to_route_imagine() {
+        let dir = std::env::temp_dir().join(format!("grokdesk-imagine-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("grokdesk-relay.json"),
+            r#"{"endpoint":"https://relay.example/v1","name":"小哈AI","model":"grok-4.6"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            "[model.\"grok-4.6\"]\nmodel = \"grok-4.6\"\napi_key = \"sk-test\"\napi_backend = \"responses\"\n\n[models]\ndefault = \"grok-4.6\"\n\n[features]\nimage_gen = false\n",
+        )
+        .unwrap();
+        ensure_image_gen_routing(&dir).unwrap();
+        let written = fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(written.contains("image_gen = true"));
+        assert!(written.contains("image_gen_model_override = \"grok-imagine-image\""));
+        assert!(written.contains("[model.\"grok-imagine-image\"]"));
+        assert!(written.contains("sk-test"));
+        let imagine = written
+            .split("[model.\"grok-imagine-image\"]")
+            .nth(1)
+            .unwrap()
+            .split("[model.")
+            .next()
+            .unwrap();
+        assert!(imagine.contains("api_base_url = \"https://relay.example/v1\""));
+        assert!(!imagine.contains("api_backend"));
+
+        fs::write(
+            dir.join("config.toml"),
+            "[model.\"grok-imagine-image\"]\nmodel = \"grok-imagine-image\"\napi_key = \"sk-test\"\napi_backend = \"responses\"\n\n[models]\ndefault = \"grok-4.6\"\n",
+        )
+        .unwrap();
+        ensure_image_gen_routing(&dir).unwrap();
+        let rewritten = fs::read_to_string(dir.join("config.toml")).unwrap();
+        let imagine = rewritten
+            .split("[model.\"grok-imagine-image\"]")
+            .nth(1)
+            .unwrap()
+            .split("[model.")
+            .next()
+            .unwrap();
+        assert!(imagine.contains("description = \"小哈AI · Imagine\""));
+        assert!(!imagine.contains("api_backend"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

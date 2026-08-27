@@ -471,6 +471,7 @@ fn tool_label(name: &str, args: &Value) -> (&'static str, String) {
         "web_search" => ("search", "Web search".into()),
         "web_fetch" => ("fetch", "Fetch URL".into()),
         "list_dir" | "Glob" => ("list", format!("List `{path}`")),
+        "image_gen" | "imagine" | "ImageGen" => ("image_gen", "Generate Image".into()),
         _ => ("other", name.replace('_', " ")),
     }
 }

@@ -17,6 +17,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ActivityTimeline, InlineCommands, InlineEdits } from "./ActivityTimeline";
+import {
+  ChatMessageMedia,
+  extractMessageMedia,
+  isImageGenBusy,
+  isShowableImage,
+  mergeMessageMedia,
+} from "./ChatImage";
 import { TextShimmer } from "./components/prompt-kit/text-shimmer";
 import { ThinkingOrbs } from "./components/thinking-orbs/ThinkingOrbs";
 import { extractFileDiffs } from "./diff";
@@ -54,14 +61,13 @@ import {
   resolvedBindings,
   withShortcut,
 } from "./keybindings";
-import { MessageBody } from "./markdown";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
 import { QuickOpen } from "./QuickOpen";
 import { SettingsView } from "./SettingsView";
 import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
 import type { RunJob } from "./launch";
-import { isCommandEvent, isRedundantExtension, jsonText } from "./timeline";
+import { isCommandEvent, isImageGenEvent, isRedundantExtension, jsonText } from "./timeline";
 import {
   canonicalModelId,
   defaultSettings,
@@ -372,6 +378,15 @@ function terminalJobTitle(command: string, fallback: string) {
   const line = (command || fallback).split("\n")[0].trim();
   if (line.length <= 28) return line || fallback;
   return `${line.slice(0, 27)}…`;
+}
+
+function isGeneratedImageProbe(command: string) {
+  const text = command.toLowerCase();
+  if (!text.trim()) return false;
+  const touchesImageFile = /(?:^|[/\s"'=])(?:.*\/)?images\/[^ \n"']+\.(?:png|jpe?g|gif|webp|bmp|heic)/.test(text);
+  const encodesImage = /b64encode|data:image|base64.*jpe?g|pathlib/.test(text) && /\.(?:png|jpe?g|gif|webp)\b/.test(text);
+  const sessionImage = /(?:grokdesk-relay|\.grok)\/.*\/images\//.test(text);
+  return touchesImageFile || encodesImage || sessionImage;
 }
 
 function upsertAgentJob(current: AgentTermJob[], next: AgentTermJob): AgentTermJob[] {
@@ -1176,7 +1191,8 @@ export default function App() {
     const last = [...(conversation?.messages || [])].reverse().find((item) => item.role === "assistant");
     const jobs = (last?.events || [])
       .map(agentJobFromEvent)
-      .filter((item): item is AgentTermJob => Boolean(item));
+      .filter((item): item is AgentTermJob => Boolean(item))
+      .filter((item) => !isGeneratedImageProbe(item.command) && !/complete|success|fail|error|cancel/i.test(item.status));
     if (jobs.length) setAgentTermJobs(jobs);
   }, [showTerminal]);
   const visibleMessages = useMemo(() => {
@@ -1186,6 +1202,12 @@ export default function App() {
     // cannot blank the transcript. Overlay in place so the user turn stays above Grok.
     return withStickyOutgoing(base, stickyOutgoing);
   }, [selected?.messages, stickyOutgoing]);
+  const liveImageBusy = useMemo(() => {
+    const assistant = [...visibleMessages].reverse().find((item) => item.role === "assistant" && item.streaming);
+    if (!assistant) return false;
+    const prev = visibleMessages.find((item) => item.id === previousUserId(visibleMessages, assistant.id));
+    return isImageGenBusy(assistant, prev?.text || "");
+  }, [visibleMessages]);
   const homeDir = status?.homeDir || "";
   const sessionCwd = selected?.cwd || cwd;
   const activeSsh = selected?.ssh || (isSshWorkspace(sessionCwd) ? parseSshWorkspace(sessionCwd) : null);
@@ -1626,17 +1648,21 @@ export default function App() {
           if (chunkType === "text" || !chunkType) {
             assistant.text += contentText(update);
           } else {
-            assistant.media = [
-              ...assistant.media,
-              {
-                id: uid(),
-                type: chunkType,
-                mimeType: content.mimeType ? String(content.mimeType) : undefined,
-                data: content.data ? String(content.data) : undefined,
-                uri: content.uri ? String(content.uri) : undefined,
-                name: content.name ? String(content.name) : undefined,
-              },
-            ];
+            assistant.media = mergeMessageMedia(
+              assistant.media,
+              [
+                {
+                  id: uid(),
+                  type: chunkType,
+                  mimeType: content.mimeType ? String(content.mimeType) : undefined,
+                  data: content.data ? String(content.data) : undefined,
+                  uri: content.uri ? String(content.uri) : undefined,
+                  name: content.name ? String(content.name) : undefined,
+                  at: assistant.text.length,
+                },
+              ],
+              assistant.text.length,
+            );
           }
         } else if (type === "agent_thought_chunk") {
           assistant.thought += contentText(update);
@@ -1649,7 +1675,9 @@ export default function App() {
         } else if (type === "tool_call" || type === "tool_call_update") {
           const id = String(update.toolCallId || update.tool_call_id || uid());
           const metaTool = toolMeta(update);
-          const kind = String(update.kind || metaTool?.kind || metaTool?.name || "other");
+          const metaKind = String(metaTool?.kind || metaTool?.name || "");
+          const rawKind = String(update.kind || "");
+          const kind = /^(other)?$/i.test(rawKind) && metaKind ? metaKind : rawKind || metaKind || "other";
           const rawTitle = String(
             update.title || metaTool?.label || metaTool?.name || update.name || copy.toolCall,
           );
@@ -1667,19 +1695,41 @@ export default function App() {
           const isEdit = Boolean(
             diffs.length || /edit|write|replace|apply_patch|applypatch|str_replace/i.test(`${kind} ${rawTitle}`),
           );
-          const fileName = editPath.split("/").filter(Boolean).pop() || "";
-          const title = isEdit ? (fileName ? `Edit ${fileName}` : "Edit") : rawTitle;
           const input = diffs.length ? undefined : jsonText(update.rawInput ?? update.input ?? update.raw_input);
           const output = diffs.length ? undefined : jsonText(update.content ?? update.output ?? update.rawOutput);
+          const imageLike = isImageGenEvent({
+            id: `tool-${id}`,
+            kind,
+            title: rawTitle,
+            input,
+            output,
+          });
+          const fileName = editPath.split("/").filter(Boolean).pop() || "";
+          const title = imageLike ? copy.imageGenTool : isEdit ? (fileName ? `Edit ${fileName}` : "Edit") : rawTitle;
           assistant.events = upsertEvent(assistant.events, {
             id: `tool-${id}`,
-            kind: isEdit ? "edit" : kind,
+            kind: imageLike ? "image_gen" : isEdit ? "edit" : kind,
             title,
             status: String(update.status || "pending"),
             input,
             output,
             diffs: diffs.length ? diffs : undefined,
           });
+          assistant.media = mergeMessageMedia(
+            assistant.media,
+            extractMessageMedia(
+              [
+                update.rawOutput,
+                update.raw_output,
+                update.content,
+                update.output,
+                update.embeddedContent,
+                asRecord(update._meta),
+              ],
+              assistant.text.length,
+            ),
+            assistant.text.length,
+          );
           if (
             showTerminalRef.current &&
             isCommandEvent({
@@ -1693,15 +1743,17 @@ export default function App() {
             })
           ) {
             const command = extractShellCommand(inputRec, input);
-            setAgentTermJobs((current) =>
-              upsertAgentJob(current, {
-                id,
-                title: terminalJobTitle(command, title),
-                command: command || title,
-                output: extractShellOutput(output),
-                status: String(update.status || "pending"),
-              }),
-            );
+            if (!isGeneratedImageProbe(command || title)) {
+              setAgentTermJobs((current) =>
+                upsertAgentJob(current, {
+                  id,
+                  title: terminalJobTitle(command, title),
+                  command: command || title,
+                  output: extractShellOutput(output),
+                  status: update.status ? String(update.status) : "",
+                }),
+              );
+            }
           }
           if (editPath && isEdit) {
             setWorkspaceFocusPath(editPath);
@@ -1940,7 +1992,7 @@ export default function App() {
           input: event.input,
           output: event.output,
         })),
-        media: [],
+        media: extractMessageMedia((item.events || []).flatMap((event) => [event.output, event.input])),
         streaming: false,
       }));
       const el = transcriptRef.current;
@@ -3583,12 +3635,12 @@ export default function App() {
             <span className="muted">{selected?.title || t.newChat}</span>
           </div>
           <div className="live-row">
-            {running ? (
+            {running && !liveImageBusy ? (
               <div className="live">
                 <span className="spinner" />
                 {statusText || t.running}
               </div>
-            ) : osLabel ? (
+            ) : !running && osLabel ? (
               <div className="live quiet">{osLabel}</div>
             ) : null}
             <button
@@ -3705,9 +3757,14 @@ export default function App() {
                 <div ref={topSentinelRef} className="history-sentinel" />
                 {visibleMessages.slice(Math.max(0, visibleMessages.length - shownCount)).map((message) => {
                   const livePhase = assistantLivePhase(message);
+                  const prevUser = visibleMessages.find(
+                    (item) => item.id === previousUserId(visibleMessages, message.id),
+                  );
+                  const imageBusy = isImageGenBusy(message, prevUser?.text || "");
+                  const expectImage = imageBusy && !(message.media || []).some(isShowableImage);
                   const showThinkingBar =
                     livePhase === "thinking" && !(message.thought && !message.events.length);
-                  const showWorkingBar = livePhase === "working";
+                  const showWorkingBar = livePhase === "working" && !imageBusy;
                   return (
                   <article key={message.id} className={`row ${message.role}`}>
                     <div className={message.role === "user" ? "bubble user" : "bubble assistant"}>
@@ -3778,20 +3835,8 @@ export default function App() {
                       ) : null}
                       {editingMessageId === message.id
                         ? null
-                        : message.text || (message.streaming && message.events.length) ? (
-                        <MessageBody
-                          text={message.text}
-                          streaming={message.streaming && Boolean(message.text)}
-                        />
-                      ) : null}
-                      {message.media.map((item) =>
-                        item.type === "image" && item.data ? (
-                          <img key={item.id} className="chat-media" src={`data:${item.mimeType || "image/png"};base64,${item.data}`} alt={item.name || ""} />
-                        ) : (
-                          <a key={item.id} className="media-link" href={item.uri} target="_blank" rel="noreferrer">
-                            {item.name || item.uri || item.type}
-                          </a>
-                        ),
+                        : (
+                        <ChatMessageMedia message={message} copy={t} expectImage={expectImage} />
                       )}
                       {showWorkingBar ? (
                         <div className="working">

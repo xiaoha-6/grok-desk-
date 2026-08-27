@@ -64,6 +64,15 @@ function decodeChunk(data: string) {
   }
 }
 
+function jobFinished(status?: string) {
+  return /complete|success|fail|error|cancel/i.test(status || "");
+}
+
+function clipFeed(text: string, max = 4000) {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n…`;
+}
+
 function toTermText(value: string) {
   return value.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
 }
@@ -303,6 +312,7 @@ export function TerminalPanel({
   const [menuOpen, setMenuOpen] = useState(false);
   const [ready, setReady] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const dismissedAgents = useRef(new Set<string>());
   const setChannel = onChannel || (() => undefined);
 
   useEffect(() => {
@@ -358,6 +368,7 @@ export function TerminalPanel({
       const next = current.map((tab) => ({ ...tab }));
       for (const job of agentJobs) {
         const id = `agent-${job.id}`;
+        if (dismissedAgents.current.has(id) || jobFinished(job.status)) continue;
         const existing = next.find((tab) => tab.id === id);
         const title = job.title || copy.agentTerminal;
         if (existing) {
@@ -380,6 +391,26 @@ export function TerminalPanel({
       return changed ? next : current;
     });
   }, [agentJobs, copy.agentTerminal, cwd]);
+
+  useEffect(() => {
+    const doneIds = (agentJobs || [])
+      .filter((job) => jobFinished(job.status))
+      .map((job) => `agent-${job.id}`);
+    if (!doneIds.length) return;
+    const timer = window.setTimeout(() => {
+      doneIds.forEach((id) => dismissedAgents.current.add(id));
+      setTabs((current) => {
+        const remaining = current.filter((tab) => !doneIds.includes(tab.id));
+        if (remaining.length === current.length) return current;
+        setActiveId((active) => {
+          if (remaining.some((tab) => tab.id === active)) return active;
+          return [...remaining].reverse().find((tab) => tab.kind === "shell")?.id || remaining[0]?.id || "";
+        });
+        return remaining;
+      });
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [agentJobs]);
 
   useEffect(() => {
     if (!runJob) return;
@@ -412,9 +443,13 @@ export function TerminalPanel({
 
   const closeTab = useCallback(
     (id: string) => {
+      if (id.startsWith("agent-")) dismissedAgents.current.add(id);
       setTabs((current) => {
         const next = current.filter((item) => item.id !== id);
-        if (id === activeId) setActiveId(next[next.length - 1]?.id || "");
+        if (id === activeId) {
+          const shell = [...next].reverse().find((tab) => tab.kind === "shell");
+          setActiveId(shell?.id || next[next.length - 1]?.id || "");
+        }
         return next;
       });
     },
@@ -471,6 +506,7 @@ export function TerminalPanel({
       </div>
       {channel === "terminal" ? (
         <div className="term-tabs">
+          <div className="term-tab-scroll">
           {tabs.map((tab) => {
             const job = tab.kind === "agent" ? agentJobs?.find((item) => `agent-${item.id}` === tab.id) : undefined;
             const busy = Boolean(job && /in_progress|pending|running/i.test(job.status)) || tab.kind === "run";
@@ -505,6 +541,7 @@ export function TerminalPanel({
               </button>
             );
           })}
+          </div>
           <div className="term-add-wrap" ref={menuRef}>
             <button
               className="term-add"
@@ -534,7 +571,9 @@ export function TerminalPanel({
         {tabs.map((tab) => {
           const job = tab.kind === "agent" ? agentJobs?.find((item) => `agent-${item.id}` === tab.id) : undefined;
           const feed = job
-            ? `$ ${job.command}${job.output ? `\n${job.output}` : ""}${job.status && !/in_progress|pending|running/i.test(job.status) ? `\n[${job.status}]` : ""}`
+            ? clipFeed(
+                `$ ${job.command}${job.output ? `\n${job.output}` : ""}${job.status && !/in_progress|pending|running/i.test(job.status) ? `\n[${job.status}]` : ""}`,
+              )
             : "";
           const inDebug = channel === "debug" && tab.kind === "run";
           const inTerm = channel === "terminal";

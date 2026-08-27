@@ -127,9 +127,16 @@ export function categoryFor(event: TimelineEvent): ActivityCategory {
   return "other";
 }
 
+export function isImageGenEvent(event: TimelineEvent) {
+  const haystack = `${event.kind} ${event.title} ${event.input || ""} ${event.output || ""}`.toLowerCase();
+  return /imagine|image[_-]?gen|imagegen|variant["']?\s*:\s*["']?imagegen|generate[- ]?image|文生图|生成图片|生成圖片/.test(
+    haystack,
+  );
+}
+
 export function visibleEvents(events: TimelineEvent[]) {
   return events.filter((event) => {
-    if (isEditEvent(event) || isCommandEvent(event)) return false;
+    if (isEditEvent(event) || isCommandEvent(event) || isImageGenEvent(event)) return false;
     if (event.kind === "extension" && REDUNDANT.has(normalize(event.title))) return false;
     return categoryFor(event) !== "system";
   });

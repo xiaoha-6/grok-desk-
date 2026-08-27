@@ -1,4 +1,7 @@
-use crate::config::{canonical_model_id, credentials_ready, resolve_agent_home, NO_CREDENTIALS_CODE};
+use crate::config::{
+    canonical_model_id, credentials_ready, ensure_image_gen_routing, resolve_agent_home,
+    IMAGE_EDIT_MODEL, IMAGE_GEN_MODEL, NO_CREDENTIALS_CODE,
+};
 use crate::runtime::{grok_home, resolve_binary};
 use crate::ssh::SshTarget;
 use serde::{Deserialize, Serialize};
@@ -550,6 +553,8 @@ impl AcpClient {
         ssh: Option<&SshTarget>,
     ) -> Result<(), String> {
         let home = resolve_agent_home(options.grok_home.as_deref())?;
+        let _ = ensure_image_gen_routing(&crate::runtime::grok_home());
+        let _ = ensure_image_gen_routing(&home);
         let mut extra_env: Vec<(String, String)> = vec![
             (
                 "GROK_MEMORY".into(),
@@ -579,6 +584,9 @@ impl AcpClient {
             extra_env.push(("GROK_WEB_FETCH".into(), "0".into()));
         }
         let relay_profile = crate::config::read_relay_profile(&grok_home());
+        extra_env.push(("GROK_IMAGE_GEN".into(), "1".into()));
+        extra_env.push(("GROK_IMAGE_GEN_MODEL_OVERRIDE".into(), IMAGE_GEN_MODEL.into()));
+        extra_env.push(("GROK_IMAGE_EDIT_MODEL_OVERRIDE".into(), IMAGE_EDIT_MODEL.into()));
         if crate::config::is_relay_configured(&grok_home()) {
             if let Some(profile) = &relay_profile {
                 extra_env.push(("GROK_CLI_CHAT_PROXY_BASE_URL".into(), profile.endpoint.clone()));
@@ -756,6 +764,7 @@ fn session_params(cwd: &str, options: &SessionOptions) -> Value {
     {
         meta["reasoningEffort"] = json!(effort);
     }
+    meta["imageGenModel"] = json!(IMAGE_GEN_MODEL);
     json!({
         "cwd": cwd,
         "mcpServers": [],

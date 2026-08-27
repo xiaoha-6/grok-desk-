@@ -178,6 +178,7 @@ export type MessageMedia = {
   data?: string;
   uri?: string;
   name?: string;
+  at?: number;
 };
 
 export type ChatMessage = {
