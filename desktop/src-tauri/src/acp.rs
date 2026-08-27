@@ -889,6 +889,37 @@ fn dispatch_message(
                 .ok()
                 .map(|value| value.clone())
                 .unwrap_or_else(|| "default".to_string());
+            if method == "session/request_permission" && is_generated_image_probe_params(&params)
+            {
+                let result = if let Some(option_id) = pick_reject_option(&params) {
+                    json!({
+                        "outcome": {
+                            "outcome": "selected",
+                            "optionId": option_id
+                        }
+                    })
+                } else {
+                    json!({ "outcome": { "outcome": "cancelled" } })
+                };
+                let _ = write_message(
+                    stdin,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result
+                    }),
+                );
+                let _ = app.emit(
+                    "acp-update",
+                    json!({
+                        "method": "session/request_permission",
+                        "params": params,
+                        "autoDenied": true,
+                        "reason": "generated_image_probe"
+                    }),
+                );
+                return;
+            }
             if method == "session/request_permission"
                 && should_auto_allow(&mode, &params)
             {
@@ -1131,6 +1162,127 @@ pub fn pick_permission_option(params: &Value) -> Option<String> {
     })
 }
 
+pub fn pick_reject_option(params: &Value) -> Option<String> {
+    let options = params.get("options").and_then(Value::as_array)?;
+    let parsed: Vec<(String, String)> = options
+        .iter()
+        .filter_map(|option| {
+            let id = option
+                .get("optionId")
+                .or_else(|| option.get("option_id"))
+                .or_else(|| option.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            let kind = option
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = option
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some((id, format!("{kind} {name}")))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    let searchable = |id: &str, extra: &str| {
+        format!("{id} {extra}")
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .replace(' ', "_")
+    };
+    let priorities = [
+        "reject_once",
+        "reject",
+        "deny_once",
+        "deny",
+        "cancel",
+        "skip",
+    ];
+    for priority in priorities {
+        if let Some((id, _)) = parsed
+            .iter()
+            .find(|(id, extra)| searchable(id, extra).contains(priority))
+        {
+            return Some(id.clone());
+        }
+    }
+    None
+}
+
+fn tool_call_from_params(params: &Value) -> Option<&Value> {
+    params.get("toolCall").or_else(|| params.get("tool_call"))
+}
+
+fn permission_haystack(params: &Value) -> String {
+    let mut text = String::new();
+    if let Some(tool) = tool_call_from_params(params) {
+        for key in ["title", "kind", "command"] {
+            if let Some(value) = tool.get(key).and_then(Value::as_str) {
+                text.push_str(value);
+                text.push('\n');
+            }
+        }
+        for key in ["rawInput", "raw_input", "input", "content"] {
+            if let Some(value) = tool.get(key) {
+                text.push_str(&value.to_string());
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
+pub fn is_generated_image_probe(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase().replace('\\', "/");
+    if lower.trim().is_empty() {
+        return false;
+    }
+    let has_ext = [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".heif",
+    ]
+    .iter()
+    .any(|ext| lower.contains(ext));
+    if !has_ext {
+        return false;
+    }
+    let touches_images = lower.contains("/images/")
+        || lower.contains(" images/")
+        || lower.contains("\"images/")
+        || lower.contains("'images/")
+        || lower.contains("=images/");
+    if !touches_images {
+        return false;
+    }
+    if lower.contains("grokdesk-relay")
+        || lower.contains("/.grok/")
+        || lower.contains("sessions/")
+    {
+        return true;
+    }
+    if lower.contains("b64encode")
+        || lower.contains("base64")
+        || lower.contains("pathlib")
+        || lower.contains("python")
+        || lower.contains("data:image")
+    {
+        return true;
+    }
+    lower.split("images/").any(|chunk| {
+        chunk
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_digit())
+            .unwrap_or(false)
+    })
+}
+
+fn is_generated_image_probe_params(params: &Value) -> bool {
+    is_generated_image_probe(&permission_haystack(params))
+}
+
 #[allow(dead_code)]
 pub fn session_update_from(params: &Value) -> Option<Value> {
     if let Some(update) = params.get("update").cloned() {
@@ -1336,6 +1488,26 @@ mod tests {
         assert!(!should_auto_allow("acceptEdits", &shell));
         assert!(should_auto_allow("bypassPermissions", &shell));
         assert!(!should_auto_allow("default", &edit));
+    }
+
+    #[test]
+    fn rejects_generated_image_probe() {
+        let params = json!({
+            "toolCall": {
+                "kind": "execute",
+                "title": "python3",
+                "rawInput": {
+                    "command": "python3 -c \"import base64,pathlib; print(base64.b64encode(pathlib.Path('images/1.jpg').read_bytes()))\""
+                }
+            },
+            "options": [
+                { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "reject", "name": "Reject", "kind": "reject" }
+            ]
+        });
+        assert!(is_generated_image_probe_params(&params));
+        assert_eq!(pick_reject_option(&params).as_deref(), Some("reject"));
+        assert!(!is_generated_image_probe("ls src && cargo test"));
     }
 
     #[test]

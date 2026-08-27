@@ -6,6 +6,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { IconClose, IconOutput, IconPlus, IconPorts, IconTerminal, IconWarning } from "./icons";
 import type { Copy } from "./i18n";
+import { fill } from "./i18n";
 import type { RunJob } from "./launch";
 import type { SshTarget, Theme } from "./types";
 
@@ -311,8 +312,8 @@ export function TerminalPanel({
   const [activeId, setActiveId] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [ready, setReady] = useState(false);
+  const [agentLogOpen, setAgentLogOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const dismissedAgents = useRef(new Set<string>());
   const setChannel = onChannel || (() => undefined);
 
   useEffect(() => {
@@ -361,58 +362,6 @@ export function TerminalPanel({
   }, [addTab, ready, tabs.length]);
 
   useEffect(() => {
-    if (!agentJobs?.length) return;
-    setTabs((current) => {
-      let changed = false;
-      let addedId = "";
-      const next = current.map((tab) => ({ ...tab }));
-      for (const job of agentJobs) {
-        const id = `agent-${job.id}`;
-        if (dismissedAgents.current.has(id) || jobFinished(job.status)) continue;
-        const existing = next.find((tab) => tab.id === id);
-        const title = job.title || copy.agentTerminal;
-        if (existing) {
-          if (existing.title !== title) {
-            existing.title = title;
-            changed = true;
-          }
-          continue;
-        }
-        next.push({
-          id,
-          title,
-          cwd,
-          kind: "agent",
-        });
-        changed = true;
-        addedId = id;
-      }
-      if (addedId) setActiveId(addedId);
-      return changed ? next : current;
-    });
-  }, [agentJobs, copy.agentTerminal, cwd]);
-
-  useEffect(() => {
-    const doneIds = (agentJobs || [])
-      .filter((job) => jobFinished(job.status))
-      .map((job) => `agent-${job.id}`);
-    if (!doneIds.length) return;
-    const timer = window.setTimeout(() => {
-      doneIds.forEach((id) => dismissedAgents.current.add(id));
-      setTabs((current) => {
-        const remaining = current.filter((tab) => !doneIds.includes(tab.id));
-        if (remaining.length === current.length) return current;
-        setActiveId((active) => {
-          if (remaining.some((tab) => tab.id === active)) return active;
-          return [...remaining].reverse().find((tab) => tab.kind === "shell")?.id || remaining[0]?.id || "";
-        });
-        return remaining;
-      });
-    }, 800);
-    return () => window.clearTimeout(timer);
-  }, [agentJobs]);
-
-  useEffect(() => {
     if (!runJob) return;
     const id = runJob.id.startsWith("run-") ? runJob.id : `run-${runJob.id}`;
     setTabs((current) => {
@@ -443,7 +392,6 @@ export function TerminalPanel({
 
   const closeTab = useCallback(
     (id: string) => {
-      if (id.startsWith("agent-")) dismissedAgents.current.add(id);
       setTabs((current) => {
         const next = current.filter((item) => item.id !== id);
         if (id === activeId) {
@@ -565,6 +513,37 @@ export function TerminalPanel({
               </div>
             ) : null}
           </div>
+        </div>
+      ) : null}
+      {channel === "terminal" && (agentJobs?.length || 0) > 0 ? (
+        <div className="agent-run-log">
+          <button
+            className="agent-run-toggle"
+            type="button"
+            onClick={() => setAgentLogOpen((value) => !value)}
+          >
+            <span className={`agent-run-dot${(agentJobs || []).some((job) => !jobFinished(job.status)) ? " live" : ""}`} />
+            <strong>{copy.agentRunLog}</strong>
+            <em>{fill(copy.agentRunCount, { n: agentJobs?.length || 0 })}</em>
+            <span className="agent-run-caret">{agentLogOpen ? "▾" : "▸"}</span>
+          </button>
+          {agentLogOpen ? (
+            <div className="agent-run-body">
+              {(agentJobs || []).map((job) => {
+                const running = /in_progress|pending|running/i.test(job.status);
+                const failed = /fail|error/i.test(job.status);
+                return (
+                  <details key={job.id} className={`agent-run-item${failed ? " bad" : running ? " run" : ""}`} open={running}>
+                    <summary>
+                      <span className="agent-run-cmd">{job.command || job.title}</span>
+                      {job.status ? <span>{job.status}</span> : null}
+                    </summary>
+                    {job.output ? <pre>{job.output}</pre> : null}
+                  </details>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       ) : null}
       <div className={`term-body${showTerm ? "" : " hidden"}`}>

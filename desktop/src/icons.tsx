@@ -197,6 +197,25 @@ export function IconDownload(props: IconProps) {
     </Svg>
   );
 }
+export function IconSave(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M5 5h10.2L19 8.8V19H5z" />
+      <path d="M8 5v4.8h8" />
+      <path d="M8 19v-6h8v6" />
+    </Svg>
+  );
+}
+export function IconExpand(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M9 5H5v4" />
+      <path d="M15 5h4v4" />
+      <path d="M19 15v4h-4" />
+      <path d="M5 15v4h4" />
+    </Svg>
+  );
+}
 export function IconClose(props: IconProps) {
   return (
     <Svg {...props} size={props.size ?? 11}>

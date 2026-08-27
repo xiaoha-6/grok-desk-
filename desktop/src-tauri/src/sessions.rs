@@ -60,6 +60,8 @@ pub struct LocalSessionMessage {
 #[serde(rename_all = "camelCase")]
 pub struct LocalSessionHistory {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_dir: String,
     pub messages: Vec<LocalSessionMessage>,
     pub used_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -96,7 +98,8 @@ pub fn load_session_history(
     let limit = limit.max(1);
     let history_path = dir.join("chat_history.jsonl");
     let segments = compaction_segment_files(&dir);
-    let all = reconstruct_turns(&history_path);
+    let mut all = reconstruct_turns(&history_path);
+    attach_session_images(&dir, &mut all);
     let hist_total = all.len();
     let (messages, hist_more) = slice_end(&all, limit, skip);
     let has_more;
@@ -112,12 +115,152 @@ pub fn load_session_history(
     let (used_tokens, total_tokens, compaction_count) = parse_signals(&dir.join("signals.json"));
     Ok(LocalSessionHistory {
         session_id: session_id.to_string(),
+        session_dir: dir.to_string_lossy().into_owned(),
         messages,
         used_tokens,
         total_tokens,
         compaction_count,
         has_more,
     })
+}
+
+fn list_session_images(dir: &Path) -> Vec<PathBuf> {
+    let folder = dir.join("images");
+    let Ok(entries) = fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| {
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic" | "heif"
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn looks_like_image_blob(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".heif"]
+        .iter()
+        .any(|ext| lower.contains(ext))
+}
+
+fn event_has_image_path(event: &LocalTimelineEvent) -> bool {
+    event
+        .output
+        .as_deref()
+        .map(looks_like_image_blob)
+        .unwrap_or(false)
+        || event
+            .input
+            .as_deref()
+            .map(looks_like_image_blob)
+            .unwrap_or(false)
+}
+
+fn is_image_gen_event(event: &LocalTimelineEvent) -> bool {
+    let hay = format!(
+        "{} {} {}",
+        event.kind,
+        event.title,
+        event.input.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    hay.contains("image_gen")
+        || hay.contains("imagine")
+        || hay.contains("imagegen")
+        || hay.contains("generate image")
+}
+
+fn attach_session_images(dir: &Path, messages: &mut [LocalSessionMessage]) {
+    let files = list_session_images(dir);
+    if files.is_empty() {
+        return;
+    }
+    let mut unused = files;
+    for msg in messages.iter() {
+        let blob = format!(
+            "{} {}",
+            msg.text,
+            msg.events
+                .iter()
+                .map(|event| format!(
+                    "{} {}",
+                    event.input.as_deref().unwrap_or(""),
+                    event.output.as_deref().unwrap_or("")
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        unused.retain(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let full = path.to_string_lossy();
+            !blob.contains(name) && !blob.contains(full.as_ref())
+        });
+    }
+    for msg in messages.iter_mut() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let wants = msg.events.iter().any(is_image_gen_event)
+            || msg.text.to_ascii_lowercase().contains("images/");
+        if !wants {
+            continue;
+        }
+        if msg.events.iter().any(event_has_image_path) {
+            continue;
+        }
+        let Some(path) = unused.first().cloned() else {
+            break;
+        };
+        unused.remove(0);
+        let payload = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "filename": path.file_name().and_then(|name| name.to_str()).unwrap_or("image.jpg"),
+            "type": "ImageGen",
+        })
+        .to_string();
+        if let Some(event) = msg
+            .events
+            .iter_mut()
+            .find(|event| is_image_gen_event(event) && event.output.is_none())
+        {
+            event.output = Some(payload);
+        } else if let Some(event) = msg
+            .events
+            .iter_mut()
+            .find(|event| is_image_gen_event(event) && !event_has_image_path(event))
+        {
+            event.output = Some(payload);
+        } else {
+            msg.events.push(LocalTimelineEvent {
+                id: format!(
+                    "image-{}",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("1")
+                ),
+                kind: "image_gen".into(),
+                title: "Generate Image".into(),
+                status: Some("completed".into()),
+                input: None,
+                output: Some(payload),
+            });
+        }
+    }
 }
 
 fn visit_summaries(dir: &Path, out: &mut Vec<LocalSessionSummary>) {

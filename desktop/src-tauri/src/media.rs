@@ -94,3 +94,32 @@ pub fn read_image_file(path: String) -> Result<PromptAttachment, String> {
         .to_string();
     attachment(&bytes, mime, &name)
 }
+
+pub fn save_image_as(
+    source_path: Option<String>,
+    data: Option<String>,
+    dest: &Path,
+) -> Result<(), String> {
+    if let Some(path) = source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        fs::copy(path, dest).map_err(|err| format!("无法保存图片：{err}"))?;
+        return Ok(());
+    }
+    let encoded = data.unwrap_or_default();
+    let payload = encoded
+        .split(',')
+        .last()
+        .unwrap_or(encoded.trim())
+        .trim();
+    if payload.is_empty() {
+        return Err("没有可保存的图片".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|err| format!("无法解码图片：{err}"))?;
+    fs::write(dest, bytes).map_err(|err| format!("无法保存图片：{err}"))?;
+    Ok(())
+}

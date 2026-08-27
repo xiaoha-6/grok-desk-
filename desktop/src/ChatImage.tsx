@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { Copy } from "./i18n";
-import { IconDownload } from "./icons";
+import { IconClose, IconDownload, IconExpand, IconRefresh, IconSave } from "./icons";
 import { MessageBody } from "./markdown";
 import { isImageGenEvent } from "./timeline";
 import type { ChatMessage, MessageMedia, PromptAttachment, TimelineEvent } from "./types";
@@ -27,6 +28,42 @@ export function wantsImageGen(text: string) {
   return /(?:生成|画|畫|绘制|繪製|出).{0,24}(?:图|圖)|一张图|一張圖|生图|生圖|出图|出圖|imagine\b|image\s*gen|(?:draw|make|create|generate)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|illustration)|文生图|文生圖|帮我画|幫我畫/i.test(
     value,
   );
+}
+
+export function isGeneratedImageProbe(command: string) {
+  const text = command.toLowerCase().replace(/\\/g, "/");
+  if (!text.trim()) return false;
+  const touchesImageFile = /(?:^|[/\s"'=])(?:.*\/)?images\/[^ \n"']+\.(?:png|jpe?g|gif|webp|bmp|heic)/.test(text);
+  const encodesImage = /b64encode|data:image|base64.*jpe?g|pathlib/.test(text) && /\.(?:png|jpe?g|gif|webp)\b/.test(text);
+  const sessionImage = /(?:grokdesk-relay|\.grok)\/.*\/images\//.test(text);
+  return touchesImageFile || encodesImage || sessionImage;
+}
+
+export function isImageProbeEvent(event: TimelineEvent) {
+  return isGeneratedImageProbe(`${event.title}\n${event.input || ""}\n${event.output || ""}`);
+}
+
+export function friendlyImageError(raw: string, copy: Copy) {
+  const text = String(raw || "").trim();
+  if (/没有配置图片生成|還沒有設定圖片|not configured|no.*image.*model|image gen.*model/i.test(text)) {
+    return copy.imageGenNotConfigured;
+  }
+  if (/\b403\b|forbidden|unauthorized|没有权限|沒有權限/i.test(text)) {
+    return copy.imageGenForbidden;
+  }
+  if (/timeout|timed out|超时|超時|逾時/i.test(text)) {
+    return copy.imageGenTimeout;
+  }
+  return text || copy.imageGenFailed;
+}
+
+export function imageGenFailure(message?: ChatMessage) {
+  if (!message) return "";
+  const failed = (message.events || []).find((event) => {
+    if (!isImageGenEvent(event)) return false;
+    return /fail|error/.test((event.status || "").toLowerCase());
+  });
+  return failed?.output || failed?.title || message.error || "";
 }
 
 export function isShowableImage(item: MessageMedia) {
@@ -128,7 +165,9 @@ export function extractMessageMedia(value: unknown, at = 0): MessageMedia[] {
         walk(parsed, depth + 1);
         return;
       }
-      const pathMatch = node.match(/(?:^|[\s"'=])(\/(?:Users|home|root|var)[^\s"'\\]+\.(?:png|jpe?g|gif|webp|bmp|heic))/i);
+      const pathMatch = node.match(
+        /(?:^|[\s"'=])((?:\/(?:Users|home|root|var)[^\s"'\\]+|(?:\.\/)?images\/[^\s"'\\]+)\.(?:png|jpe?g|gif|webp|bmp|heic))/i,
+      );
       if (pathMatch?.[1] && looksLikeImagePath(pathMatch[1])) {
         pushImage(out, { path: pathMatch[1] }, pathMatch[1], at);
       }
@@ -160,6 +199,33 @@ export function mediaFromEvents(events: TimelineEvent[] | undefined, at = 0) {
   return extractMessageMedia(
     (events || []).flatMap((event) => [event.output, event.input]),
     at,
+  );
+}
+
+export function resolveMediaUri(uri: string, sessionDir?: string) {
+  const value = uri.trim();
+  if (!value) return "";
+  if (isHttpLike(value) || value.startsWith("file:")) return value;
+  if (/^\/(?!\/)/.test(value) || /^[A-Za-z]:[\\/]/.test(value)) return value;
+  if (!sessionDir) return value;
+  const relative = value.replace(/^\.\//, "").replace(/^\\/, "");
+  const base = sessionDir.replace(/[/\\]+$/, "");
+  return `${base}/${relative}`.replace(/\\/g, "/");
+}
+
+export function hydrateHistoryMedia(
+  events: TimelineEvent[] | undefined,
+  text = "",
+  sessionDir?: string,
+  at = 0,
+) {
+  const incoming = mergeMessageMedia(
+    extractMessageMedia((events || []).flatMap((event) => [event.output, event.input]), at),
+    extractMessageMedia(text, at),
+    at,
+  );
+  return incoming.map((item) =>
+    item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
   );
 }
 
@@ -212,6 +278,71 @@ async function downloadImage(src: string, name?: string) {
     link.rel = "noreferrer";
     link.click();
   }
+}
+
+async function saveImageAs(src: string, item?: MessageMedia | null) {
+  const uri = (item?.uri || "").trim();
+  const path = uri && !isHttpLike(uri) ? filePathFromUri(uri) : "";
+  const data = item?.data || (src.startsWith("data:") ? src.replace(/^data:[^;]+;base64,/, "") : "");
+  await invoke<string | null>("save_image_as", {
+    path: path || undefined,
+    data: path ? undefined : data || undefined,
+    name: item?.name || "grok-image.png",
+  });
+}
+
+function ImageLightbox({
+  src,
+  name,
+  copy,
+  onClose,
+  onSaveAs,
+  onRedraw,
+}: {
+  src: string;
+  name?: string;
+  copy: Copy;
+  onClose: () => void;
+  onSaveAs?: () => void;
+  onRedraw?: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return createPortal(
+    <div className="chat-image-lightbox" onClick={onClose} role="dialog" aria-modal="true">
+      <div className="chat-image-lightbox-inner" onClick={(event) => event.stopPropagation()}>
+        <img src={src} alt={name || ""} />
+        <div className="chat-image-lightbox-bar">
+          <button type="button" title={copy.downloadImage} onClick={() => void downloadImage(src, name)}>
+            <IconDownload size={16} />
+            <span>{copy.downloadImage}</span>
+          </button>
+          {onSaveAs ? (
+            <button type="button" title={copy.saveImageAs} onClick={onSaveAs}>
+              <IconSave size={16} />
+              <span>{copy.saveImageAs}</span>
+            </button>
+          ) : null}
+          {onRedraw ? (
+            <button type="button" title={copy.redrawImage} onClick={onRedraw}>
+              <IconRefresh size={16} />
+              <span>{copy.redrawImage}</span>
+            </button>
+          ) : null}
+          <button type="button" title={copy.closeImage} onClick={onClose}>
+            <IconClose size={16} />
+            <span>{copy.closeImage}</span>
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
 }
 
 function GeneratingField() {
@@ -297,19 +428,25 @@ function GeneratingField() {
 export function ChatGeneratedImage({
   item,
   generating,
+  error,
   copy,
   aspect,
+  onRedraw,
 }: {
   item?: MessageMedia;
   generating?: boolean;
+  error?: string;
   copy: Copy;
   aspect?: string;
+  onRedraw?: () => void;
 }) {
   const fallbackSrc = mediaSrc(item);
   const [src, setSrc] = useState(item?.data ? fallbackSrc : "");
   const [loadedSrc, setLoadedSrc] = useState("");
+  const [open, setOpen] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const ready = Boolean(src) && loadedSrc === src;
+  const failed = Boolean(error) && !ready;
 
   useEffect(() => {
     let cancelled = false;
@@ -345,7 +482,7 @@ export function ChatGeneratedImage({
     if (src && node?.complete && node.naturalWidth) setLoadedSrc(src);
   }, [src]);
 
-  if (!src && !generating) {
+  if (!src && !generating && !failed) {
     if (item?.uri || item?.name) {
       return (
         <a className="media-link" href={item.uri} target="_blank" rel="noreferrer">
@@ -356,34 +493,76 @@ export function ChatGeneratedImage({
     return null;
   }
 
-  const showField = Boolean(generating || !ready);
+  const showField = Boolean((generating && !ready) || (failed && !ready));
   const style = showField ? ({ aspectRatio: aspect || "16 / 9" } as CSSProperties) : undefined;
 
   return (
-    <figure className={`chat-image-card ${ready ? "is-ready" : "generating"}`} style={style}>
-      {showField ? (
-        <>
-          <GeneratingField />
-          <span className="chat-image-badge">{copy.generatingImage}</span>
-        </>
-      ) : null}
-      {src ? (
-        <img
-          ref={imgRef}
+    <>
+      <figure
+        className={`chat-image-card ${ready ? "is-ready" : failed ? "is-failed" : "generating"}`}
+        style={style}
+      >
+        {showField ? (
+          <>
+            <GeneratingField />
+            {failed ? (
+              <div className="chat-image-fail">
+                <strong>{copy.imageGenFailed}</strong>
+                <span>{error}</span>
+                {onRedraw ? (
+                  <button type="button" onClick={onRedraw}>
+                    <IconRefresh size={14} />
+                    {copy.retryImage}
+                  </button>
+                ) : null}
+              </div>
+            ) : (
+              <span className="chat-image-badge">{copy.generatingImage}</span>
+            )}
+          </>
+        ) : null}
+        {src ? (
+          <img
+            ref={imgRef}
+            src={src}
+            alt={item?.name || ""}
+            className={ready ? "is-ready" : ""}
+            onLoad={() => setLoadedSrc(src)}
+            onClick={() => {
+              if (ready) setOpen(true);
+            }}
+          />
+        ) : null}
+        {ready ? (
+          <div className="chat-image-actions">
+            <button type="button" title={copy.openImage} onClick={() => setOpen(true)}>
+              <IconExpand size={15} />
+            </button>
+            <button type="button" title={copy.downloadImage} onClick={() => void downloadImage(src, item?.name)}>
+              <IconDownload size={15} />
+            </button>
+            <button type="button" title={copy.saveImageAs} onClick={() => void saveImageAs(src, item)}>
+              <IconSave size={15} />
+            </button>
+            {onRedraw ? (
+              <button type="button" title={copy.redrawImage} onClick={onRedraw}>
+                <IconRefresh size={15} />
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </figure>
+      {open && ready ? (
+        <ImageLightbox
           src={src}
-          alt={item?.name || ""}
-          className={ready ? "is-ready" : ""}
-          onLoad={() => setLoadedSrc(src)}
+          name={item?.name}
+          copy={copy}
+          onClose={() => setOpen(false)}
+          onSaveAs={() => void saveImageAs(src, item)}
+          onRedraw={onRedraw}
         />
       ) : null}
-      {ready ? (
-        <div className="chat-image-actions">
-          <button type="button" title={copy.downloadImage} onClick={() => void downloadImage(src, item?.name)}>
-            <IconDownload size={15} />
-          </button>
-        </div>
-      ) : null}
-    </figure>
+    </>
   );
 }
 
@@ -391,19 +570,33 @@ export function ChatMessageMedia({
   message,
   copy,
   expectImage,
+  sessionDir,
+  onRedraw,
 }: {
   message: ChatMessage;
   copy: Copy;
   expectImage?: boolean;
+  sessionDir?: string;
+  onRedraw?: () => void;
 }) {
-  const images = mergeMessageMedia(message.media || [], mediaFromEvents(message.events, 0)).filter(isShowableImage);
+  const images = mergeMessageMedia(
+    (message.media || []).map((item) =>
+      item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
+    ),
+    mediaFromEvents(message.events, 0).map((item) =>
+      item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
+    ),
+  ).filter(isShowableImage);
   let pending = (message.events || []).filter(isImageGenActive).length;
-  if (expectImage && !images.length) pending = Math.max(pending, 1);
+  if (expectImage && !images.length && message.streaming) pending = Math.max(pending, 1);
+  const rawFail = imageGenFailure(message);
+  const failText = rawFail ? friendlyImageError(rawFail, copy) : "";
+  const failed = Boolean(!images.length && !message.streaming && rawFail);
   const placeholders = Math.max(0, pending - images.length);
   const others = (message.media || []).filter((item) => !isShowableImage(item));
-  const text = stripImageDumpText(message.text || "", images.length > 0 || placeholders > 0);
+  const text = stripImageDumpText(message.text || "", images.length > 0 || placeholders > 0 || failed);
   const aspect = aspectFromEvents(message.events);
-  if (!text && !images.length && !placeholders && !others.length) return null;
+  if (!text && !images.length && !placeholders && !others.length && !failed) return null;
 
   const nodes: ReactNode[] = [];
   const ordered = [...images].sort((left, right) => (left.at ?? 0) - (right.at ?? 0));
@@ -415,11 +608,23 @@ export function ChatMessageMedia({
         generating={message.streaming && !item.data && !item.uri}
         copy={copy}
         aspect={aspect}
+        onRedraw={onRedraw}
       />,
     );
   });
   for (let index = 0; index < placeholders; index += 1) {
     nodes.push(<ChatGeneratedImage key={`gen-${index}`} generating copy={copy} aspect={aspect} />);
+  }
+  if (failed && !placeholders) {
+    nodes.push(
+      <ChatGeneratedImage
+        key="gen-failed"
+        error={failText || copy.imageGenFailed}
+        copy={copy}
+        aspect={aspect}
+        onRedraw={onRedraw}
+      />,
+    );
   }
   if (text) {
     nodes.push(

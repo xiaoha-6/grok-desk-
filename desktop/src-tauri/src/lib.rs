@@ -565,6 +565,32 @@ async fn read_image_file(path: String) -> Result<PromptAttachment, String> {
 }
 
 #[tauri::command]
+async fn save_image_as(
+    path: Option<String>,
+    data: Option<String>,
+    name: Option<String>,
+) -> Result<Option<String>, String> {
+    let suggested = name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("grok-image.png")
+        .to_string();
+    let file = rfd::AsyncFileDialog::new()
+        .set_title("保存图片")
+        .set_file_name(&suggested)
+        .save_file()
+        .await;
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    let dest = file.path().to_path_buf();
+    let saved = dest.to_string_lossy().into_owned();
+    run_blocking(move || media::save_image_as(path, data, &dest)).await?;
+    Ok(Some(saved))
+}
+
+#[tauri::command]
 async fn cancel_turn(state: State<'_, AppState>) -> Result<(), String> {
     let acp = Arc::clone(&state.acp);
     run_blocking(move || {
@@ -808,6 +834,7 @@ pub fn run() {
             set_active_model,
             read_clipboard_image,
             read_image_file,
+            save_image_as,
             parse_import_url,
             take_pending_import,
             install_runtime,

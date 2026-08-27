@@ -238,6 +238,7 @@ export type Conversation = {
   cwd: string;
   accountId?: string;
   grokSessionId?: string;
+  sessionDir?: string;
   ssh?: SshTarget | null;
   messages: ChatMessage[];
   updatedAt: number;
@@ -258,6 +259,7 @@ export type LocalSessionSummary = {
 
 export type LocalSessionHistory = {
   sessionId: string;
+  sessionDir?: string;
   messages: { role: string; text: string; events?: TimelineEvent[] }[];
   usedTokens?: number | null;
   totalTokens?: number | null;

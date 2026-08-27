@@ -16,6 +16,7 @@ import {
 } from "./timeline";
 import type { Lang, TimelineEvent } from "./types";
 import { fill, t as translate } from "./i18n";
+import { isImageProbeEvent } from "./ChatImage";
 
 function Disclosure({
   open,
@@ -136,7 +137,7 @@ export function InlineCommands({
   events: TimelineEvent[];
   lang: Lang;
 }) {
-  const commands = events.filter((event) => isCommandEvent(event));
+  const commands = events.filter((event) => isCommandEvent(event) && !isImageProbeEvent(event));
   if (!commands.length) return null;
   return (
     <div className="inline-commands">

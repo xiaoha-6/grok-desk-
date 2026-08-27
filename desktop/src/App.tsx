@@ -20,7 +20,11 @@ import { ActivityTimeline, InlineCommands, InlineEdits } from "./ActivityTimelin
 import {
   ChatMessageMedia,
   extractMessageMedia,
+  hydrateHistoryMedia,
+  imageGenFailure,
+  isGeneratedImageProbe,
   isImageGenBusy,
+  isImageProbeEvent,
   isShowableImage,
   mergeMessageMedia,
 } from "./ChatImage";
@@ -378,15 +382,6 @@ function terminalJobTitle(command: string, fallback: string) {
   const line = (command || fallback).split("\n")[0].trim();
   if (line.length <= 28) return line || fallback;
   return `${line.slice(0, 27)}…`;
-}
-
-function isGeneratedImageProbe(command: string) {
-  const text = command.toLowerCase();
-  if (!text.trim()) return false;
-  const touchesImageFile = /(?:^|[/\s"'=])(?:.*\/)?images\/[^ \n"']+\.(?:png|jpe?g|gif|webp|bmp|heic)/.test(text);
-  const encodesImage = /b64encode|data:image|base64.*jpe?g|pathlib/.test(text) && /\.(?:png|jpe?g|gif|webp)\b/.test(text);
-  const sessionImage = /(?:grokdesk-relay|\.grok)\/.*\/images\//.test(text);
-  return touchesImageFile || encodesImage || sessionImage;
 }
 
 function upsertAgentJob(current: AgentTermJob[], next: AgentTermJob): AgentTermJob[] {
@@ -1743,7 +1738,13 @@ export default function App() {
             })
           ) {
             const command = extractShellCommand(inputRec, input);
-            if (!isGeneratedImageProbe(command || title)) {
+            if (!isGeneratedImageProbe(command || title) && !isImageProbeEvent({
+              id: `tool-${id}`,
+              kind: isEdit ? "edit" : kind,
+              title,
+              input,
+              output,
+            })) {
               setAgentTermJobs((current) =>
                 upsertAgentJob(current, {
                   id,
@@ -1889,6 +1890,22 @@ export default function App() {
       return;
     }
     const tool = asRecord(params.toolCall) || asRecord(params.tool_call) || {};
+    const command = extractShellCommand(asRecord(tool.rawInput) || asRecord(tool.raw_input) || asRecord(tool.input), jsonText(tool));
+    const probeText = `${tool.title || ""} ${command} ${jsonText(tool.rawInput ?? tool.raw_input ?? tool.input ?? tool)}`;
+    if (isGeneratedImageProbe(probeText)) {
+      const reject = ((params.options as Array<Record<string, unknown>>) || []).find((option) =>
+        /reject|deny|cancel/i.test(
+          `${option.optionId || option.option_id || option.id || ""} ${option.kind || ""} ${option.name || ""}`,
+        ),
+      );
+      void invoke("answer_interaction", {
+        requestId: payload.requestId,
+        result: reject
+          ? { outcome: { outcome: "selected", optionId: String(reject.optionId || reject.option_id || reject.id) } }
+          : { outcome: { outcome: "cancelled" } },
+      }).catch(() => undefined);
+      return;
+    }
     const options = ((params.options as Array<Record<string, unknown>>) || []).map((option) => ({
       id: String(option.optionId || option.option_id || option.id || ""),
       name: String(option.name || copy.allow),
@@ -1992,7 +2009,7 @@ export default function App() {
           input: event.input,
           output: event.output,
         })),
-        media: extractMessageMedia((item.events || []).flatMap((event) => [event.output, event.input])),
+        media: hydrateHistoryMedia(item.events || [], item.text || "", history.sessionDir),
         streaming: false,
       }));
       const el = transcriptRef.current;
@@ -2014,6 +2031,7 @@ export default function App() {
           return {
             ...item,
             messages,
+            sessionDir: history.sessionDir || item.sessionDir,
             historyHasMore: hasMore,
             historySkip: skip + incoming.length,
           };
@@ -3836,7 +3854,36 @@ export default function App() {
                       {editingMessageId === message.id
                         ? null
                         : (
-                        <ChatMessageMedia message={message} copy={t} expectImage={expectImage} />
+                        <ChatMessageMedia
+                          message={message}
+                          copy={t}
+                          expectImage={expectImage}
+                          sessionDir={selected?.sessionDir}
+                          onRedraw={
+                            message.role === "assistant" && prevUser && !running
+                              ? () => {
+                                  const extras = (prevUser.media || [])
+                                    .filter((item) => item.data)
+                                    .map((item) => ({
+                                      mimeType: item.mimeType,
+                                      data: item.data,
+                                      name: item.name,
+                                    }));
+                                  const lastAssistant = [...visibleMessages]
+                                    .reverse()
+                                    .find((item) => item.role === "assistant");
+                                  if (
+                                    lastAssistant?.id === message.id &&
+                                    (imageGenFailure(message) || message.error)
+                                  ) {
+                                    void regenerate();
+                                    return;
+                                  }
+                                  void sendText(prevUser.text, extras);
+                                }
+                              : undefined
+                          }
+                        />
                       )}
                       {showWorkingBar ? (
                         <div className="working">
@@ -3850,7 +3897,7 @@ export default function App() {
                           <span>{t.stoppedHint}</span>
                         </div>
                       ) : null}
-                      {message.error ? (
+                      {message.error && !imageGenFailure(message) ? (
                         <div className="fail">
                           <div className="fail-title">{t.failed}</div>
                           <pre>{message.error}</pre>
