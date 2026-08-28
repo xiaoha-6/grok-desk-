@@ -1032,7 +1032,7 @@ export default function App() {
   const [sshError, setSshError] = useState("");
   const [sshBrowsePath, setSshBrowsePath] = useState("");
   const [sshEntries, setSshEntries] = useState<WorkspaceEntry[]>([]);
-  const [running, setRunning] = useState(false);
+  const [liveTurns, setLiveTurns] = useState<string[]>([]);
   const [statusText, setStatusText] = useState("");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [statusError, setStatusError] = useState("");
@@ -1113,10 +1113,11 @@ export default function App() {
   const topSentinelRef = useRef<HTMLDivElement | null>(null);
   const followRef = useRef(true);
   const lastImportRef = useRef("");
-  const turnIdRef = useRef(0);
+  const turnSeqRef = useRef<Record<string, number>>({});
   const conversationsRef = useRef(conversations);
   const selectedIdRef = useRef(selectedId);
-  const runningRef = useRef(running);
+  const runningRef = useRef(false);
+  const liveTurnsRef = useRef(new Set<string>());
   const modelRef = useRef(model);
   const cwdRef = useRef(cwd);
   const statusRef = useRef(status);
@@ -1130,11 +1131,11 @@ export default function App() {
   const relayQuotaRef = useRef(relayQuota);
   const relayReadyRef = useRef(relayReady);
   const historyLoadedRef = useRef(new Set<string>());
-  const historyBusyRef = useRef(false);
+  const historyBusyRef = useRef(new Set<string>());
   const historyLockedRef = useRef(false);
-  const historyEpochRef = useRef(0);
+  const historyEpochRef = useRef<Record<string, number>>({});
   const checkpointsRef = useRef(new Map<string, SnapshotFile[]>());
-  const turnUserIdRef = useRef("");
+  const turnUserIdRef = useRef<Record<string, string>>({});
   const mentionRef = useRef(mention);
   mentionRef.current = mention;
   const imeRef = useRef({ composing: false, until: 0 });
@@ -1153,7 +1154,7 @@ export default function App() {
   const activeSshRef = useRef<SshTarget | null>(null);
   conversationsRef.current = conversations;
   selectedIdRef.current = selectedId;
-  runningRef.current = running;
+  runningRef.current = Boolean(selectedId && liveTurnsRef.current.has(selectedId));
   modelRef.current = model;
   cwdRef.current = cwd;
   statusRef.current = status;
@@ -1175,27 +1176,52 @@ export default function App() {
   }, [conversations, selectedId]);
 
   const selected = conversations.find((item) => item.id === selectedId) ?? null;
+  const running = Boolean(selectedId && liveTurns.includes(selectedId));
+  const visibleQueued = queuedPrompts.filter((item) => item.conversationId === selectedId);
+
+  function setConversationLive(id: string, live: boolean) {
+    const next = new Set(liveTurnsRef.current);
+    if (live) next.add(id);
+    else next.delete(id);
+    liveTurnsRef.current = next;
+    setLiveTurns([...next]);
+  }
+
+  function bumpConversationTurn(id: string) {
+    turnSeqRef.current[id] = (turnSeqRef.current[id] || 0) + 1;
+    return turnSeqRef.current[id];
+  }
+
+  function conversationTurn(id: string) {
+    return turnSeqRef.current[id] || 0;
+  }
 
   useEffect(() => {
     if (!showTerminal) {
       setAgentTermJobs([]);
       return;
     }
-    if (!runningRef.current) return;
+    if (!runningRef.current) {
+      setAgentTermJobs([]);
+      return;
+    }
     const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
     const last = [...(conversation?.messages || [])].reverse().find((item) => item.role === "assistant");
     const jobs = (last?.events || [])
       .map(agentJobFromEvent)
       .filter((item): item is AgentTermJob => Boolean(item))
       .filter((item) => !isGeneratedImageProbe(item.command) && !/complete|success|fail|error|cancel/i.test(item.status));
-    if (jobs.length) setAgentTermJobs(jobs);
-  }, [showTerminal]);
+    setAgentTermJobs(jobs);
+  }, [showTerminal, selectedId, liveTurns]);
   const visibleMessages = useMemo(() => {
     const base = selected?.messages || [];
     if (!stickyOutgoing.length) return base;
     // Prefer sticky copies for outgoing user bubbles so a mid-turn conversations rewrite
     // cannot blank the transcript. Overlay in place so the user turn stays above Grok.
-    return withStickyOutgoing(base, stickyOutgoing);
+    return withStickyOutgoing(
+      base,
+      stickyOutgoing.filter((item) => !item.conversationId || item.conversationId === selectedId),
+    );
   }, [selected?.messages, stickyOutgoing]);
   const liveImageBusy = useMemo(() => {
     const assistant = [...visibleMessages].reverse().find((item) => item.role === "assistant" && item.streaming);
@@ -1272,18 +1298,21 @@ export default function App() {
   }, [stickyOutgoing]);
 
   useEffect(() => {
-    // Only retire sticky copies after the turn is idle. If we clear them as soon as
-    // conversations temporarily contain the bubble, a later history/session rewrite
-    // can wipe conversations and leave the UI with neither copy.
-    if (running) return;
-    const base = conversations.find((item) => item.id === selectedId)?.messages || [];
-    if (!base.length || !stickyOutgoingRef.current.length) return;
-    const ids = new Set(base.map((item) => item.id));
+    // Only retire sticky copies after that conversation is idle. Background turns
+    // must keep their outgoing bubbles even if the selected chat is idle.
     setStickyOutgoing((current) => {
-      const next = current.filter((item) => !(item.id && ids.has(item.id) && !item.queued));
+      if (!current.length) return current;
+      const next = current.filter((item) => {
+        if (item.queued) return true;
+        const cid = item.conversationId || selectedId;
+        if (cid && liveTurns.includes(cid)) return true;
+        const conv = conversations.find((entry) => entry.id === cid);
+        if (!conv) return Boolean(cid);
+        return !(item.id && conv.messages.some((message) => message.id === item.id));
+      });
       return next.length === current.length ? current : next;
     });
-  }, [conversations, selectedId, running]);
+  }, [conversations, selectedId, liveTurns]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -1487,10 +1516,11 @@ export default function App() {
     scrollToBottom(true);
   }, [scrollToBottom]);
 
+  const mutateTargetRef = useRef<string | null>(null);
   const mutateAssistant = useCallback(
     (mutator: (assistant: ChatMessage, conversation: Conversation) => Conversation | void) => {
       setConversations((list) => {
-        const currentId = selectedIdRef.current;
+        const currentId = mutateTargetRef.current || selectedIdRef.current;
         return list.map((conversation) => {
           if (conversation.id !== currentId) return conversation;
           const messages = [...conversation.messages];
@@ -1509,13 +1539,16 @@ export default function App() {
     [],
   );
 
-  const finishTurn = useCallback((error?: string) => {
+  const finishTurn = useCallback((error?: string, conversationId?: string) => {
     const cancelled = isUserCancelError(error);
     const err = error && !cancelled ? friendlyError(error, tRef.current) : undefined;
+    const targetId = conversationId || selectedIdRef.current;
     setConversations((list) => {
       const next = list.map((item) => {
-        if (item.id !== selectedIdRef.current) return item;
-        const sticky = stickyOutgoingRef.current;
+        if (item.id !== targetId) return item;
+        const sticky = stickyOutgoingRef.current.filter(
+          (message) => !message.conversationId || message.conversationId === targetId,
+        );
         // Only seal the live turn. Never rewrite older completed assistants on cancel.
         let sealedLive = false;
         const sealed = item.messages.map((message) => {
@@ -1547,14 +1580,19 @@ export default function App() {
       return next;
     });
     // Keep sticky until conversations have absorbed them on the next idle pass.
-    setRunning(false);
-    runningRef.current = false;
-    setStatusText(cancelled ? tRef.current.stopped : err || tRef.current.ready);
+    if (targetId) {
+      liveTurnsRef.current.delete(targetId);
+      setLiveTurns([...liveTurnsRef.current]);
+    }
+    runningRef.current = Boolean(selectedIdRef.current && liveTurnsRef.current.has(selectedIdRef.current));
+    if (!targetId || targetId === selectedIdRef.current) {
+      setStatusText(cancelled ? tRef.current.stopped : err || tRef.current.ready);
+    }
     notifyTurnDone(tRef.current, !cancelled && !err);
     if (!cancelled && !err && settingsRef.current.gitAutoCommit) {
       const root = workspaceRootRef.current;
       if (root) {
-        const conv = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
+        const conv = conversationsRef.current.find((item) => item.id === targetId);
         const lastUser = [...(conv?.messages || [])].reverse().find((item) => item.role === "user");
         const title = (lastUser?.text || conv?.title || "update").replace(/\s+/g, " ").trim().slice(0, 72);
         const template = settingsRef.current.gitAutoCommitMessage || "xiaoha: {title}";
@@ -1574,7 +1612,10 @@ export default function App() {
       }
     }
     window.setTimeout(() => {
-      const next = promptQueueRef.current.shift();
+      const index = promptQueueRef.current.findIndex((item) => !targetId || item.conversationId === targetId);
+      if (index < 0) return;
+      const next = promptQueueRef.current[index];
+      promptQueueRef.current = promptQueueRef.current.filter((_, i) => i !== index);
       setQueuedPrompts([...promptQueueRef.current]);
       if (!next) return;
       void sendTextRef.current(next.text, next.attachments, {
@@ -1589,14 +1630,17 @@ export default function App() {
     (payload: AcpUpdate) => {
       const copy = translate(lang);
       const params = payload.params || {};
+      const targetId = String(payload.conversationId || selectedIdRef.current || "");
+      const isActiveView = !payload.conversationId || payload.conversationId === selectedIdRef.current;
+      mutateTargetRef.current = targetId;
       const meta = asRecord(params._meta);
       if (payload.method === "x.ai/models/update" || payload.method === "_x.ai/models/update") {
         const current = String(params.currentModelId || params.current_model_id || "");
-        if (current) setModel(current);
+        if (current && isActiveView) setModel(current);
         return;
       }
       const tokens = Number(meta?.totalTokens ?? meta?.total_tokens ?? 0);
-      if (tokens > 0) {
+      if (tokens > 0 && isActiveView) {
         setUsage((current) => ({
           ...current,
           usedTokens: tokens,
@@ -1726,6 +1770,7 @@ export default function App() {
             assistant.text.length,
           );
           if (
+            isActiveView &&
             showTerminalRef.current &&
             isCommandEvent({
               id: `tool-${id}`,
@@ -1757,11 +1802,13 @@ export default function App() {
             }
           }
           if (editPath && isEdit) {
-            setWorkspaceFocusPath(editPath);
-            setWorkspaceFocusTick((tick) => tick + 1);
-            setShowWorkspace(true);
-            const convId = selectedIdRef.current;
-            const userId = turnUserIdRef.current;
+            if (isActiveView) {
+              setWorkspaceFocusPath(editPath);
+              setWorkspaceFocusTick((tick) => tick + 1);
+              setShowWorkspace(true);
+            }
+            const convId = targetId || selectedIdRef.current;
+            const userId = convId ? turnUserIdRef.current[convId] : "";
             if (convId && userId) {
               const key = checkpointKey(convId, userId);
               const current = [...(checkpointsRef.current.get(key) || [])];
@@ -1793,11 +1840,13 @@ export default function App() {
           });
         } else if (type === "auto_compact_completed") {
           const after = Number(update.tokens_after ?? update.tokensAfter ?? 0);
-          setUsage((current) => ({
-            ...current,
-            usedTokens: after || current.usedTokens,
-            compactionCount: current.compactionCount + 1,
-          }));
+          if (isActiveView) {
+            setUsage((current) => ({
+              ...current,
+              usedTokens: after || current.usedTokens,
+              compactionCount: current.compactionCount + 1,
+            }));
+          }
           assistant.events = upsertEvent(assistant.events, {
             id: "active-compaction",
             kind: "compaction",
@@ -1835,7 +1884,7 @@ export default function App() {
         }
         return { ...conversation, updatedAt: Date.now() };
       });
-      scrollToBottom();
+      if (isActiveView) scrollToBottom();
     },
     [lang, mutateAssistant, scrollToBottom, usagePercent],
   );
@@ -1844,9 +1893,11 @@ export default function App() {
     method: string;
     requestId: string;
     params: Record<string, unknown>;
+    conversationId?: string;
   }) => {
     const copy = translate(lang);
     const params = payload.params || {};
+    mutateTargetRef.current = payload.conversationId || selectedIdRef.current;
     if (payload.method === "x.ai/ask_user_question") {
       const questions = ((params.questions as Array<Record<string, unknown>>) || []).map((value) => ({
         question: String(value.question || ""),
@@ -1861,6 +1912,7 @@ export default function App() {
         id: payload.requestId,
         questions,
         planMode: params.mode === "plan",
+        conversationId: payload.conversationId,
       });
       mutateAssistant((assistant) => {
         assistant.events = upsertEvent(assistant.events, {
@@ -1877,6 +1929,7 @@ export default function App() {
       setPendingPlan({
         id: payload.requestId,
         content: String(params.planContent || params.plan_content || ""),
+        conversationId: payload.conversationId,
       });
       mutateAssistant((assistant) => {
         assistant.events = upsertEvent(assistant.events, {
@@ -1903,6 +1956,7 @@ export default function App() {
         result: reject
           ? { outcome: { outcome: "selected", optionId: String(reject.optionId || reject.option_id || reject.id) } }
           : { outcome: { outcome: "cancelled" } },
+        conversationId: payload.conversationId,
       }).catch(() => undefined);
       return;
     }
@@ -1915,6 +1969,7 @@ export default function App() {
       id: payload.requestId,
       title: String(tool.title || copy.grokWantsAction),
       options,
+      conversationId: payload.conversationId,
     });
     mutateAssistant((assistant) => {
       assistant.events = upsertEvent(assistant.events, {
@@ -1962,13 +2017,12 @@ export default function App() {
 
   const loadSessionHistory = useCallback(async (conversationId: string, older = false) => {
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
-    if (!conversation?.grokSessionId || historyBusyRef.current) return;
+    if (!conversation?.grokSessionId || historyBusyRef.current.has(conversationId)) return;
     // Remote SSH chats must never pull local ~/.grok session history.
     if (conversation.ssh || isSshWorkspace(conversation.cwd)) return;
     // Freeze history entirely while sending or while sticky outgoing bubbles exist.
     if (
-      runningRef.current ||
-      stickyOutgoingRef.current.length > 0 ||
+      liveTurnsRef.current.has(conversationId) ||
       conversation.messages.some((item) => item.streaming || item.queued || item.local)
     ) {
       return;
@@ -1976,9 +2030,9 @@ export default function App() {
     if (older && conversation.historyHasMore === false) return;
     if (!older && historyLoadedRef.current.has(conversationId)) return;
     if (!older) historyLoadedRef.current.add(conversationId);
-    historyBusyRef.current = true;
-    const epoch = historyEpochRef.current;
-    if (older) setLoadingOlder(true);
+    historyBusyRef.current.add(conversationId);
+    const epoch = historyEpochRef.current[conversationId] || 0;
+    if (older && conversationId === selectedIdRef.current) setLoadingOlder(true);
     const skip = older ? conversation.historySkip || conversation.messages.length : 0;
     try {
       const history = await invoke<LocalSessionHistory>("load_session_history", {
@@ -1987,11 +2041,11 @@ export default function App() {
         skip,
       });
       // Drop stale responses that finished after a new send started.
-      if (epoch !== historyEpochRef.current) return;
+      if (epoch !== (historyEpochRef.current[conversationId] || 0)) return;
       const latest = conversationsRef.current.find((item) => item.id === conversationId);
       if (
         !latest ||
-        runningRef.current ||
+        liveTurnsRef.current.has(conversationId) ||
         latest.messages.some((item) => item.streaming || item.queued || item.local)
       ) {
         return;
@@ -2050,7 +2104,7 @@ export default function App() {
           }
         });
       }
-      if (older) {
+      if (older && conversationId === selectedIdRef.current) {
         setShownCount((count) => Math.max(count, conversation.messages.length) + incoming.length);
         requestAnimationFrame(() => {
           const box = transcriptRef.current;
@@ -2063,7 +2117,7 @@ export default function App() {
           updateFollowState(box);
         });
       }
-      if (!older && history.usedTokens != null) {
+      if (!older && history.usedTokens != null && conversationId === selectedIdRef.current) {
         setUsage({
           usedTokens: Number(history.usedTokens) || 0,
           totalTokens: Number(history.totalTokens) || settingsRef.current.contextWindowTokens,
@@ -2073,8 +2127,8 @@ export default function App() {
     } catch {
       if (!older) historyLoadedRef.current.delete(conversationId);
     } finally {
-      historyBusyRef.current = false;
-      setLoadingOlder(false);
+      historyBusyRef.current.delete(conversationId);
+      if (conversationId === selectedIdRef.current) setLoadingOlder(false);
     }
   }, [updateFollowState]);
 
@@ -2116,7 +2170,7 @@ export default function App() {
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
-        if (historyLockedRef.current || runningRef.current || stickyOutgoingRef.current.length) return;
+        if (historyLockedRef.current || liveTurnsRef.current.has(selectedIdRef.current || "") || stickyOutgoingRef.current.some((item) => !item.conversationId || item.conversationId === selectedIdRef.current)) return;
         if (followRef.current && !userPinnedRef.current) return;
         const rootEl = transcriptRef.current;
         if (!rootEl || rootEl.scrollTop > 8) return;
@@ -2358,11 +2412,11 @@ export default function App() {
       await add(listen<AcpUpdate>("acp-update", (event) => handleAcpUpdateRef.current(event.payload)));
       await add(
         listen<AcpTurnDone>("acp-turn-done", (event) => {
-          finishTurnRef.current(event.payload.ok ? undefined : event.payload.error);
+          finishTurnRef.current(event.payload.ok ? undefined : event.payload.error, event.payload.conversationId);
         }),
       );
       await add(
-        listen<{ method: string; requestId: string; params: Record<string, unknown> }>("acp-interaction", (event) =>
+        listen<{ method: string; requestId: string; params: Record<string, unknown>; conversationId?: string }>("acp-interaction", (event) =>
           handleInteractionRef.current(event.payload),
         ),
       );
@@ -2449,22 +2503,25 @@ export default function App() {
     setView("chat");
     followRef.current = true;
     setShowJumpToBottom(false);
-    setStickyOutgoing([]);
     // Allow history to reload so repaired reconstructions replace stale local windows.
     historyLoadedRef.current.delete(id);
     if (item?.cwd) setCwd(item.cwd);
-    if (!runningRef.current && !item?.ssh && !isSshWorkspace(item?.cwd || "")) {
+    if (!liveTurnsRef.current.has(id) && !item?.ssh && !isSshWorkspace(item?.cwd || "")) {
       void loadSessionHistory(id);
     }
   }
 
   function deleteConversation(id: string) {
+    if (liveTurnsRef.current.has(id)) {
+      bumpConversationTurn(id);
+      setConversationLive(id, false);
+      void invoke("stop_session", { conversationId: id }).catch(() => undefined);
+    }
     const next = conversations.filter((item) => item.id !== id);
     const ensured = ensureConversation(next, id === selectedId ? null : selectedId, usableWorkspace(cwd, homeDir));
     setConversations(ensured.list);
     setSelectedId(ensured.id);
   }
-
   function applyCwd(path: string, ssh?: SshTarget | null) {
     const trimmed = path.trim();
     const nextSsh = ssh === undefined ? (isSshWorkspace(trimmed) ? parseSshWorkspace(trimmed) : null) : ssh;
@@ -2473,7 +2530,6 @@ export default function App() {
       list.map((item) => (item.id === selectedId ? { ...item, cwd: trimmed, ssh: nextSsh } : item)),
     );
   }
-
   async function loadSshHosts() {
     try {
       const [hosts, configHosts] = await Promise.all([
@@ -2618,11 +2674,11 @@ export default function App() {
     const conversation = conversationsRef.current.find((item) => item.id === (options?.conversationId || selectedIdRef.current));
     const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
     if ((!text.trim() && !attachments.length) || !conversation) return;
-    if (runningRef.current && !options?.fromQueue) {
+    if (liveTurnsRef.current.has(conversation.id) && !options?.fromQueue) {
       if (options?.interrupt) {
-        promptQueueRef.current = [];
-        setQueuedPrompts([]);
-        turnIdRef.current += 1;
+        promptQueueRef.current = promptQueueRef.current.filter((item) => item.conversationId !== conversation.id);
+        setQueuedPrompts([...promptQueueRef.current]);
+        bumpConversationTurn(conversation.id);
         // Seal the in-flight assistant BEFORE tearing down the session so tool/
         // process output cannot vanish when stop_session races history merges.
         setConversations((list) => {
@@ -2642,16 +2698,15 @@ export default function App() {
           conversationsRef.current = next;
           return next;
         });
-        setRunning(false);
-        runningRef.current = false;
-        setStatusText(t.stopped);
+        setConversationLive(conversation.id, false);
+        if (conversation.id === selectedIdRef.current) setStatusText(t.stopped);
         try {
-          await invoke("cancel_turn");
+          await invoke("cancel_turn", { conversationId: conversation.id });
         } catch {
           // ignore
         }
         try {
-          await invoke("stop_session");
+          await invoke("stop_session", { conversationId: conversation.id });
         } catch {
           // ignore
         }
@@ -2666,6 +2721,7 @@ export default function App() {
           streaming: false,
           queued: true,
           local: true,
+          conversationId: conversation.id,
         };
         const queued: QueuedPrompt = {
           id: uid(),
@@ -2676,7 +2732,7 @@ export default function App() {
         };
         promptQueueRef.current = [...promptQueueRef.current, queued];
         setQueuedPrompts(promptQueueRef.current);
-        historyEpochRef.current += 1;
+        historyEpochRef.current[conversation.id] = (historyEpochRef.current[conversation.id] || 0) + 1;
         const queuedConversation = {
           ...conversation,
           messages: [...conversation.messages, queuedUser],
@@ -2693,12 +2749,14 @@ export default function App() {
         setPrompt("");
         setPendingImages([]);
         if (composerRef.current) composerRef.current.style.height = "30px";
-        setStatusText(`${t.queued} ${promptQueueRef.current.length}`);
+        if (conversation.id === selectedIdRef.current) {
+          setStatusText(`${t.queued} ${promptQueueRef.current.filter((item) => item.conversationId === conversation.id).length}`);
+        }
         requestAnimationFrame(() => scrollToBottom(true));
         return;
       }
     }
-    if (runningRef.current) return;
+    if (liveTurnsRef.current.has(conversation.id)) return;
     const runtime = statusRef.current;
     const sshTarget = resolveConversationSsh(conversation, sshHosts);
     if (!sshTarget && !runtime?.installed) {
@@ -2725,16 +2783,15 @@ export default function App() {
       setStatusText(t.needCredentials);
       return;
     }
-    const turnId = ++turnIdRef.current;
+    const turnId = bumpConversationTurn(conversation.id);
     // Invalidate any in-flight history fetch immediately, before React re-renders.
-    historyEpochRef.current += 1;
-    historyBusyRef.current = false;
+    historyEpochRef.current[conversation.id] = (historyEpochRef.current[conversation.id] || 0) + 1;
+    historyBusyRef.current.delete(conversation.id);
     setPrompt("");
     setPendingImages([]);
     if (composerRef.current) composerRef.current.style.height = "30px";
-    setRunning(true);
-    runningRef.current = true;
-    setStatusText(t.connecting);
+    setConversationLive(conversation.id, true);
+    if (conversation.id === selectedIdRef.current) setStatusText(t.connecting);
     followRef.current = true;
     setShowJumpToBottom(false);
     const title =
@@ -2745,7 +2802,7 @@ export default function App() {
       ? conversation.messages.find((item) => item.id === options.messageId)
       : undefined;
     const user: ChatMessage = existingUser
-      ? { ...existingUser, text: text.trim(), media: attachments.map(mediaFromAttachment), queued: false, streaming: false, local: true }
+      ? { ...existingUser, text: text.trim(), media: attachments.map(mediaFromAttachment), queued: false, streaming: false, local: true, conversationId: conversation.id }
       : {
           id: uid(),
           role: "user",
@@ -2755,6 +2812,7 @@ export default function App() {
           media: attachments.map(mediaFromAttachment),
           streaming: false,
           local: true,
+          conversationId: conversation.id,
         };
     const assistant: ChatMessage = {
       id: uid(),
@@ -2765,11 +2823,12 @@ export default function App() {
       media: [],
       streaming: true,
       local: true,
+      conversationId: conversation.id,
     };
     userPinnedRef.current = false;
     followRef.current = true;
     setShownCount((count) => Math.max(count, conversation.messages.length + 2, VIEW_PAGE));
-    turnUserIdRef.current = user.id;
+    turnUserIdRef.current[conversation.id] = user.id;
     const optimisticMessages = existingUser
       ? [
           ...conversation.messages.map((item) => (item.id === existingUser.id ? user : item)).filter((item) => !item.queued || item.id === user.id),
@@ -2810,9 +2869,10 @@ export default function App() {
           enableMemory: settingsRef.current.enableMemory,
           enableWebSearch: settingsRef.current.enableWebSearch,
           enableSubagents: settingsRef.current.enableSubagents,
+          conversationId: conversation.id,
         },
       });
-      if (turnId !== turnIdRef.current) return;
+      if (turnId !== conversationTurn(conversation.id)) return;
       setConversations((list) => {
         const next = list.map((item) => {
           if (item.id !== conversation.id) return item;
@@ -2836,7 +2896,7 @@ export default function App() {
         conversationsRef.current = next;
         return next;
       });
-      setStatusText(t.running);
+      if (conversation.id === selectedIdRef.current) setStatusText(t.running);
       const snapshot = await checkpointPromise;
       const key = checkpointKey(conversation.id, user.id);
       if (snapshot.length) {
@@ -2846,16 +2906,17 @@ export default function App() {
       await invoke("send_prompt", {
         text: expanded,
         attachments: attachments.length ? attachments : null,
+        conversationId: conversation.id,
       });
     } catch (error) {
-      if (turnId !== turnIdRef.current) return;
+      if (turnId !== conversationTurn(conversation.id)) return;
       setPendingImages(attachments);
       const message = String(error);
       if (isMissingCredentials(message)) {
         setView("settings");
         setSettingsPage("relay");
       }
-      finishTurn(message);
+      finishTurn(message, conversation.id);
     }
   }
 
@@ -2864,16 +2925,17 @@ export default function App() {
   }
 
   async function stopTurn() {
-    turnIdRef.current += 1;
+    const id = selectedIdRef.current;
+    if (id) bumpConversationTurn(id);
     // Freeze the live assistant first so cancel/stop cannot blank the transcript.
-    finishTurn(t.connectionCancelled);
+    finishTurn(t.connectionCancelled, id || undefined);
     try {
-      await invoke("cancel_turn");
+      await invoke("cancel_turn", { conversationId: id });
     } catch {
       // ignore
     }
     try {
-      await invoke("stop_session");
+      await invoke("stop_session", { conversationId: id });
     } catch {
       // ignore
     }
@@ -2913,7 +2975,7 @@ export default function App() {
     const extras = (original?.media || [])
       .filter((item) => item.data)
       .map((item) => ({ mimeType: item.mimeType, data: item.data, name: item.name }));
-    await sendText(draft, extras, { conversationId: conversation.id, interrupt: Boolean(runningRef.current), messageId });
+    await sendText(draft, extras, { conversationId: conversation.id, interrupt: liveTurnsRef.current.has(conversation.id), messageId });
   }
 
   function sendQueuedNow(item: QueuedPrompt) {
@@ -2922,7 +2984,7 @@ export default function App() {
     void sendText(item.text, item.attachments, {
       conversationId: item.conversationId,
       messageId: item.messageId,
-      interrupt: Boolean(runningRef.current),
+      interrupt: liveTurnsRef.current.has(item.conversationId),
     });
   }
 
@@ -2939,14 +3001,17 @@ export default function App() {
   }
 
   function clearQueue() {
-    const ids = new Set(promptQueueRef.current.map((item) => item.messageId));
-    promptQueueRef.current = [];
-    setQueuedPrompts([]);
+    const selected = selectedIdRef.current;
+    const removed = promptQueueRef.current.filter((item) => item.conversationId === selected);
+    const ids = new Set(removed.map((item) => item.messageId));
+    promptQueueRef.current = promptQueueRef.current.filter((item) => item.conversationId !== selected);
+    setQueuedPrompts([...promptQueueRef.current]);
     setConversations((list) =>
-      list.map((conversation) => ({
-        ...conversation,
-        messages: conversation.messages.filter((message) => !ids.has(message.id)),
-      })),
+      list.map((conversation) =>
+        conversation.id === selected
+          ? { ...conversation, messages: conversation.messages.filter((message) => !ids.has(message.id)) }
+          : conversation,
+      ),
     );
   }
 
@@ -3122,7 +3187,7 @@ export default function App() {
   }
 
   function revealOlder(conversationId: string) {
-    if (historyLockedRef.current || historyBusyRef.current || runningRef.current || stickyOutgoingRef.current.length) return;
+    if (historyLockedRef.current || historyBusyRef.current.has(conversationId) || liveTurnsRef.current.has(conversationId) || stickyOutgoingRef.current.some((item) => !item.conversationId || item.conversationId === conversationId)) return;
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) return;
     if (conversation.ssh || isSshWorkspace(conversation.cwd)) return;
@@ -3152,7 +3217,7 @@ export default function App() {
     const el = transcriptRef.current;
     if (!el) return;
     updateFollowState(el);
-    if (historyLockedRef.current || runningRef.current || stickyOutgoingRef.current.length) return;
+    if (historyLockedRef.current || liveTurnsRef.current.has(selectedIdRef.current || "") || stickyOutgoingRef.current.some((item) => !item.conversationId || item.conversationId === selectedIdRef.current)) return;
     if (followRef.current && !userPinnedRef.current) return;
     if (el.scrollTop > 8) return;
     if (selectedIdRef.current) revealOlder(selectedIdRef.current);
@@ -3202,7 +3267,9 @@ export default function App() {
         result: optionId
           ? { outcome: { outcome: "selected", optionId } }
           : { outcome: { outcome: "cancelled" } },
+        conversationId: pendingPermission.conversationId,
       });
+      mutateTargetRef.current = pendingPermission.conversationId || selectedIdRef.current;
       mutateAssistant((assistant) => {
         assistant.events = upsertEvent(assistant.events, {
           id: `interaction-${pendingPermission.id}`,
@@ -3232,6 +3299,7 @@ export default function App() {
               .map(([key, value]) => [key, { notes: value }]),
           ),
         },
+        conversationId: pendingQuestion.conversationId,
       });
     } catch (error) {
       setStatusText(localizeThrown(error, t));
@@ -3250,6 +3318,7 @@ export default function App() {
           outcome: approved ? "approved" : "cancelled",
           feedback: planFeedback || undefined,
         },
+        conversationId: pendingPlan.conversationId,
       });
     } catch (error) {
       setStatusText(localizeThrown(error, t));
@@ -3566,7 +3635,7 @@ export default function App() {
                             onClick={() => selectConversation(item.id)}
                           >
                             <span className="session-title">{item.title}</span>
-                            {running && item.id === selectedId ? <span className="mini-spin" /> : null}
+                            {liveTurns.includes(item.id) ? <span className="mini-spin" /> : null}
                             <span
                               className="session-delete"
                               title={t.deleteChat}
@@ -4020,20 +4089,20 @@ export default function App() {
                 ))}
               </div>
             ) : null}
-            {queuedPrompts.length ? (
+            {visibleQueued.length ? (
               <div className="prompt-queue">
                 <div className="prompt-queue-head">
-                  <span>{t.queued} {queuedPrompts.length}</span>
+                  <span>{t.queued} {visibleQueued.length}</span>
                   <em>{t.queuedNext}</em>
                   <button className="ghost compact nowrap" type="button" onClick={clearQueue}>
                     {t.clearQueue}
                   </button>
                 </div>
-                {queuedPrompts.map((item) => (
+                {visibleQueued.map((item) => (
                   <div key={item.id} className="prompt-queue-item">
                     <p>{item.text || t.pasteImage}</p>
                     <button className="ghost compact nowrap" type="button" onClick={() => sendQueuedNow(item)}>
-                      {running ? t.interruptSend : t.sendNow}
+                      {liveTurns.includes(item.conversationId) ? t.interruptSend : t.sendNow}
                     </button>
                     <button className="ghost compact nowrap" type="button" onClick={() => removeQueued(item)}>
                       {t.cancel}

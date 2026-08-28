@@ -15,7 +15,7 @@ use accounts::{
     fetch_quota, load_state, save_accounts, start_login, AccountRecord, AccountState, LoginSlot,
     SkillRecord,
 };
-use acp::{AcpClient, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
+use acp::{AcpClient, AcpHub, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
 use config::{
     parse_deeplink, write_config, ModelCatalog, ModelListRequest, RelayImport, RelayQuota,
 };
@@ -35,7 +35,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 struct AppState {
     pending_import: Mutex<Option<RelayImport>>,
-    acp: Arc<Mutex<AcpClient>>,
+    acp: Arc<AcpHub>,
     login: LoginSlot,
 }
 
@@ -43,7 +43,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             pending_import: Mutex::new(None),
-            acp: Arc::new(Mutex::new(AcpClient::default())),
+            acp: Arc::new(AcpHub::default()),
             login: Arc::new(Mutex::new(None)),
         }
     }
@@ -91,12 +91,7 @@ fn take_pending_import(state: State<AppState>) -> Option<RelayImport> {
 
 #[tauri::command]
 fn get_acp_status(state: State<AppState>) -> AcpStatus {
-    state.acp.lock().map(|client| client.status()).unwrap_or(AcpStatus {
-        connected: false,
-        session_id: None,
-        model: None,
-        cwd: None,
-    })
+    state.acp.status()
 }
 
 #[tauri::command]
@@ -105,8 +100,13 @@ async fn ensure_session(
     state: State<'_, AppState>,
     options: SessionOptions,
 ) -> Result<SessionInfo, String> {
-    let acp = Arc::clone(&state.acp);
-    run_blocking(move || AcpClient::connect(&acp, &app, options)).await
+    let hub = Arc::clone(&state.acp);
+    run_blocking(move || {
+        let conversation_id = options.conversation_id.clone();
+        let client = hub.client(conversation_id.as_deref())?;
+        AcpClient::connect(&client, &app, options)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -115,11 +115,13 @@ async fn send_prompt(
     state: State<'_, AppState>,
     text: String,
     attachments: Option<Vec<PromptAttachment>>,
+    conversation_id: Option<String>,
 ) -> Result<(), String> {
-    let acp = Arc::clone(&state.acp);
+    let hub = Arc::clone(&state.acp);
     run_blocking(move || {
-        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        client.send_prompt(&app, text, attachments.unwrap_or_default())
+        let client = hub.client(conversation_id.as_deref())?;
+        let guard = client.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        guard.send_prompt(&app, text, attachments.unwrap_or_default())
     })
     .await
 }
@@ -591,32 +593,47 @@ async fn save_image_as(
 }
 
 #[tauri::command]
-async fn cancel_turn(state: State<'_, AppState>) -> Result<(), String> {
-    let acp = Arc::clone(&state.acp);
+async fn cancel_turn(
+    state: State<'_, AppState>,
+    conversation_id: Option<String>,
+) -> Result<(), String> {
+    let hub = Arc::clone(&state.acp);
     run_blocking(move || {
-        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        client.cancel()
+        let client = hub.client(conversation_id.as_deref())?;
+        let guard = client.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        guard.cancel()
     })
     .await
 }
 
 #[tauri::command]
-async fn set_permission_mode(state: State<'_, AppState>, mode: String) -> Result<(), String> {
-    let acp = Arc::clone(&state.acp);
-    run_blocking(move || {
-        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        client.set_permission_mode(&mode)
-    })
-    .await
+async fn set_permission_mode(
+    state: State<'_, AppState>,
+    mode: String,
+    conversation_id: Option<String>,
+) -> Result<(), String> {
+    let hub = Arc::clone(&state.acp);
+    run_blocking(move || hub.set_permission_mode(&mode, conversation_id.as_deref())).await
 }
 
 #[tauri::command]
-async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
-    let acp = Arc::clone(&state.acp);
+async fn stop_session(
+    state: State<'_, AppState>,
+    conversation_id: Option<String>,
+) -> Result<(), String> {
+    let hub = Arc::clone(&state.acp);
     run_blocking(move || {
-        let mut client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        client.stop();
-        Ok(())
+        if conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            hub.stop_one(conversation_id.as_deref())
+        } else {
+            hub.stop_all();
+            Ok(())
+        }
     })
     .await
 }
@@ -626,11 +643,13 @@ async fn answer_interaction(
     state: State<'_, AppState>,
     request_id: String,
     result: Value,
+    conversation_id: Option<String>,
 ) -> Result<(), String> {
-    let acp = Arc::clone(&state.acp);
+    let hub = Arc::clone(&state.acp);
     run_blocking(move || {
-        let client = acp.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        client.answer_interaction(request_id, result)
+        let client = hub.client(conversation_id.as_deref())?;
+        let guard = client.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        guard.answer_interaction(request_id, result)
     })
     .await
 }
@@ -640,10 +659,12 @@ async fn call_extension(
     state: State<'_, AppState>,
     method: String,
     params: Option<Value>,
+    conversation_id: Option<String>,
 ) -> Result<Value, String> {
-    let acp = Arc::clone(&state.acp);
+    let hub = Arc::clone(&state.acp);
     run_blocking(move || {
-        AcpClient::call_extension(&acp, method, params.unwrap_or_else(|| serde_json::json!({})))
+        let client = hub.client(conversation_id.as_deref())?;
+        AcpClient::call_extension(&client, method, params.unwrap_or_else(|| serde_json::json!({})))
     })
     .await
 }

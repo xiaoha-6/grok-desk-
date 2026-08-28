@@ -37,6 +37,7 @@ pub struct SessionOptions {
     pub enable_web_search: Option<bool>,
     pub enable_subagents: Option<bool>,
     pub ssh: Option<SshTarget>,
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +238,7 @@ pub struct AcpClient {
     session: Option<SessionInfo>,
     spawn_fingerprint: Option<String>,
     generation: u64,
+    conversation_id: String,
 }
 
 impl Default for AcpClient {
@@ -246,7 +248,103 @@ impl Default for AcpClient {
             session: None,
             spawn_fingerprint: None,
             generation: 0,
+            conversation_id: String::new(),
         }
+    }
+}
+
+#[derive(Default)]
+pub struct AcpHub {
+    inner: Mutex<HashMap<String, Arc<Mutex<AcpClient>>>>,
+}
+
+impl AcpHub {
+    fn key(conversation_id: Option<&str>) -> String {
+        conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("_default")
+            .to_string()
+    }
+
+    pub fn client(&self, conversation_id: Option<&str>) -> Result<Arc<Mutex<AcpClient>>, String> {
+        let key = Self::key(conversation_id);
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| "无法锁定 ACP 会话池".to_string())?;
+        Ok(map
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(AcpClient::default())))
+            .clone())
+    }
+
+    pub fn status(&self) -> AcpStatus {
+        let Ok(map) = self.inner.lock() else {
+            return AcpStatus {
+                connected: false,
+                session_id: None,
+                model: None,
+                cwd: None,
+            };
+        };
+        for client in map.values() {
+            if let Ok(guard) = client.lock() {
+                let status = guard.status();
+                if status.connected {
+                    return status;
+                }
+            }
+        }
+        AcpStatus {
+            connected: false,
+            session_id: None,
+            model: None,
+            cwd: None,
+        }
+    }
+
+    pub fn stop_one(&self, conversation_id: Option<&str>) -> Result<(), String> {
+        let client = self.client(conversation_id)?;
+        let mut guard = client
+            .lock()
+            .map_err(|_| "无法锁定 ACP 会话".to_string())?;
+        guard.stop();
+        Ok(())
+    }
+
+    pub fn stop_all(&self) {
+        if let Ok(map) = self.inner.lock() {
+            for client in map.values() {
+                if let Ok(mut guard) = client.lock() {
+                    guard.stop();
+                }
+            }
+        }
+    }
+
+    pub fn set_permission_mode(&self, mode: &str, conversation_id: Option<&str>) -> Result<(), String> {
+        if conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            let client = self.client(conversation_id)?;
+            let guard = client
+                .lock()
+                .map_err(|_| "无法锁定 ACP 会话".to_string())?;
+            return guard.set_permission_mode(mode);
+        }
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| "无法锁定 ACP 会话池".to_string())?;
+        for client in map.values() {
+            if let Ok(guard) = client.lock() {
+                let _ = guard.set_permission_mode(mode);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -365,6 +463,13 @@ impl AcpClient {
         options: SessionOptions,
     ) -> Result<SessionInfo, String> {
         require_credentials(&options)?;
+        let conversation_id = options
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
         let model = canonical_model_id(
             options
                 .model
@@ -460,6 +565,7 @@ impl AcpClient {
                     cwd,
                 };
                 this.session = Some(info.clone());
+                this.conversation_id = conversation_id;
                 Ok(info)
             }
             Err(error) => {
@@ -517,6 +623,7 @@ impl AcpClient {
         let next_id = Arc::clone(&agent.next_id);
         let pending = Arc::clone(&agent.pending);
         let app = app.clone();
+        let conversation_id = self.conversation_id.clone();
         thread::spawn(move || {
             let result = rpc_request(
                 &stdin,
@@ -531,12 +638,15 @@ impl AcpClient {
             );
             match result {
                 Ok(_) => {
-                    let _ = app.emit("acp-turn-done", json!({ "ok": true }));
+                    let _ = app.emit(
+                        "acp-turn-done",
+                        with_conversation(json!({ "ok": true }), &conversation_id),
+                    );
                 }
                 Err(error) => {
                     let _ = app.emit(
                         "acp-turn-done",
-                        json!({ "ok": false, "error": error }),
+                        with_conversation(json!({ "ok": false, "error": error }), &conversation_id),
                     );
                 }
             }
@@ -656,6 +766,13 @@ impl AcpClient {
                 .unwrap_or_else(|| "default".to_string()),
         ));
         let pending_interactions = Arc::new(Mutex::new(HashMap::new()));
+        let conversation_id = options
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        self.conversation_id = conversation_id.clone();
         spawn_stdout_reader(
             app.clone(),
             Arc::clone(&stdin),
@@ -664,6 +781,7 @@ impl AcpClient {
             Arc::clone(&permission_mode),
             Arc::clone(&pending_interactions),
             stdout,
+            conversation_id.clone(),
         );
         spawn_stderr_reader(app.clone(), stderr, Arc::clone(&diagnostics));
 
@@ -785,6 +903,15 @@ fn resolve_cwd(cwd: Option<String>) -> Result<String, String> {
         .to_string())
 }
 
+fn with_conversation(mut payload: Value, conversation_id: &str) -> Value {
+    if !conversation_id.is_empty() {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("conversationId".into(), json!(conversation_id));
+        }
+    }
+    payload
+}
+
 fn spawn_stdout_reader(
     app: AppHandle,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -793,6 +920,7 @@ fn spawn_stdout_reader(
     permission_mode: Arc<Mutex<String>>,
     pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
     stdout: impl std::io::Read + Send + 'static,
+    conversation_id: String,
 ) {
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
@@ -813,10 +941,14 @@ fn spawn_stdout_reader(
                 &permission_mode,
                 &pending_interactions,
                 json,
+                &conversation_id,
             );
         }
         pending.fail_all("Grok Agent 已退出");
-        let _ = app.emit("acp-exit", json!({ "ok": false }));
+        let _ = app.emit(
+            "acp-exit",
+            with_conversation(json!({ "ok": false }), &conversation_id),
+        );
     });
 }
 
@@ -844,6 +976,7 @@ fn dispatch_message(
     permission_mode: &Mutex<String>,
     pending_interactions: &Mutex<HashMap<String, Value>>,
     json: Value,
+    conversation_id: &str,
 ) {
     let id = json.get("id").cloned();
     let method = json.get("method").and_then(Value::as_str).map(str::to_string);
@@ -911,12 +1044,15 @@ fn dispatch_message(
                 );
                 let _ = app.emit(
                     "acp-update",
-                    json!({
-                        "method": "session/request_permission",
-                        "params": params,
-                        "autoDenied": true,
-                        "reason": "generated_image_probe"
-                    }),
+                    with_conversation(
+                        json!({
+                            "method": "session/request_permission",
+                            "params": params,
+                            "autoDenied": true,
+                            "reason": "generated_image_probe"
+                        }),
+                        conversation_id,
+                    ),
                 );
                 return;
             }
@@ -939,11 +1075,14 @@ fn dispatch_message(
                     );
                     let _ = app.emit(
                         "acp-update",
-                        json!({
-                            "method": "session/request_permission",
-                            "params": params,
-                            "autoAllowed": true
-                        }),
+                        with_conversation(
+                            json!({
+                                "method": "session/request_permission",
+                                "params": params,
+                                "autoAllowed": true
+                            }),
+                            conversation_id,
+                        ),
                     );
                     return;
                 }
@@ -954,11 +1093,14 @@ fn dispatch_message(
             }
             let _ = app.emit(
                 "acp-interaction",
-                json!({
-                    "method": method,
-                    "requestId": request_id,
-                    "params": params
-                }),
+                with_conversation(
+                    json!({
+                        "method": method,
+                        "requestId": request_id,
+                        "params": params
+                    }),
+                    conversation_id,
+                ),
             );
             return;
         }
@@ -966,10 +1108,13 @@ fn dispatch_message(
 
     let _ = app.emit(
         "acp-update",
-        json!({
-            "method": method,
-            "params": params
-        }),
+        with_conversation(
+            json!({
+                "method": method,
+                "params": params
+            }),
+            conversation_id,
+        ),
     );
 }
 

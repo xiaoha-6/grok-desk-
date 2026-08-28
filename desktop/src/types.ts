@@ -196,6 +196,7 @@ export type ChatMessage = {
   local?: boolean;
   /** User stopped this turn. Keep whatever streamed so far and show a stopped marker. */
   stopped?: boolean;
+  conversationId?: string;
 };
 
 export type SshTarget = {
@@ -321,11 +322,13 @@ export type AcpUpdate = {
   method: string;
   params: Record<string, unknown>;
   autoAllowed?: boolean;
+  conversationId?: string;
 };
 
 export type AcpTurnDone = {
   ok: boolean;
   error?: string;
+  conversationId?: string;
 };
 
 export type PermissionOption = {
@@ -338,6 +341,7 @@ export type PendingPermission = {
   id: string;
   title: string;
   options: PermissionOption[];
+  conversationId?: string;
 };
 
 export type AgentQuestionOption = {
@@ -356,11 +360,13 @@ export type PendingQuestion = {
   id: string;
   questions: AgentQuestion[];
   planMode: boolean;
+  conversationId?: string;
 };
 
 export type PendingPlan = {
   id: string;
   content: string;
+  conversationId?: string;
 };
 
 export type AppSettings = {
