@@ -4,15 +4,15 @@ import {
   IconArchive,
   IconBolt,
   IconBox,
+  IconChat,
   IconChevronLeft,
   IconGear,
-  IconHand,
+  IconInfinity,
   IconKeyboard,
   IconPerson,
   IconPencil,
   IconPlan,
   IconRelay,
-  IconShield,
   IconSliders,
   IconSpark,
   IconTerminal,
@@ -26,7 +26,6 @@ import {
   PERMISSION_MODES,
   mergeModelOptions,
   permissionModeHint,
-  permissionModeLabel,
   type AccountRecord,
   type AppSettings,
   type CatalogModel,
@@ -598,7 +597,7 @@ export function SettingsView(props: {
                   onChange={(value) => props.patchSettings({ permissionMode: value })}
                   options={PERMISSION_MODES.map((item) => ({
                     id: item.id,
-                    label: permissionModeLabel(item.id, props.lang),
+                    label: item.short,
                     hint: permissionModeHint(item.id, props.lang),
                     icon:
                       item.id === "acceptEdits" ? (
@@ -608,9 +607,9 @@ export function SettingsView(props: {
                       ) : item.id === "auto" ? (
                         <IconBolt size={14} />
                       ) : item.id === "bypassPermissions" ? (
-                        <IconShield size={14} />
+                        <IconInfinity size={14} />
                       ) : (
-                        <IconHand size={14} />
+                        <IconChat size={14} />
                       ),
                   }))}
                 />

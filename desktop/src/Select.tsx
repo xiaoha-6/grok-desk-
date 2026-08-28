@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { IconChevronDown } from "./icons";
+import { IconCheck, IconChevronDown } from "./icons";
 
 export type SelectOption = {
   id: string;
@@ -30,6 +30,7 @@ export function Select({
   className,
   menuClassName,
   dense,
+  showHint = true,
   ariaLabel,
 }: {
   value: string;
@@ -43,6 +44,7 @@ export function Select({
   menuClassName?: string;
   /** Smaller menu / option footprint for composer chips. */
   dense?: boolean;
+  showHint?: boolean;
   ariaLabel?: string;
 }) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
@@ -65,14 +67,15 @@ export function Select({
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const margin = 8;
-      const hasHints = options.some((item) => Boolean(item.hint));
+      const hasHints = showHint && options.some((item) => Boolean(item.hint));
       const hintFloor = dense ? 210 : 260;
       const hintPreferred = dense ? 228 : 280;
+      const compactFloor = dense ? 172 : 156;
       const minW = variant === "field"
         ? Math.min(hasHints ? (dense ? 240 : 300) : 220, vw - margin * 2)
-        : Math.min(Math.max(rect.width, hasHints ? hintPreferred : 140), vw - margin * 2);
+        : Math.min(Math.max(rect.width, hasHints ? hintPreferred : compactFloor), vw - margin * 2);
       const preferred = Math.max(rect.width, minW);
-      const width = Math.min(Math.max(preferred, hasHints ? hintFloor : 140), Math.max(140, vw - margin * 2));
+      const width = Math.min(Math.max(preferred, hasHints ? hintFloor : compactFloor), Math.max(compactFloor, vw - margin * 2));
       const leftRaw = align === "end" ? rect.right - width : rect.left;
       const left = Math.min(Math.max(margin, leftRaw), Math.max(margin, vw - width - margin));
       const spaceBelow = Math.max(96, vh - rect.bottom - margin);
@@ -89,7 +92,7 @@ export function Select({
       window.removeEventListener("resize", place);
       window.removeEventListener("scroll", place, true);
     };
-  }, [align, dense, open, variant, options.length]);
+  }, [align, dense, open, showHint, variant, options]);
 
   useEffect(() => {
     if (!open) return;
@@ -205,7 +208,10 @@ export function Select({
                     {item.icon ? <span className="app-select-option-icon">{item.icon}</span> : null}
                     <span className="app-select-option-copy">
                       <span className="app-select-option-name">{item.label}</span>
-                      {item.hint ? <span className="app-select-option-id">{item.hint}</span> : null}
+                      {showHint && item.hint ? <span className="app-select-option-id">{item.hint}</span> : null}
+                    </span>
+                    <span className="app-select-option-check" aria-hidden>
+                      {selected ? <IconCheck size={13} /> : null}
                     </span>
                   </button>
                 );

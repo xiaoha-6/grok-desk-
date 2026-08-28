@@ -21,7 +21,17 @@ export function GrokMark({ size = 24, className }: IconProps) {
 
 function Svg({ size = 15, children, className }: IconProps & { children: ReactNode }) {
   return (
-    <svg className={className} viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.7">
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       {children}
     </svg>
   );
@@ -72,6 +82,41 @@ export function IconFolder(props: IconProps) {
     <Svg {...props}>
       <path d="M3.5 8.5h6l2 2H20.5v8.2a1.8 1.8 0 0 1-1.8 1.8H5.3a1.8 1.8 0 0 1-1.8-1.8z" />
       <path d="M3.5 8.5V6.8A1.8 1.8 0 0 1 5.3 5h4.1l2 2" />
+    </Svg>
+  );
+}
+export function IconLaptop(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="4.2" y="4.2" width="15.6" height="11.2" rx="1.8" />
+      <path d="M9.2 8.2h5.6M9.2 10.6h3.4" strokeLinecap="round" />
+      <path d="M3.2 17.2h17.6c.7 0 1.1.8.6 1.3-.4.4-1 .7-1.6.7H4.2c-.6 0-1.2-.3-1.6-.7-.5-.5-.1-1.3.6-1.3z" />
+    </Svg>
+  );
+}
+export function IconGlobe(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="12" cy="12" r="8.1" />
+      <ellipse cx="12" cy="12" rx="3.2" ry="8.1" />
+      <path d="M4.1 9.2h15.8M4.1 14.8h15.8" strokeLinecap="round" />
+    </Svg>
+  );
+}
+export function IconChat(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M5 6.6h14A2.4 2.4 0 0 1 21.4 9v6.1A2.4 2.4 0 0 1 19 17.5h-7.2L7.2 20.4c-.5.3-1.2-.1-1.2-.7V17.5H5A2.4 2.4 0 0 1 2.6 15.1V9A2.4 2.4 0 0 1 5 6.6z" />
+      <path d="M8.2 10.6h7.4M8.2 13.5h4.8" />
+    </Svg>
+  );
+}
+export function IconMore(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="6.5" cy="12" r="1.35" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.35" fill="currentColor" stroke="none" />
+      <circle cx="17.5" cy="12" r="1.35" fill="currentColor" stroke="none" />
     </Svg>
   );
 }
@@ -324,6 +369,14 @@ export function IconSliders(props: IconProps) {
       <path d="M4 8h16M4 16h16" />
       <circle cx="9" cy="8" r="2" />
       <circle cx="15" cy="16" r="2" />
+    </Svg>
+  );
+}
+export function IconInfinity(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M7.2 12c0-1.6 1.3-2.9 2.9-2.9 1.9 0 3.1 2.9 4.9 2.9 1.4 0 2.6-1.2 2.6-2.6S16.4 6.8 15 6.8c-1.8 0-3 2.9-4.9 2.9-1.6 0-2.9-1.3-2.9-2.9" />
+      <path d="M7.2 12c0 1.6 1.3 2.9 2.9 2.9 1.9 0 3.1-2.9 4.9-2.9 1.4 0 2.6 1.2 2.6 2.6s-1.2 2.6-2.6 2.6c-1.8 0-3-2.9-4.9-2.9-1.6 0-2.9 1.3-2.9 2.9" />
     </Svg>
   );
 }

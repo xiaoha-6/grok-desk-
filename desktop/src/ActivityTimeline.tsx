@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useState, type ReactNode } from "react";
 import { CodeDiffView } from "./CodeDiffView";
 import { CategoryIcon, EventKindIcon, IconChevronRight } from "./icons";
 import {
@@ -17,7 +17,6 @@ import {
 import type { Lang, TimelineEvent } from "./types";
 import { fill, t as translate } from "./i18n";
 import { isImageProbeEvent } from "./ChatImage";
-
 function Disclosure({
   open,
   onToggle,
@@ -36,16 +35,32 @@ function Disclosure({
     </button>
   );
 }
-
 function clip(text: string, max = 1600) {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n…`;
 }
-
+function askFromEvent(event: TimelineEvent) {
+  const raw = String(event.input || "").trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as { questions?: Array<{ question?: string; options?: Array<{ label?: string; description?: string }> }> };
+    return (parsed.questions || [])
+      .map((question) => ({
+        question: String(question.question || ""),
+        options: (question.options || [])
+          .map((option) => ({ label: String(option.label || ""), description: String(option.description || "") }))
+          .filter((option) => option.label),
+      }))
+      .filter((question) => question.question || question.options.length);
+  } catch {
+    return [];
+  }
+}
 function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang; startOpen?: boolean }) {
   const copy = translate(lang);
   const hasDiff = Boolean(event.diffs?.length);
-  const [open, setOpen] = useState(Boolean(startOpen && (hasDiff || event.kind === "edit" || event.status === "in_progress")));
+  const ask = askFromEvent(event);
+  const [open, setOpen] = useState(Boolean(startOpen && (hasDiff || event.kind === "edit" || event.status === "in_progress" || ask.length > 0)));
   const status = event.status ? statusLabel(event.status, lang) : "";
   const tone =
     event.status && /fail|error/i.test(event.status)
@@ -67,13 +82,30 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
           {hasDiff
             ? event.diffs!.map((diff, index) => <CodeDiffView key={`${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />)
             : null}
-          {!hasDiff && event.input ? (
+          {!hasDiff && ask.length ? (
+            <div className="ask-preview">
+              {ask.map((question) => (
+                <div key={question.question} className="ask-preview-q">
+                  <strong>{question.question}</strong>
+                  <ul>
+                    {question.options.map((option) => (
+                      <li key={option.label}>
+                        {option.label}
+                        {option.description ? <em>{option.description}</em> : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {!hasDiff && !ask.length && event.input ? (
             <div className="timeline-block">
               <div className="timeline-kicker">{copy.input}</div>
               <pre>{clip(event.input)}</pre>
             </div>
           ) : null}
-          {event.output && !hasDiff ? (
+          {event.output && !hasDiff && !ask.length ? (
             event.kind === "thought" ? (
               <pre className="thought-md">{clip(event.output, 4000)}</pre>
             ) : (
@@ -90,7 +122,6 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
     </div>
   );
 }
-
 function CategoryGroup({
   category,
   events,
@@ -130,7 +161,7 @@ function CategoryGroup({
   );
 }
 
-export function InlineCommands({
+export const InlineCommands = memo(function InlineCommands({
   events,
   lang,
 }: {
@@ -172,9 +203,9 @@ export function InlineCommands({
       })}
     </div>
   );
-}
+});
 
-export function InlineEdits({
+export const InlineEdits = memo(function InlineEdits({
   events,
   lang,
 }: {
@@ -209,9 +240,9 @@ export function InlineEdits({
       ))}
     </div>
   );
-}
+});
 
-export function ActivityTimeline({
+export const ActivityTimeline = memo(function ActivityTimeline({
   events,
   lang,
   defaultOpen = false,
@@ -251,4 +282,4 @@ export function ActivityTimeline({
       ) : null}
     </div>
   );
-}
+});

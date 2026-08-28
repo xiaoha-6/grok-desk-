@@ -2,6 +2,7 @@ mod accounts;
 mod acp;
 mod config;
 mod git;
+mod image_gen;
 mod install;
 mod media;
 mod pty;
@@ -25,6 +26,7 @@ use runtime::{grok_home, runtime_status, RuntimeStatus};
 use sessions::{LocalSessionHistory, LocalSessionSummary};
 use ssh::{SshConfigHost, SshProbe, SshTarget};
 use git::{GitCommit, GitFileDiff, GitReview, GitStatus, GithubIdentity, SnapshotFile};
+use image_gen::GeneratedImage;
 use workspace::{GrepHit, ProjectRules, WorkspaceEntry, WorkspaceFile};
 use serde::Deserialize;
 use serde_json::Value;
@@ -557,6 +559,11 @@ async fn set_active_model(model: String, context_window: Option<u64>) -> Result<
 }
 
 #[tauri::command]
+async fn generate_image(prompt: String) -> Result<GeneratedImage, String> {
+    run_blocking(move || image_gen::generate_image(prompt)).await
+}
+
+#[tauri::command]
 async fn read_clipboard_image() -> Result<Option<PromptAttachment>, String> {
     run_blocking(media::read_clipboard_image).await
 }
@@ -853,6 +860,7 @@ pub fn run() {
             get_relay_quota,
             list_relay_models,
             set_active_model,
+            generate_image,
             read_clipboard_image,
             read_image_file,
             save_image_as,

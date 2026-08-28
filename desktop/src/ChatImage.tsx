@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { ThinkingOrb } from "thinking-orbs";
 import type { Copy } from "./i18n";
 import { IconClose, IconDownload, IconExpand, IconRefresh, IconSave } from "./icons";
 import { MessageBody } from "./markdown";
@@ -30,6 +31,22 @@ export function wantsImageGen(text: string) {
   );
 }
 
+/** Bypass ACP only for short, image-only prompts. Coding / screenshot-to-UI stays on Grok. */
+export function isDirectImagePrompt(text: string, hasAttachments = false) {
+  if (hasAttachments) return false;
+  const value = text.trim();
+  if (!value || value.length > 280) return false;
+  if (!wantsImageGen(value)) return false;
+  if (
+    /改代码|修改文件|修复|修復|实现|實作|refactor|\bbug\b|\bfix\b|函数|函式|组件|元件|按钮|按鈕|\bhover\b|报错|報錯|为什么|為什麼|\.lua|\.tsx|\.jsx|\.css|\.html|工作区|工作區|根据.{0,8}截图|根據.{0,8}截圖|从截图|從截圖|界面|頁面|页面|layout|screenshot/i.test(
+      value,
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function isGeneratedImageProbe(command: string) {
   const text = command.toLowerCase().replace(/\\/g, "/");
   if (!text.trim()) return false;
@@ -53,6 +70,9 @@ export function friendlyImageError(raw: string, copy: Copy) {
   }
   if (/timeout|timed out|超时|超時|逾時/i.test(text)) {
     return copy.imageGenTimeout;
+  }
+  if (/context_too_large|context too large|请求内容过大|上下文.{0,8}过大/i.test(text)) {
+    return copy.contextTooLarge;
   }
   return text || copy.imageGenFailed;
 }
@@ -517,7 +537,10 @@ export function ChatGeneratedImage({
                 ) : null}
               </div>
             ) : (
-              <span className="chat-image-badge">{copy.generatingImage}</span>
+              <span className="chat-image-badge">
+                <ThinkingOrb state="shaping" size={20} theme="dark" />
+                {copy.generatingImage}
+              </span>
             )}
           </>
         ) : null}
@@ -566,7 +589,7 @@ export function ChatGeneratedImage({
   );
 }
 
-export function ChatMessageMedia({
+export const ChatMessageMedia = memo(function ChatMessageMedia({
   message,
   copy,
   expectImage,
@@ -643,4 +666,4 @@ export function ChatMessageMedia({
     );
   });
   return <div className="chat-media-flow">{nodes}</div>;
-}
+});

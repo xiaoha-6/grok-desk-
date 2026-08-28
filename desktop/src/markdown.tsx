@@ -1,6 +1,6 @@
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 
-export function MessageBody({ text, streaming }: { text: string; streaming?: boolean }) {
+export const MessageBody = memo(function MessageBody({ text, streaming }: { text: string; streaming?: boolean }) {
   const blocks = splitBlocks(text);
   return (
     <div className={streaming ? "md streaming" : "md"}>
@@ -35,7 +35,7 @@ export function MessageBody({ text, streaming }: { text: string; streaming?: boo
       })}
     </div>
   );
-}
+});
 
 function splitBlocks(text: string) {
   const chunks = text.split(/```/);

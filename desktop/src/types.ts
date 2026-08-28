@@ -233,10 +233,20 @@ export type SshProbe = {
   configSynced?: boolean;
 };
 
+export type ProjectRecord = {
+  id: string;
+  name: string;
+  cwd: string;
+  ssh?: SshTarget | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type Conversation = {
   id: string;
   title: string;
   cwd: string;
+  projectId?: string;
   accountId?: string;
   grokSessionId?: string;
   sessionDir?: string;
@@ -340,17 +350,20 @@ export type PermissionOption = {
 export type PendingPermission = {
   id: string;
   title: string;
+  command?: string;
   options: PermissionOption[];
   conversationId?: string;
 };
 
 export type AgentQuestionOption = {
+  id?: string;
   label: string;
   description: string;
   preview?: string;
 };
 
 export type AgentQuestion = {
+  id?: string;
   question: string;
   options: AgentQuestionOption[];
   multiSelect: boolean;
@@ -361,6 +374,7 @@ export type PendingQuestion = {
   questions: AgentQuestion[];
   planMode: boolean;
   conversationId?: string;
+  permissionOptions?: PermissionOption[];
 };
 
 export type PendingPlan = {
@@ -458,34 +472,38 @@ export const EFFORTS = [
 
 export const PERMISSION_MODES = [
   {
-    id: "default",
-    labelZh: "每次确认",
-    labelHant: "每次確認",
-    labelEn: "Ask before edits",
-    hintZh: "改文件或跑命令前都先问你",
-    hintHant: "改檔案或跑命令前都先問你",
-    hintEn: "Ask before file edits and shell commands",
-  },
-  {
-    id: "acceptEdits",
-    labelZh: "自动接受编辑",
-    labelHant: "自動接受編輯",
-    labelEn: "Accept edits",
-    hintZh: "文件修改自动通过，其它操作仍会确认",
-    hintHant: "檔案修改自動通過，其它操作仍會確認",
-    hintEn: "Auto-approve file edits; still confirm other actions",
+    id: "bypassPermissions",
+    short: "Agent",
+    labelZh: "完全访问",
+    labelHant: "完全存取",
+    labelEn: "Agent",
+    hintZh: "跳过确认，直接干活",
+    hintHant: "略過確認，直接動手",
+    hintEn: "Skip confirmations and just work",
   },
   {
     id: "plan",
+    short: "Plan",
     labelZh: "规划模式",
     labelHant: "規劃模式",
-    labelEn: "Plan mode",
+    labelEn: "Plan",
     hintZh: "先出计划，你确认后再动手",
     hintHant: "先出計畫，你確認後再動手",
     hintEn: "Draft a plan first, then wait for approval",
   },
   {
+    id: "default",
+    short: "Ask",
+    labelZh: "每次确认",
+    labelHant: "每次確認",
+    labelEn: "Ask",
+    hintZh: "改文件或跑命令前都先问你",
+    hintHant: "改檔案或跑命令前都先問你",
+    hintEn: "Ask before file edits and shell commands",
+  },
+  {
     id: "auto",
+    short: "Auto",
     labelZh: "自动执行",
     labelHant: "自動執行",
     labelEn: "Auto",
@@ -494,13 +512,14 @@ export const PERMISSION_MODES = [
     hintEn: "Run tools automatically with fewer prompts",
   },
   {
-    id: "bypassPermissions",
-    labelZh: "完全访问",
-    labelHant: "完全存取",
-    labelEn: "Full access",
-    hintZh: "跳过确认（高风险）",
-    hintHant: "略過確認（高風險）",
-    hintEn: "Skip confirmations (higher risk)",
+    id: "acceptEdits",
+    short: "Edit",
+    labelZh: "自动接受编辑",
+    labelHant: "自動接受編輯",
+    labelEn: "Edit",
+    hintZh: "文件修改自动通过，其它操作仍会确认",
+    hintHant: "檔案修改自動通過，其它操作仍會確認",
+    hintEn: "Auto-approve file edits; still confirm other actions",
   },
 ];
 
@@ -510,6 +529,12 @@ export function normalizePermissionMode(mode: string | undefined | null): string
   if (value === "ask" || value === "askAlways" || value === "confirm") return "default";
   if (value === "approve" || value === "accept") return "acceptEdits";
   return value;
+}
+
+export function permissionModeShort(mode: string | undefined | null) {
+  const id = normalizePermissionMode(mode);
+  const item = PERMISSION_MODES.find((entry) => entry.id === id) || PERMISSION_MODES[0];
+  return item.short;
 }
 
 export function permissionModeLabel(mode: string | undefined | null, lang: Lang) {

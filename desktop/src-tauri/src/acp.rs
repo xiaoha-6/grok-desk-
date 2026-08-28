@@ -1008,13 +1008,18 @@ fn dispatch_message(
             if let Some(inner_params) = params.get("params").cloned() {
                 method = inner_method.to_string();
                 params = inner_params;
+            } else {
+                method = method.trim_start_matches('_').to_string();
             }
+        } else {
+            method = method.trim_start_matches('_').to_string();
         }
     }
 
     if let Some(id) = id {
+        let is_ask = is_ask_method(&method) || is_ask_payload(&params);
         if method == "session/request_permission"
-            || method == "x.ai/ask_user_question"
+            || is_ask
             || method == "x.ai/exit_plan_mode"
         {
             let mode = permission_mode
@@ -1091,13 +1096,23 @@ fn dispatch_message(
             if let Ok(mut map) = pending_interactions.lock() {
                 map.insert(request_id.clone(), id.clone());
             }
+            let emit_method = if is_ask && method == "session/request_permission" {
+                "x.ai/ask_user_question"
+            } else {
+                method.as_str()
+            };
+            let emit_params = if is_ask {
+                lift_ask_params(params.clone())
+            } else {
+                params.clone()
+            };
             let _ = app.emit(
                 "acp-interaction",
                 with_conversation(
                     json!({
-                        "method": method,
+                        "method": emit_method,
                         "requestId": request_id,
-                        "params": params
+                        "params": emit_params
                     }),
                     conversation_id,
                 ),
@@ -1440,6 +1455,12 @@ pub fn session_update_from(params: &Value) -> Option<Value> {
 }
 
 fn should_auto_allow(permission_mode: &str, params: &Value) -> bool {
+    // Ask 本身是只读交互工具：权限必须先放行，工具才会通过
+    // `x.ai/ask_user_question` 把选择题发给桌面。卡住权限的话，
+    // 界面只会看到 JSON，模型也会自己猜答案。
+    if is_ask_payload(params) {
+        return true;
+    }
     match permission_mode {
         "bypassPermissions" | "auto" => true,
         "acceptEdits" => {
@@ -1454,6 +1475,77 @@ fn should_auto_allow(permission_mode: &str, params: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_ask_method(method: &str) -> bool {
+    method.contains("ask_user_question")
+}
+
+fn is_ask_payload(params: &Value) -> bool {
+    if params
+        .get("questions")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return true;
+    }
+    let Some(tool) = tool_call_from_params(params) else {
+        return false;
+    };
+    let title = tool
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if title.contains("ask:") || title == "ask" || title.starts_with("ask ") {
+        return true;
+    }
+    for key in ["rawInput", "raw_input", "input"] {
+        if let Some(value) = tool.get(key) {
+            if value
+                .get("questions")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                return true;
+            }
+            if let Some(text) = value.as_str() {
+                if text.contains("\"questions\"") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn lift_ask_params(mut params: Value) -> Value {
+    if params.get("questions").is_some() {
+        return params;
+    }
+    let input = tool_call_from_params(&params).and_then(|tool| {
+        tool.get("rawInput")
+            .or_else(|| tool.get("raw_input"))
+            .or_else(|| tool.get("input"))
+            .cloned()
+    });
+    let Some(input) = input else {
+        return params;
+    };
+    let parsed = if let Some(text) = input.as_str() {
+        serde_json::from_str::<Value>(text).unwrap_or(input)
+    } else {
+        input
+    };
+    if let Some(questions) = parsed.get("questions").cloned() {
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("questions".into(), questions);
+            if let Some(mode) = parsed.get("mode").cloned() {
+                obj.entry("mode").or_insert(mode);
+            }
+        }
+    }
+    params
 }
 
 #[allow(dead_code)]
@@ -1508,6 +1600,13 @@ fn explain_upstream(message: String) -> String {
         )
     } else if lower.contains("503") {
         format!("{message}\n上游暂时过载（503）。请稍后重试。")
+    } else if lower.contains("context_too_large")
+        || message.contains("请求内容过大")
+        || lower.contains("context too large")
+    {
+        format!(
+            "{message}\n这次对话或附件太长，当前渠道处理不了。出图请直接说「生成一张…」；写代码请开新对话或把问题说短一点。"
+        )
     } else {
         message
     }
@@ -1633,6 +1732,17 @@ mod tests {
         assert!(!should_auto_allow("acceptEdits", &shell));
         assert!(should_auto_allow("bypassPermissions", &shell));
         assert!(!should_auto_allow("default", &edit));
+        let ask = json!({
+            "toolCall": {
+                "title": "Ask: 你想还原哪一部分混淆代码?",
+                "rawInput": {
+                    "questions": [{ "question": "which?", "options": [{ "label": "app.js" }] }]
+                }
+            }
+        });
+        assert!(should_auto_allow("bypassPermissions", &ask));
+        assert!(should_auto_allow("default", &ask));
+        assert!(is_ask_payload(&ask));
     }
 
     #[test]
