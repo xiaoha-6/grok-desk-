@@ -34,6 +34,7 @@ type Props = {
   onLog?: (line: string) => void;
   onGitSettings?: (patch: { gitAutoCommit?: boolean; gitAutoPush?: boolean; gitAutoCommitMessage?: string }) => void;
   onAskAgent?: (text: string) => void;
+  onWorkingTreeChanged?: (paths: string[] | null, reason: "discard" | "pull") => void;
 };
 
 function statusLetter(code: string) {
@@ -126,6 +127,7 @@ export function SourceControlView({
   onLog,
   onGitSettings,
   onAskAgent,
+  onWorkingTreeChanged,
 }: Props) {
   const [message, setMessage] = useState("");
   const [remoteUrl, setRemoteUrl] = useState("");
@@ -218,13 +220,14 @@ export function SourceControlView({
     );
   }
 
-  async function run<T>(work: () => Promise<T>, ok?: string) {
+  async function run<T>(work: () => Promise<T>, ok?: string, tree?: { paths: string[] | null; reason: "discard" | "pull" }) {
     onBusy(true);
     try {
       const result = await work();
       if (ok) onLog?.(ok);
       await onRefresh();
       await loadLog();
+      if (tree) onWorkingTreeChanged?.(tree.paths, tree.reason);
       onError("");
       return result;
     } catch (err) {
@@ -303,7 +306,7 @@ export function SourceControlView({
             <button type="button" title={copy.gitCommit} disabled={busy || !message.trim() || !git?.dirty} onClick={() => void commit()}>
               <IconCheck size={14} />
             </button>
-            <button type="button" title={copy.scmPull} disabled={busy || !origin} onClick={() => void run(() => invoke("git_pull", { root: cwd, ssh: ssh || null }), copy.scmPulled)}>
+            <button type="button" title={copy.scmPull} disabled={busy || !origin} onClick={() => void run(() => invoke("git_pull", { root: cwd, ssh: ssh || null }), copy.scmPulled, { paths: null, reason: "pull" })}>
               <IconArrowDown size={14} />
             </button>
             <button type="button" title={copy.scmPush} disabled={busy || !origin} onClick={() => void run(() => invoke("git_push", { root: cwd, ssh: ssh || null }), copy.scmPushed)}>
@@ -318,7 +321,7 @@ export function SourceControlView({
                   await invoke("git_fetch", { root: cwd, ssh: ssh || null });
                   if (git?.behind) await invoke("git_pull", { root: cwd, ssh: ssh || null });
                   if ((git?.ahead || 0) > 0) await invoke("git_push", { root: cwd, ssh: ssh || null });
-                }, copy.scmSynced)
+                }, copy.scmSynced, git?.behind ? { paths: null, reason: "pull" } : undefined)
               }
             >
               <IconCloud size={14} />
@@ -430,7 +433,7 @@ export function SourceControlView({
                     disabled={busy}
                     onClick={() => {
                       if (!confirmDiscard([])) return;
-                      void run(() => invoke("git_discard", { root: cwd, paths: [], ssh: ssh || null }), copy.scmDiscarded);
+                      void run(() => invoke("git_discard", { root: cwd, paths: [], ssh: ssh || null }), copy.scmDiscarded, { paths: null, reason: "discard" });
                     }}
                   >
                     <IconUndo size={13} />
@@ -457,7 +460,7 @@ export function SourceControlView({
                     onDiff={() => onOpenDiff(file.path)}
                     onDiscard={() => {
                       if (!confirmDiscard([file.path])) return;
-                      void run(() => invoke("git_discard", { root: cwd, paths: [file.path], ssh: ssh || null }), copy.scmDiscarded);
+                      void run(() => invoke("git_discard", { root: cwd, paths: [file.path], ssh: ssh || null }), copy.scmDiscarded, { paths: [file.path], reason: "discard" });
                     }}
                     onStage={() => void run(() => invoke("git_stage", { root: cwd, paths: [file.path], ssh: ssh || null }))}
                   />
@@ -488,7 +491,7 @@ export function SourceControlView({
               <button type="button" title={copy.gitCommit} disabled={busy || !message.trim() || !git.dirty} onClick={() => void commit()}>
                 <IconCheck size={13} />
               </button>
-              <button type="button" title={copy.scmPull} disabled={busy || !origin} onClick={() => void run(() => invoke("git_pull", { root: cwd, ssh: ssh || null }), copy.scmPulled)}>
+              <button type="button" title={copy.scmPull} disabled={busy || !origin} onClick={() => void run(() => invoke("git_pull", { root: cwd, ssh: ssh || null }), copy.scmPulled, { paths: null, reason: "pull" })}>
                 <IconArrowDown size={13} />
               </button>
               <button type="button" title={copy.scmPush} disabled={busy || !origin} onClick={() => void run(() => invoke("git_push", { root: cwd, ssh: ssh || null }), copy.scmPushed)}>

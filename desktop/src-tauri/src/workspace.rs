@@ -38,6 +38,31 @@ pub struct WorkspaceFile {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalPathInfo {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+pub fn inspect_local_path(path: &str) -> Result<LocalPathInfo, String> {
+    let raw = PathBuf::from(path.trim());
+    if raw.as_os_str().is_empty() {
+        return Err("路径为空".into());
+    }
+    let canon = fs::canonicalize(&raw).map_err(|err| format!("路径无效：{err}"))?;
+    let name = canon
+        .file_name()
+        .map(|item| item.to_string_lossy().into_owned())
+        .unwrap_or_else(|| canon.display().to_string());
+    Ok(LocalPathInfo {
+        path: canon.to_string_lossy().into_owned(),
+        name,
+        is_dir: canon.is_dir(),
+    })
+}
+
 pub fn list_workspace(root: &str, rel: Option<&str>) -> Result<Vec<WorkspaceEntry>, String> {
     let dir = resolve_in_root(root, rel.unwrap_or(""))?;
     if !dir.is_dir() {
@@ -420,6 +445,11 @@ mod tests {
         write_workspace_file(root, "src/main.rs", "fn main() { println!(\"hi\"); }\n").unwrap();
         let updated = read_workspace_file(root, "src/main.rs").unwrap();
         assert!(updated.content.contains("println"));
+        let info = inspect_local_path(dir.join("src/main.rs").to_str().unwrap()).unwrap();
+        assert_eq!(info.name, "main.rs");
+        assert!(!info.is_dir);
+        let folder = inspect_local_path(dir.to_str().unwrap()).unwrap();
+        assert!(folder.is_dir);
         let _ = fs::remove_dir_all(&dir);
     }
 }

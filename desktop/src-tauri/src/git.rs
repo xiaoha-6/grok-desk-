@@ -485,7 +485,10 @@ fn capture_num(haystack: &str, key: &str) -> u32 {
 }
 
 fn git_command() -> Command {
-    let mut command = Command::new(if cfg!(windows) { "git.exe" } else { "git" });
+    let mut command = match crate::runtime::resolve_git_binary() {
+        Some(path) => Command::new(path),
+        None => Command::new(if cfg!(windows) { "git.exe" } else { "git" }),
+    };
     crate::runtime::hide_console(&mut command);
     command
 }

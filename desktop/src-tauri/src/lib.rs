@@ -27,7 +27,7 @@ use sessions::{LocalSessionHistory, LocalSessionSummary};
 use ssh::{SshConfigHost, SshProbe, SshTarget};
 use git::{GitCommit, GitFileDiff, GitReview, GitStatus, GithubIdentity, SnapshotFile};
 use image_gen::GeneratedImage;
-use workspace::{GrepHit, ProjectRules, WorkspaceEntry, WorkspaceFile};
+use workspace::{GrepHit, LocalPathInfo, ProjectRules, WorkspaceEntry, WorkspaceFile};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
@@ -782,6 +782,11 @@ fn open_skills_dir(app: AppHandle, kind: String, cwd: Option<String>) -> Result<
 }
 
 #[tauri::command]
+fn inspect_local_path(path: String) -> Result<LocalPathInfo, String> {
+    workspace::inspect_local_path(&path)
+}
+
+#[tauri::command]
 fn reveal_in_folder(app: AppHandle, path: String) -> Result<(), String> {
     let target = std::path::PathBuf::from(path.trim());
     if !target.exists() {
@@ -945,6 +950,7 @@ pub fn run() {
             list_skills,
             list_skill_dirs,
             open_skills_dir,
+            inspect_local_path,
             reveal_in_folder,
             pty_open,
             pty_write,

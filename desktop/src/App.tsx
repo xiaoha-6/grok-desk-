@@ -40,6 +40,7 @@ import {
   IconCodePane,
   IconPanelLeft,
   IconFolder,
+  IconFile,
   IconGlobe,
   IconLaptop,
   IconChat,
@@ -138,7 +139,22 @@ const DEFAULT_CONTEXT_WINDOW = 500000;
 const HISTORY_PAGE = 80;
 const VIEW_PAGE = 80;
 const MAX_ATTACHMENTS = 8;
+const MAX_PENDING_FILES = 16;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+
+type PendingFile = {
+  id: string;
+  path: string;
+  name: string;
+  mention: string;
+  isDir: boolean;
+};
+
+type LocalPathInfo = {
+  path: string;
+  name: string;
+  isDir: boolean;
+};
 
 const STORAGE_KEY = "grokdesk.workspace.v3";
 const LEGACY_KEYS = ["grokdesk.workspace.v2", "grokdesk.workspace.v1"];
@@ -1006,6 +1022,62 @@ function isImagePath(path: string) {
   return /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i.test(path);
 }
 
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isAbsoluteLocalPath(path: string) {
+  const normalized = normalizePath(path);
+  return normalized.startsWith("/") || /^[a-zA-Z]:\//.test(normalized);
+}
+
+function parentDir(path: string) {
+  const normalized = normalizePath(path);
+  const index = normalized.lastIndexOf("/");
+  return index <= 0 ? normalized : normalized.slice(0, index);
+}
+
+function mentionForDrop(absPath: string, workspaceRoot: string) {
+  const abs = normalizePath(absPath);
+  const root = normalizePath(workspaceRoot);
+  if (root && (samePath(abs, root) || abs.toLowerCase().startsWith(`${root.toLowerCase()}/`))) {
+    return abs.slice(root.length).replace(/^\/+/, "") || ".";
+  }
+  return abs;
+}
+
+function mentionReadTarget(cwd: string, mention: string) {
+  const cleaned = mention.replace(/\\/g, "/");
+  if (isAbsoluteLocalPath(cleaned)) {
+    const name = cleaned.split("/").filter(Boolean).pop() || cleaned;
+    return { root: parentDir(cleaned) || "/", path: name };
+  }
+  return { root: cwd, path: mention };
+}
+
+function appendMentions(text: string, mentions: string[]) {
+  let next = text;
+  for (const mention of mentions) {
+    if (!mention) continue;
+    const token = `@${mention}`;
+    if (next.includes(token)) continue;
+    next = next.trim() ? `${next.trimEnd()} ${token}` : token;
+  }
+  return next;
+}
+
+function stripMention(text: string, mention: string) {
+  if (!mention) return text;
+  return text
+    .replace(new RegExp(`(^|\\s)@${escapeRegExp(mention)}(?=\\s|$)`, "g"), "$1")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/^\s+/, "");
+}
+
+function fileDropPath(file: File) {
+  return String((file as File & { path?: string }).path || "").trim();
+}
+
 function fileToAttachment(file: File): Promise<PromptAttachment> {
   return new Promise((resolve, reject) => {
     if (file.size > MAX_IMAGE_BYTES) {
@@ -1141,17 +1213,19 @@ async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | n
     next +=
       "\n\n<tool_policy>用户没有要求生成图片。不要调用 ImageGen、Imagine 或 grok-imagine-image。用读文件和改代码回答。</tool_policy>";
   }
-  if (!cwd) return next;
   const mentions = [...text.matchAll(/(?:^|[\s])@([^\s@]+)/g)].map((item) => item[1]);
+  if (!cwd && !mentions.some((path) => isAbsoluteLocalPath(path))) return next;
   const seen = new Set<string>();
   for (const path of mentions) {
     if (!path || seen.has(path)) continue;
     seen.add(path);
+    const target = mentionReadTarget(cwd, path);
+    const localOnly = isAbsoluteLocalPath(path) ? null : ssh || null;
     try {
       const file = await invoke<{ content: string; truncated: boolean }>("read_workspace_file", {
-        root: cwd,
-        path,
-        ssh: ssh || null,
+        root: target.root,
+        path: target.path,
+        ssh: localOnly,
       });
       if (file.truncated || file.content.length > 80_000) {
         next += `\n\n<file path="${path}">\n[file too large to inline]\n</file>`;
@@ -1160,7 +1234,11 @@ async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | n
       }
     } catch {
       try {
-        const entries = await invoke<WorkspaceEntry[]>("list_workspace", { root: cwd, path, ssh: ssh || null });
+        const entries = await invoke<WorkspaceEntry[]>("list_workspace", {
+          root: target.root,
+          path: target.path,
+          ssh: localOnly,
+        });
         const names = (Array.isArray(entries) ? entries : []).slice(0, 40).map((item) => item.path).join("\n");
         next += `\n\n<folder path="${path}">\n${names}\n</folder>`;
       } catch {
@@ -1306,6 +1384,7 @@ export default function App() {
   });
   const [relayQuota, setRelayQuota] = useState<RelayQuota | null>(null);
   const [pendingImages, setPendingImages] = useState<PromptAttachment[]>([]);
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [rawEvents, setRawEvents] = useState<Array<{ method: string; payload: string }>>([]);
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null);
@@ -1349,6 +1428,9 @@ export default function App() {
   const settingsRef = useRef(settings);
   const accountsRef = useRef(accounts);
   const pendingImagesRef = useRef(pendingImages);
+  const pendingFilesRef = useRef(pendingFiles);
+  const ingestDroppedPathsRef = useRef<(paths: string[]) => void>(() => undefined);
+  const recentDropRef = useRef(new Set<string>());
   const pasteHandledRef = useRef(false);
   const formRef = useRef(form);
   const availableModelsRef = useRef(availableModels);
@@ -1393,6 +1475,7 @@ export default function App() {
   settingsRef.current = settings;
   accountsRef.current = accounts;
   pendingImagesRef.current = pendingImages;
+  pendingFilesRef.current = pendingFiles;
   formRef.current = form;
   availableModelsRef.current = availableModels;
   relayQuotaRef.current = relayQuota;
@@ -1485,7 +1568,7 @@ export default function App() {
   activeSshRef.current = activeSsh;
   const keys = resolvedBindings(settings.keybindings);
   const projectName = activeSsh ? sshLabel(activeSsh, workspaceRoot) : workspaceLabel(sessionCwd, homeDir, t.home);
-  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0 || Boolean(activeSkill)) && !installing;
+  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0 || pendingFiles.length > 0 || Boolean(activeSkill)) && !installing;
   const relayConfigured = Boolean(relayQuota?.configured || relayReady);
   const routed = relayConfigured ? undefined : pickRoutedAccount(accounts, settings);
   const activeAccount = relayConfigured
@@ -2969,12 +3052,7 @@ export default function App() {
           if (event.payload.type === "over" || event.payload.type === "enter") setDragOver(true);
           else if (event.payload.type === "drop") {
             setDragOver(false);
-            for (const path of event.payload.paths) {
-              if (!isImagePath(path)) continue;
-              void invoke<PromptAttachment>("read_image_file", { path })
-                .then((item) => addPendingImagesRef.current([item]))
-                .catch((error) => setStatusText(localizeThrown(error, tRef.current)));
-            }
+            ingestDroppedPathsRef.current(event.payload.paths || []);
           } else {
             setDragOver(false);
           }
@@ -3057,6 +3135,7 @@ export default function App() {
     setView("chat");
     setPrompt("");
     setPendingImages([]);
+    setPendingFiles([]);
     setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
     followRef.current = true;
     setShowJumpToBottom(false);
@@ -3338,7 +3417,10 @@ export default function App() {
   ) {
     const conversation = conversationsRef.current.find((item) => item.id === (options?.conversationId || selectedIdRef.current));
     const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
-    const outbound = text.trim();
+    const outbound = appendMentions(
+      text,
+      pendingFilesRef.current.map((item) => item.mention),
+    ).trim();
     if ((!outbound && !attachments.length) || !conversation) return;
     const existingQueued = options?.messageId
       ? conversation.messages.find((item) => item.id === options.messageId)
@@ -3420,6 +3502,7 @@ export default function App() {
         setShownCount((count) => Math.max(count, conversation.messages.length + 1, VIEW_PAGE));
         setPrompt("");
         setPendingImages([]);
+        setPendingFiles([]);
         if (composerRef.current) composerRef.current.style.height = "30px";
         if (conversation.id === selectedIdRef.current) {
           setStatusText(`${t.queued} ${promptQueueRef.current.filter((item) => item.conversationId === conversation.id).length}`);
@@ -3461,6 +3544,7 @@ export default function App() {
     historyBusyRef.current.delete(conversation.id);
     setPrompt("");
     setPendingImages([]);
+    setPendingFiles([]);
     if (composerRef.current) composerRef.current.style.height = "30px";
     setConversationLive(conversation.id, true);
     if (conversation.id === selectedIdRef.current) setStatusText(t.connecting);
@@ -3627,7 +3711,7 @@ export default function App() {
       setPermissionMode(parsed.mode);
       setPrompt("");
       setSlash(null);
-      if (parsed.rest || pendingImagesRef.current.length) await sendText(parsed.rest);
+      if (parsed.rest || pendingImagesRef.current.length || pendingFilesRef.current.length) await sendText(parsed.rest);
       return;
     }
     if (parsed?.kind === "skills") {
@@ -3769,7 +3853,7 @@ export default function App() {
       setPermissionMode(item.mode);
       const next = rest.trim();
       setPrompt(next);
-      if (next || pendingImagesRef.current.length) void sendText(next);
+      if (next || pendingImagesRef.current.length || pendingFilesRef.current.length) void sendText(next);
       return;
     }
     if (item.kind === "skills") {
@@ -3780,7 +3864,7 @@ export default function App() {
     if (item.kind === "skill" && item.skill) {
       const task = rest.trim();
       setPrompt(task);
-      if (task || pendingImagesRef.current.length) {
+      if (task || pendingImagesRef.current.length || pendingFilesRef.current.length) {
         void sendText(wrapSkillPrompt(item.skill, task), undefined, {
           displayText: `/${item.skill.name}${task ? ` ${task}` : ""}`,
         });
@@ -3934,13 +4018,153 @@ export default function App() {
     }
   }
 
-  async function onComposerDrop(event: ReactDragEvent<HTMLDivElement>) {
+  function rememberDrop(key: string) {
+    if (!key || recentDropRef.current.has(key)) return true;
+    recentDropRef.current.add(key);
+    window.setTimeout(() => recentDropRef.current.delete(key), 600);
+    return false;
+  }
+
+  async function ingestDroppedPaths(paths: string[]) {
+    const images: string[] = [];
+    const others: string[] = [];
+    for (const path of paths) {
+      const trimmed = path.trim();
+      if (!trimmed || rememberDrop(normalizePath(trimmed))) continue;
+      if (isImagePath(trimmed)) images.push(trimmed);
+      else others.push(trimmed);
+    }
+    for (const path of images) {
+      try {
+        addPendingImages([await invoke<PromptAttachment>("read_image_file", { path })]);
+      } catch (error) {
+        setStatusText(localizeThrown(error, tRef.current));
+      }
+    }
+    if (!others.length) return;
+    const next: PendingFile[] = [];
+    for (const path of others) {
+      try {
+        const info = await invoke<LocalPathInfo>("inspect_local_path", { path });
+        let root = workspaceRootRef.current;
+        if (!root && !activeSshRef.current) {
+          const candidate = info.isDir ? info.path : parentDir(info.path);
+          if (usableWorkspace(candidate, statusRef.current?.homeDir || "")) {
+            applyCwd(candidate, null);
+            workspaceRootRef.current = candidate;
+            root = candidate;
+          }
+        }
+        next.push({
+          id: uid(),
+          path: info.path,
+          name: info.name,
+          mention: mentionForDrop(info.path, root),
+          isDir: info.isDir,
+        });
+      } catch (error) {
+        setStatusText(localizeThrown(error, tRef.current));
+      }
+    }
+    if (!next.length) return;
+    setPendingFiles((current) => {
+      const merged = [...current];
+      for (const item of next) {
+        if (merged.length >= MAX_PENDING_FILES) break;
+        if (merged.some((existing) => samePath(existing.path, item.path))) continue;
+        merged.push(item);
+      }
+      return merged;
+    });
+    setPrompt((current) => appendMentions(current, next.map((item) => item.mention)));
+    setShowWorkspace(true);
+    const focus = next.find((item) => !isAbsoluteLocalPath(item.mention));
+    if (focus) {
+      setWorkspaceFocusPath(focus.mention === "." ? "" : focus.mention);
+      setWorkspaceFocusTick((tick) => tick + 1);
+    }
+    requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      resizeComposer();
+    });
+  }
+  ingestDroppedPathsRef.current = (paths) => {
+    void ingestDroppedPaths(paths);
+  };
+
+  function removePendingFile(id: string) {
+    const item = pendingFilesRef.current.find((file) => file.id === id);
+    setPendingFiles((current) => current.filter((file) => file.id !== id));
+    if (item) setPrompt((current) => stripMention(current, item.mention));
+  }
+
+  function openDroppedFile(item: PendingFile) {
+    if (!isAbsoluteLocalPath(item.mention)) {
+      setShowWorkspace(true);
+      setWorkspaceFocusPath(item.mention === "." ? "" : item.mention);
+      setWorkspaceFocusTick((tick) => tick + 1);
+    }
+  }
+
+  function revealDroppedFile(path: string) {
+    void invoke("reveal_in_folder", { path }).catch((error) => setStatusText(localizeThrown(error, t)));
+  }
+
+  function onChatDragOver(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    setDragOver(true);
+  }
+
+  function onChatDragLeave(event: ReactDragEvent<HTMLElement>) {
+    const next = event.relatedTarget as Node | null;
+    if (next && event.currentTarget.contains(next)) return;
+    setDragOver(false);
+  }
+
+  async function onChatDrop(event: ReactDragEvent<HTMLElement>) {
     event.preventDefault();
     setDragOver(false);
-    const files = Array.from(event.dataTransfer.files || []).filter(isImageFile);
-    if (!files.length) return;
+    const workspaceFile = event.dataTransfer.getData("application/x-grokdesk-file");
+    if (workspaceFile) {
+      try {
+        const item = JSON.parse(workspaceFile) as { mention?: string; name?: string; isDir?: boolean; path?: string };
+        const mention = String(item.mention || "").trim();
+        if (mention) {
+          const file: PendingFile = {
+            id: uid(),
+            path: item.path || mention,
+            name: item.name || mention.split("/").pop() || mention,
+            mention,
+            isDir: Boolean(item.isDir),
+          };
+          setPendingFiles((current) =>
+            current.some((existing) => existing.mention === file.mention) ? current : [...current, file].slice(0, MAX_PENDING_FILES),
+          );
+          setPrompt((current) => appendMentions(current, [mention]));
+          openDroppedFile(file);
+          requestAnimationFrame(() => {
+            composerRef.current?.focus();
+            resizeComposer();
+          });
+        }
+      } catch {
+        // ignore malformed workspace drags
+      }
+      return;
+    }
+    const files = Array.from(event.dataTransfer.files || []);
+    const paths = files.map(fileDropPath).filter(Boolean);
+    if (paths.length) {
+      await ingestDroppedPaths(paths);
+      return;
+    }
+    if (recentDropRef.current.size) return;
+    const images = files.filter(isImageFile);
+    if (!images.length) return;
+    const keys = images.map((file) => `blob:${file.name}:${file.size}`);
+    if (keys.every((key) => rememberDrop(key))) return;
     try {
-      addPendingImages(await Promise.all(files.map(fileToAttachment)));
+      addPendingImages(await Promise.all(images.map(fileToAttachment)));
     } catch (error) {
       setStatusText(localizeThrown(error, t));
     }
@@ -4771,7 +4995,18 @@ export default function App() {
         </>
       ) : null}
 
-      <main className="main">
+      <main
+        className={dragOver ? "main drop-target" : "main"}
+        onDragOver={onChatDragOver}
+        onDragLeave={onChatDragLeave}
+        onDrop={(event) => void onChatDrop(event)}
+      >
+        {dragOver ? (
+          <div className="chat-drop-overlay">
+            <strong>{t.dropFilesTitle}</strong>
+            <span>{t.dropFilesHint}</span>
+          </div>
+        ) : null}
         <header className="chat-header">
           <div className="crumb">
             <button className="crumb-folder" type="button" title={t.pickWorkspace} onClick={() => void pickWorkspaceFolder()}>
@@ -5123,16 +5358,7 @@ export default function App() {
         </div>
 
         <footer className="composer-wrap">
-          <div
-            className={dragOver ? "composer drop-target" : "composer"}
-            onPaste={onComposerPaste}
-            onDragOver={(event) => {
-              event.preventDefault();
-              setDragOver(true);
-            }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={(event) => void onComposerDrop(event)}
-          >
+          <div className={dragOver ? "composer drop-target" : "composer"} onPaste={onComposerPaste}>
             {editingCwd ? (
               <input
                 className="cwd-input"
@@ -5167,8 +5393,27 @@ export default function App() {
                 </button>
               </div>
             )}
-            {pendingImages.length ? (
+            {pendingImages.length || pendingFiles.length ? (
               <div className="attach-row">
+                {pendingFiles.map((item) => (
+                  <div key={item.id} className="attach-chip file">
+                    {item.isDir ? <IconFolder /> : <IconFile />}
+                    <button
+                      type="button"
+                      className="attach-name"
+                      title={t.selectDroppedFile}
+                      onClick={() => openDroppedFile(item)}
+                    >
+                      {item.name}
+                    </button>
+                    <button type="button" title={t.revealInFolder} onClick={() => revealDroppedFile(item.path)}>
+                      <IconFolder />
+                    </button>
+                    <button type="button" title={t.cancel} onClick={() => removePendingFile(item.id)}>
+                      <IconClose />
+                    </button>
+                  </div>
+                ))}
                 {pendingImages.map((item, index) => (
                   <div key={`${item.name || "img"}-${index}`} className="attach-chip">
                     {item.data ? (
@@ -5283,7 +5528,7 @@ export default function App() {
                 ref={composerRef}
                 rows={1}
                 value={prompt}
-                placeholder={pendingImages.length ? t.pasteImage : t.composer}
+                placeholder={pendingImages.length || pendingFiles.length ? t.dropFiles : t.composer}
                 onChange={(event) => {
                   const value = event.target.value;
                   setPrompt(value);

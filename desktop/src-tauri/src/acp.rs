@@ -2,7 +2,7 @@ use crate::config::{
     canonical_model_id, credentials_ready, ensure_image_gen_routing, resolve_agent_home,
     IMAGE_EDIT_MODEL, IMAGE_GEN_MODEL, NO_CREDENTIALS_CODE,
 };
-use crate::runtime::{grok_home, resolve_binary};
+use crate::runtime::{grok_home, resolve_spawn_binary, resolve_spawn_cwd};
 use crate::ssh::SshTarget;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -710,7 +710,8 @@ impl AcpClient {
             let env_refs: Vec<(&str, String)> = extra_env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             crate::ssh::spawn_remote_agent(ssh, model, None, &env_refs)?
         } else {
-            let binary = resolve_binary().ok_or_else(|| "还没有检测到 Grok Build".to_string())?;
+            let binary = resolve_spawn_binary()?;
+            let workdir = resolve_spawn_cwd(cwd)?;
             let mut command = Command::new(&binary);
             command.arg("agent");
             if !model.is_empty() {
@@ -718,7 +719,7 @@ impl AcpClient {
             }
             command
                 .arg("stdio")
-                .current_dir(cwd)
+                .current_dir(&workdir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -726,21 +727,25 @@ impl AcpClient {
             for (key, value) in &extra_env {
                 command.env(key, value);
             }
-            let bin_dir = binary
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            let path_sep = if cfg!(windows) { ';' } else { ':' };
-            let mut path_value = bin_dir.display().to_string();
-            if let Ok(existing) = std::env::var("PATH") {
-                path_value.push(path_sep);
-                path_value.push_str(&existing);
-            }
-            command.env("PATH", path_value);
+            command.env(
+                "PATH",
+                crate::runtime::augmented_path(std::env::var("PATH").ok()),
+            );
             crate::runtime::hide_console(&mut command);
-            command
-                .spawn()
-                .map_err(|err| format!("无法启动 Grok Agent：{err}"))?
+            command.spawn().map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "找不到 Grok 可执行文件：{}。设置里若显示已安装，通常是官方 CLI 刚更新、软链暂时断开。请点「重新检测」，或等几秒再发。",
+                        binary.display()
+                    )
+                } else {
+                    format!(
+                        "无法启动 Grok Agent：{err}（程序：{}，目录：{}）",
+                        binary.display(),
+                        workdir.display()
+                    )
+                }
+            })?
         };
         let stdin = child
             .stdin
@@ -891,16 +896,12 @@ fn session_params(cwd: &str, options: &SessionOptions) -> Value {
 }
 
 fn resolve_cwd(cwd: Option<String>) -> Result<String, String> {
-    if let Some(value) = cwd {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    Ok(dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .display()
-        .to_string())
+    let raw = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    resolve_spawn_cwd(raw).map(|path| path.display().to_string())
 }
 
 fn with_conversation(mut payload: Value, conversation_id: &str) -> Value {
@@ -1630,6 +1631,13 @@ fn explain_upstream(message: String) -> String {
         format!(
             "{message}\n上游模型服务暂时不可用。这通常是中转站或 xAI 上游波动，不是本机 Grok Build 没装好。请稍后重试。"
         )
+    } else if lower.contains("missing field `created_at`")
+        || lower.contains("missing field \"created_at\"")
+        || lower.contains("missing field created_at")
+    {
+        format!(
+            "{message}\n中转站返回的 Responses 缺 created_at，Grok CLI 无法反序列化。这是上游兼容字段，不是本机没装好。请稍后重试。"
+        )
     } else if lower.contains("503") {
         format!("{message}\n上游暂时过载（503）。请稍后重试。")
     } else if lower.contains("context_too_large")
@@ -1688,6 +1696,8 @@ fn user_facing_diagnostic(line: &str) -> Option<String> {
     if plain.contains("Post-replay flush failed")
         || plain.contains("session not found")
         || plain.contains(" WARN ")
+        || (plain.contains("git_cli")
+            && (plain.contains("program not found") || plain.contains("NotFound")))
     {
         return None;
     }
@@ -1836,6 +1846,28 @@ mod tests {
             Some("boom")
         );
         assert!(user_facing_diagnostic("2026-08-24 WARN leftover").is_none());
+    }
+
+    #[test]
+    fn explains_missing_created_at() {
+        let formatted = format_rpc_error(
+            &json!({
+                "code": -32603,
+                "message": "Internal error",
+                "data": "serialization error: missing field `created_at`"
+            }),
+            None,
+        );
+        assert!(formatted.contains("created_at"));
+        assert!(formatted.contains("中转站"));
+    }
+
+    #[test]
+    fn hides_git_cli_not_found_noise() {
+        assert!(user_facing_diagnostic(
+            "2026-08-29T13:12:19Z ERROR git_cli: Command::output() FAILED (spawn error) error=program not found error_kind=NotFound cwd=C:\\Users\\31147"
+        )
+        .is_none());
     }
 
     #[test]

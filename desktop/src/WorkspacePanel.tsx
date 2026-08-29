@@ -103,6 +103,13 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   const treeRef = useRef<TreeApi<TreeNode> | undefined>(undefined);
   const expandedRef = useRef(expanded);
   const pendingReveal = useRef<{ rel: string; folders: string[] } | null>(null);
+  const staleEchoRef = useRef<Record<string, string>>({});
+  const incomingSigRef = useRef("");
+  const externalReloadTimerRef = useRef(0);
+  const rulesRef = useRef(rules);
+  const rulesDraftRef = useRef(rulesDraft);
+  rulesRef.current = rules;
+  rulesDraftRef.current = rulesDraft;
   expandedRef.current = expanded;
   openTabsRef.current = openTabs;
   activePathRef.current = activePath;
@@ -159,6 +166,8 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     setReviews({});
     setReviewEditor(null);
     setDrafts({});
+    staleEchoRef.current = {};
+    incomingSigRef.current = "";
     setScmDiffs({});
     scmDiffsRef.current = {};
     setGit(null);
@@ -168,14 +177,45 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     void loadDir("", true);
   }, [cwd, loadDir]);
 
+  const dropDraft = useCallback((rel: string, echo?: string) => {
+    if (echo != null) staleEchoRef.current[rel] = echo;
+    setDrafts((current) => {
+      if (current[rel] == null) return current;
+      const next = { ...current };
+      delete next[rel];
+      return next;
+    });
+  }, []);
+
   const loadFile = useCallback(
-    async (rel: string) => {
+    async (rel: string, options?: { dropDraft?: boolean }) => {
       if (!cwd || !rel) return;
       try {
         const loaded = await invoke<WorkspaceFile>("read_workspace_file", { root: cwd, path: rel, ssh: ssh || null });
         if (cwdRef.current !== cwd) return;
         const next = isBinaryFile(rel, loaded.content) ? { ...loaded, language: "binary", content: "", truncated: true } : loaded;
+        const prev = filesRef.current[rel]?.content;
+        const draft = draftsRef.current[rel];
         filesRef.current[rel] = next;
+        const diskChanged = prev != null && prev !== next.content;
+        const echoDraft = draft == null || draft === prev || draft === next.content;
+        if (options?.dropDraft || (diskChanged && echoDraft)) {
+          if (draft != null && draft !== next.content) staleEchoRef.current[rel] = draft;
+          else if (prev != null && prev !== next.content) staleEchoRef.current[rel] = prev;
+          dropDraft(rel);
+          if (activePathRef.current === rel && fileEditorRef.current && fileEditorRef.current.getValue() !== next.content) {
+            fileEditorRef.current.setValue(next.content);
+          }
+        }
+        const rulesFile = rulesRef.current;
+        if (
+          rulesFile &&
+          (rel === rulesFile.path || /(^|\/)AGENTS\.md$/i.test(rel)) &&
+          rulesDraftRef.current === (rulesFile.content || "")
+        ) {
+          setRules({ ...rulesFile, content: next.content, path: rulesFile.path || rel });
+          setRulesDraft(next.content);
+        }
         if (activePathRef.current === rel) {
           setFile(next);
           setError("");
@@ -206,7 +246,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         }
       }
     },
-    [cwd, loadDir, ssh],
+    [cwd, dropDraft, loadDir, ssh],
   );
 
   const showTab = useCallback(
@@ -217,7 +257,9 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
       setTab(view);
       const cached = filesRef.current[item.path];
       setFile(cached || null);
-      if (!cached) void loadFile(item.path);
+      const draft = draftsRef.current[item.path];
+      const dirty = draft != null && draft !== (cached?.content ?? "");
+      if (!cached || !dirty) void loadFile(item.path);
     },
     [diffByPath, loadFile],
   );
@@ -347,10 +389,47 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     void revealPathRef.current(focusPath, true);
   }, [focusPath, focusTick]);
 
+  const adoptExternalFiles = useCallback(
+    async (rels: string[], force = false) => {
+      if (!rels.length) return;
+      const known = [
+        ...openTabsRef.current.map((item) => item.path),
+        ...Object.keys(filesRef.current),
+        activePathRef.current,
+      ].filter(Boolean);
+      const open = new Set(openTabsRef.current.map((item) => item.path));
+      if (activePathRef.current) open.add(activePathRef.current);
+      const mapped = [...new Set(rels.map((rel) => matchOpenRel(rel, known)))];
+      for (const rel of mapped) {
+        if (open.has(rel)) await loadFile(rel, { dropDraft: force });
+        else delete filesRef.current[rel];
+      }
+    },
+    [loadFile],
+  );
+
   useEffect(() => {
-    filesRef.current = {};
-    if (activePathRef.current) void loadFile(activePathRef.current);
-  }, [changedPaths, diffs, loadFile]);
+    const rels = new Set<string>();
+    for (const path of changedPaths) {
+      const rel = toRelative(cwd, path);
+      if (rel) rels.add(rel);
+    }
+    for (const diff of diffs) {
+      const rel = toRelative(cwd, diff.path || "");
+      if (rel) rels.add(rel);
+    }
+    const sig = [
+      ...[...rels].sort(),
+      ...diffs.map((item) => `${toRelative(cwd, item.path || "")}:${item.newText.length}`),
+    ].join("|");
+    if (sig === incomingSigRef.current) return;
+    window.clearTimeout(externalReloadTimerRef.current);
+    externalReloadTimerRef.current = window.setTimeout(() => {
+      incomingSigRef.current = sig;
+      void adoptExternalFiles([...rels]);
+    }, 200);
+    return () => window.clearTimeout(externalReloadTimerRef.current);
+  }, [adoptExternalFiles, changedPaths, cwd, diffs]);
 
   const treeData = useMemo(() => {
     const build = (parent: string): TreeNode[] =>
@@ -453,11 +532,36 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   const saveFile = useCallback(
     async (rel?: string) => {
       const path = rel || activePathRef.current;
-      if (!path || !isDirty(path)) return false;
-      const content = draftsRef.current[path];
+      if (!path) return false;
+      const live = path === activePathRef.current ? fileEditorRef.current?.getValue() : undefined;
+      const content = live ?? draftsRef.current[path];
       if (content == null) return false;
+      const echo = staleEchoRef.current[path];
+      if (echo != null && content === echo) {
+        setDrafts((current) => {
+          if (current[path] == null) return current;
+          const next = { ...current };
+          delete next[path];
+          return next;
+        });
+        delete staleEchoRef.current[path];
+        return false;
+      }
+      const saved = filesRef.current[path]?.content ?? "";
+      if (content === saved) {
+        setDrafts((current) => {
+          if (current[path] == null) return current;
+          const next = { ...current };
+          delete next[path];
+          return next;
+        });
+        delete staleEchoRef.current[path];
+        return false;
+      }
+      if (!isDirty(path) && live == null) return false;
       try {
         await writeActive(path, content);
+        delete staleEchoRef.current[path];
         setError("");
         void refreshGit();
         return true;
@@ -493,6 +597,7 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   useEffect(() => {
     if (!restoreTick) return;
     setDrafts({});
+    staleEchoRef.current = {};
     for (const tab of openTabsRef.current) void loadFile(tab.path);
   }, [loadFile, restoreTick]);
 
@@ -521,17 +626,19 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         ...current,
         [activeRel]: { incoming: incomingKey, ...next },
       }));
-      if (next.newText !== review.newText) {
-        try {
+      try {
+        if (hunk || action === "reject") {
           await writeActive(activeRel, next.newText);
-          setError("");
-        } catch (err) {
-          setError(String(err));
+        } else {
+          await loadFile(activeRel, { dropDraft: true });
         }
+        setError("");
+      } catch (err) {
+        setError(String(err));
       }
       if (next.oldText === next.newText) setTab("file");
     },
-    [activeRel, incomingKey, review, writeActive],
+    [activeRel, incomingKey, loadFile, review, writeActive],
   );
 
   useEffect(() => {
@@ -545,10 +652,12 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     (props: NodeRendererProps<TreeNode>) => (
       <WorkspaceTreeNode
         {...props}
+        cwd={cwd}
+        remote={Boolean(ssh)}
         dirty={changed.has(props.node.data.path) || diffByPath.has(props.node.data.path) || isDirty(props.node.data.path)}
       />
     ),
-    [changed, diffByPath, isDirty],
+    [changed, cwd, diffByPath, isDirty, ssh],
   );
 
   return (
@@ -684,6 +793,16 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
               onLog={onLog}
               onGitSettings={onGitSettings}
               onAskAgent={onAskAgent}
+              onWorkingTreeChanged={(paths, reason) => {
+                const known = [
+                  ...openTabsRef.current.map((item) => item.path),
+                  activePathRef.current,
+                ].filter(Boolean);
+                const rels = paths?.length
+                  ? paths.map((path) => matchOpenRel(toRelative(cwd, path), known)).filter(Boolean)
+                  : known;
+                void adoptExternalFiles(rels, reason === "discard");
+              }}
             />
           ) : activity === "run" ? (
             <RunDebugView
@@ -1010,8 +1129,14 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
                       onChange={(value) => {
                         if (!activeRel || file.truncated) return;
                         const next = value ?? "";
+                        const live = fileEditorRef.current?.getValue();
+                        if (live != null && next !== live) return;
+                        const saved = filesRef.current[activeRel]?.content ?? file.content;
+                        if (staleEchoRef.current[activeRel] != null && next === staleEchoRef.current[activeRel] && next !== saved) {
+                          return;
+                        }
+                        if (next === saved) delete staleEchoRef.current[activeRel];
                         setDrafts((current) => {
-                          const saved = filesRef.current[activeRel]?.content ?? file.content;
                           if (next === saved) {
                             if (current[activeRel] == null) return current;
                             const copyDraft = { ...current };
@@ -1050,12 +1175,36 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   );
 }
 
-function WorkspaceTreeNode({ node, style, dragHandle, dirty }: NodeRendererProps<TreeNode> & { dirty: boolean }) {
+function WorkspaceTreeNode({
+  node,
+  style,
+  dragHandle,
+  dirty,
+  cwd,
+  remote,
+}: NodeRendererProps<TreeNode> & { dirty: boolean; cwd: string; remote: boolean }) {
   return (
     <div
       ref={dragHandle}
       style={style}
       className={`ws-row${node.isSelected ? " on" : ""}${dirty ? " changed" : ""}`}
+      draggable
+      onDragStart={(event) => {
+        const rel = node.data.path;
+        const root = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+        const abs = remote || !root ? "" : rel && rel !== "." ? `${root}/${rel.replace(/^\/+/, "")}` : root;
+        event.dataTransfer.setData(
+          "application/x-grokdesk-file",
+          JSON.stringify({
+            mention: rel,
+            name: node.data.name,
+            isDir: node.data.isDir,
+            path: abs,
+          }),
+        );
+        event.dataTransfer.setData("text/plain", `@${rel}`);
+        event.dataTransfer.effectAllowed = "copy";
+      }}
     >
       <span
         className={node.data.isDir && node.isOpen ? "chevron open" : "chevron"}
@@ -1184,11 +1333,15 @@ function toRelative(cwd: string, raw: string) {
   const root = String(cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
   if (!path) return "";
   if (root && (path === root || path.startsWith(`${root}/`))) return path.slice(root.length + 1);
-  if (path.startsWith("/")) {
-    const parts = path.split("/").filter(Boolean);
-    return parts.slice(Math.max(0, parts.length - 4)).join("/");
-  }
+  if (root && path.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return path.slice(root.length + 1);
   return path.replace(/^\.\//, "");
+}
+
+function matchOpenRel(rel: string, known: string[]) {
+  if (!rel) return rel;
+  if (known.includes(rel)) return rel;
+  const normalized = rel.replace(/\\/g, "/");
+  return known.find((item) => item && (normalized.endsWith(`/${item}`) || normalized === item)) || rel;
 }
 
 const MONACO_OPTIONS = {
