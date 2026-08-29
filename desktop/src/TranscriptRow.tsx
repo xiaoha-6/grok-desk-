@@ -5,6 +5,7 @@ import {
   imageGenFailure,
   isImageGenBusy,
   isShowableImage,
+  wantsImageGen,
 } from "./ChatImage";
 import { TextShimmer } from "./components/prompt-kit/text-shimmer";
 import { AgentStatus, ThinkingOrb, agentOrbForMessage } from "./components/thinking-orbs/ThinkingOrbs";
@@ -71,12 +72,14 @@ export const TranscriptRow = memo(function TranscriptRow({
   actionsRef: MutableRefObject<TranscriptRowActions>;
 }) {
   const livePhase = assistantLivePhase(message);
+  const askedImage = wantsImageGen(prevUser?.text || "");
   const imageBusy = isImageGenBusy(message, prevUser?.text || "");
   const expectImage = imageBusy && !(message.media || []).some(isShowableImage);
   const activity = agentOrbForMessage(message, copy, { imageBusy });
   const showThinkingBar = livePhase === "thinking" && !(message.thought && !message.events.length);
   const showWorkingBar = livePhase === "working" && !imageBusy;
-  const canRedraw = message.role === "assistant" && Boolean(prevUser) && !running;
+  const canRedraw = message.role === "assistant" && Boolean(prevUser) && askedImage && !running;
+  const imageFail = askedImage ? imageGenFailure(message) : "";
   const actions = actionsRef;
 
   return (
@@ -144,6 +147,7 @@ export const TranscriptRow = memo(function TranscriptRow({
             message={message}
             copy={copy}
             expectImage={expectImage}
+            allowImageUi={askedImage}
             sessionDir={sessionDir}
             onRedraw={
               canRedraw && prevUser
@@ -151,7 +155,7 @@ export const TranscriptRow = memo(function TranscriptRow({
                     actions.current.sendRedraw(
                       message,
                       prevUser,
-                      isLatestAssistant && Boolean(imageGenFailure(message) || message.error),
+                      isLatestAssistant && Boolean(imageFail || message.error),
                     )
                 : undefined
             }
@@ -164,7 +168,7 @@ export const TranscriptRow = memo(function TranscriptRow({
             <span>{copy.stoppedHint}</span>
           </div>
         ) : null}
-        {message.error && !imageGenFailure(message) ? (
+        {message.error && !imageFail ? (
           <div className="fail">
             <div className="fail-title">{copy.failed}</div>
             <pre>{message.error}</pre>

@@ -18,17 +18,27 @@ export function isImageGenActive(event: TimelineEvent) {
 
 export function isImageGenBusy(message?: ChatMessage, prevUserText = "") {
   if (!message || message.role !== "assistant") return false;
+  if (!wantsImageGen(prevUserText)) return false;
   if ((message.events || []).some(isImageGenActive)) return true;
   if ((message.media || []).some(isShowableImage)) return false;
-  return Boolean(message.streaming && wantsImageGen(prevUserText));
+  return Boolean(message.streaming);
+}
+
+const CODING_OR_REVIEW =
+  /改代码|修改文件|修复|修復|实现|實作|refactor|\bbug\b|\bfix\b|函数|函式|组件|元件|按钮|按鈕|\bhover\b|报错|報錯|为什么|為什麼|\.lua\b|\.tsx\b|\.jsx\b|\.css\b|\.html\b|\.js\b|\.ts\b|工作区|工作區|根据.{0,8}截图|根據.{0,8}截圖|从截图|從截圖|界面|頁面|页面|layout|screenshot|插件|\bplugin\b|检查|檢查|看看|帮我看|幫我看|帮我改|幫我改|代码|代碼|程式|fxmanifest|\breview\b|\bdebug\b|\binspect\b|\bcheck\b|有没有问题|有沒有問題|是否有需要/;
+
+function looksLikeImageIntent(text: string) {
+  return /(?:生成|画|畫|绘制|繪製).{0,12}(?:图|圖|照片|插画|插畫)|一张图|一張圖|(?<![产產])生图|(?<![产產])生圖|(?<![列找提])出图|(?<![列找提])出圖|文生图|文生圖|帮我画|幫我畫|(?:^|[\n\s])imagine(?:\s+(?:a|an|me)\b|\s*:)|image\s*gen|(?:draw|make|create|generate)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|illustration)\b(?!\s*(?:component|element|tag|url|path|asset|slider|src|file|icon))/i.test(
+    text,
+  );
 }
 
 export function wantsImageGen(text: string) {
   const value = text.trim();
   if (!value) return false;
-  return /(?:生成|画|畫|绘制|繪製|出).{0,24}(?:图|圖)|一张图|一張圖|生图|生圖|出图|出圖|imagine\b|image\s*gen|(?:draw|make|create|generate)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|illustration)|文生图|文生圖|帮我画|幫我畫/i.test(
-    value,
-  );
+  if (!looksLikeImageIntent(value)) return false;
+  // Mixed coding / review prompts stay on Grok. "帮我画一下这个界面" is UI work, not Imagine.
+  return !CODING_OR_REVIEW.test(value);
 }
 
 /** Bypass ACP only for short, image-only prompts. Coding / screenshot-to-UI stays on Grok. */
@@ -36,15 +46,7 @@ export function isDirectImagePrompt(text: string, hasAttachments = false) {
   if (hasAttachments) return false;
   const value = text.trim();
   if (!value || value.length > 280) return false;
-  if (!wantsImageGen(value)) return false;
-  if (
-    /改代码|修改文件|修复|修復|实现|實作|refactor|\bbug\b|\bfix\b|函数|函式|组件|元件|按钮|按鈕|\bhover\b|报错|報錯|为什么|為什麼|\.lua|\.tsx|\.jsx|\.css|\.html|工作区|工作區|根据.{0,8}截图|根據.{0,8}截圖|从截图|從截圖|界面|頁面|页面|layout|screenshot/i.test(
-      value,
-    )
-  ) {
-    return false;
-  }
-  return true;
+  return wantsImageGen(value);
 }
 
 export function isGeneratedImageProbe(command: string) {
@@ -593,12 +595,14 @@ export const ChatMessageMedia = memo(function ChatMessageMedia({
   message,
   copy,
   expectImage,
+  allowImageUi = true,
   sessionDir,
   onRedraw,
 }: {
   message: ChatMessage;
   copy: Copy;
   expectImage?: boolean;
+  allowImageUi?: boolean;
   sessionDir?: string;
   onRedraw?: () => void;
 }) {
@@ -610,9 +614,10 @@ export const ChatMessageMedia = memo(function ChatMessageMedia({
       item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
     ),
   ).filter(isShowableImage);
-  let pending = (message.events || []).filter(isImageGenActive).length;
-  if (expectImage && !images.length && message.streaming) pending = Math.max(pending, 1);
-  const rawFail = imageGenFailure(message);
+  const imageEvents = allowImageUi ? message.events || [] : [];
+  let pending = imageEvents.filter(isImageGenActive).length;
+  if (expectImage && allowImageUi && !images.length && message.streaming) pending = Math.max(pending, 1);
+  const rawFail = allowImageUi ? imageGenFailure(message) : "";
   const failText = rawFail ? friendlyImageError(rawFail, copy) : "";
   const failed = Boolean(!images.length && !message.streaming && rawFail);
   const placeholders = Math.max(0, pending - images.length);

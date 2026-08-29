@@ -1,4 +1,5 @@
 import {
+  Fragment,
   lazy,
   Suspense,
   useCallback,
@@ -77,6 +78,13 @@ import { SettingsView } from "./SettingsView";
 import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
 import type { RunJob } from "./launch";
 import { isCommandEvent, isImageGenEvent, isRedundantExtension, jsonText } from "./timeline";
+import {
+  allSlashItems,
+  filterSlashItems,
+  parseSlashInput,
+  slashQuery,
+  wrapSkillPrompt,
+} from "./slash";
 import {
   canonicalModelId,
   defaultSettings,
@@ -348,6 +356,12 @@ function sealAssistantMessage(message: ChatMessage, options?: { error?: string; 
       if (event.kind === "thought" && thoughtOut) {
         next = { ...event, output: thoughtOut };
       }
+      if (!cancelled && err && isImageGenEvent(next)) {
+        const status = String(next.status || "").toLowerCase();
+        if (!status || /pending|in_progress|running|started/.test(status)) {
+          return { ...next, status: "failed", output: next.output || err };
+        }
+      }
       if (!cancelled) return next;
       const status = String(next.status || "").toLowerCase();
       if (!status || /complete|success|approved|fail|error|cancel/.test(status)) return next;
@@ -364,6 +378,17 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function lastUserMessageText(messages: ChatMessage[] | undefined) {
+  return [...(messages || [])].reverse().find((item) => item.role === "user")?.text || "";
+}
+
+function pickPermissionChoice(options: Array<Record<string, unknown>> | undefined, reject: boolean) {
+  return (options || []).find((option) => {
+    const hay = `${option.optionId || option.option_id || option.id || ""} ${option.kind || ""} ${option.name || ""}`;
+    return reject ? /reject|deny|cancel/i.test(hay) : /allow|accept|approve/i.test(hay);
+  });
 }
 
 function firstString(...values: unknown[]): string {
@@ -900,6 +925,7 @@ type QueuedPrompt = {
   messageId: string;
   conversationId: string;
   text: string;
+  displayText?: string;
   attachments: PromptAttachment[];
 };
 
@@ -1110,6 +1136,11 @@ function relPath(cwd: string, raw: string) {
 
 async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | null) {
   let next = text.trim();
+  const askedImage = wantsImageGen(text);
+  if (!askedImage) {
+    next +=
+      "\n\n<tool_policy>用户没有要求生成图片。不要调用 ImageGen、Imagine 或 grok-imagine-image。用读文件和改代码回答。</tool_policy>";
+  }
   if (!cwd) return next;
   const mentions = [...text.matchAll(/(?:^|[\s])@([^\s@]+)/g)].map((item) => item[1]);
   const seen = new Set<string>();
@@ -1139,7 +1170,7 @@ async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | n
   }
   try {
     const rules = await invoke<{ path: string; content: string } | null>("read_project_rules", { root: cwd, ssh: ssh || null });
-  if (rules?.content.trim() && !wantsImageGen(text)) {
+  if (rules?.content.trim() && !askedImage) {
         next += `\n\n<project_rules path="${rules.path}">\n${rules.content.slice(0, 20_000)}\n</project_rules>`;
       }
   } catch {
@@ -1259,8 +1290,15 @@ export default function App() {
   const [refreshingQuota, setRefreshingQuota] = useState(false);
   const [loginLog, setLoginLog] = useState("");
   const [skills, setSkills] = useState<SkillRecord[]>([]);
+  const [skillDirs, setSkillDirs] = useState<{ userDir: string; projectDir?: string | null; serverDir: string }>({
+    userDir: "",
+    projectDir: null,
+    serverDir: "",
+  });
   const [skillsQuery, setSkillsQuery] = useState("");
   const [selectedSkill, setSelectedSkill] = useState<SkillRecord | null>(null);
+  const [slash, setSlash] = useState<{ query: string; index: number; skillsOnly: boolean } | null>(null);
+  const [activeSkill, setActiveSkill] = useState<SkillRecord | null>(null);
   const [usage, setUsage] = useState<ContextUsage>({
     usedTokens: 0,
     totalTokens: migrateSettings(saved.settings).contextWindowTokens,
@@ -1324,6 +1362,12 @@ export default function App() {
   const turnUserIdRef = useRef<Record<string, string>>({});
   const mentionRef = useRef(mention);
   mentionRef.current = mention;
+  const slashRef = useRef(slash);
+  slashRef.current = slash;
+  const skillsRef = useRef(skills);
+  skillsRef.current = skills;
+  const activeSkillRef = useRef(activeSkill);
+  activeSkillRef.current = activeSkill;
   const imeRef = useRef({ composing: false, until: 0 });
   const transcriptActionsRef = useRef<TranscriptRowActions>(null!);
   const newChatRef = useRef(() => {});
@@ -1333,7 +1377,7 @@ export default function App() {
   const sendTextRef = useRef<(
     text: string,
     extraAttachments?: PromptAttachment[],
-    options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean },
+    options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean; displayText?: string },
   ) => Promise<void>>(async () => {});
   const shownCountRef = useRef(VIEW_PAGE);
   const showTerminalRef = useRef(showTerminal);
@@ -1424,6 +1468,15 @@ export default function App() {
     if (assistant) return agentOrbForMessage(assistant, t);
     return { state: "working" as const, label: statusText || t.running };
   }, [liveImageBusy, running, statusText, t, visibleMessages]);
+  const slashDetected = useMemo(() => slashQuery(prompt), [prompt]);
+  const slashMenuItems = useMemo(() => {
+    if (!slashDetected && !slash?.skillsOnly) return [];
+    return filterSlashItems(
+      allSlashItems(t, skills),
+      slashDetected?.query ?? slash?.query ?? "",
+      Boolean(slash?.skillsOnly),
+    ).slice(0, 16);
+  }, [slashDetected, slash, t, skills]);
   const homeDir = status?.homeDir || "";
   const sessionCwd = selected?.cwd || cwd;
   const activeSsh = selected?.ssh || (isSshWorkspace(sessionCwd) ? parseSshWorkspace(sessionCwd) : null);
@@ -1432,7 +1485,7 @@ export default function App() {
   activeSshRef.current = activeSsh;
   const keys = resolvedBindings(settings.keybindings);
   const projectName = activeSsh ? sshLabel(activeSsh, workspaceRoot) : workspaceLabel(sessionCwd, homeDir, t.home);
-  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0) && !installing;
+  const canSend = (prompt.trim().length > 0 || pendingImages.length > 0 || Boolean(activeSkill)) && !installing;
   const relayConfigured = Boolean(relayQuota?.configured || relayReady);
   const routed = relayConfigured ? undefined : pickRoutedAccount(accounts, settings);
   const activeAccount = relayConfigured
@@ -1692,7 +1745,9 @@ export default function App() {
 
   const setPermissionMode = useCallback(
     (mode: string) => {
-      patchSettings({ permissionMode: mode });
+      const next = normalizePermissionMode(mode);
+      settingsRef.current = { ...settingsRef.current, permissionMode: next };
+      patchSettings({ permissionMode: next });
     },
     [patchSettings],
   );
@@ -1944,6 +1999,7 @@ export default function App() {
         fromQueue: true,
         conversationId: next.conversationId,
         messageId: next.messageId,
+        displayText: next.displayText,
       });
     }, 40);
   }, [flushPendingStream]);
@@ -2145,17 +2201,22 @@ export default function App() {
             input,
             output,
           });
+          const askedImage = wantsImageGen(
+            lastUserMessageText(conversationsRef.current.find((item) => item.id === targetId)?.messages),
+          );
           const fileName = editPath.split("/").filter(Boolean).pop() || "";
           const title = imageLike ? copy.imageGenTool : isAsk ? (rawTitle.startsWith("Ask") ? rawTitle : `Ask: ${rawTitle}`) : isEdit ? (fileName ? `Edit ${fileName}` : "Edit") : rawTitle;
-          assistant.events = upsertEvent(assistant.events, {
-            id: `tool-${id}`,
-            kind: imageLike ? "image_gen" : isAsk ? "question" : isEdit ? "edit" : kind,
-            title,
-            status: String(update.status || "pending"),
-            input: isAsk ? jsonText({ questions: askQuestions }) : input,
-            output,
-            diffs: diffs.length ? diffs : undefined,
-          });
+          if (!(imageLike && !askedImage)) {
+            assistant.events = upsertEvent(assistant.events, {
+              id: `tool-${id}`,
+              kind: imageLike ? "image_gen" : isAsk ? "question" : isEdit ? "edit" : kind,
+              title,
+              status: String(update.status || "pending"),
+              input: isAsk ? jsonText({ questions: askQuestions }) : input,
+              output,
+              diffs: diffs.length ? diffs : undefined,
+            });
+          }
           assistant.media = mergeMessageMedia(
             assistant.media,
             extractMessageMedia(
@@ -2347,12 +2408,9 @@ export default function App() {
     const tool = asRecord(params.toolCall) || asRecord(params.tool_call) || {};
     const command = extractShellCommand(asRecord(tool.rawInput) || asRecord(tool.raw_input) || asRecord(tool.input), jsonText(tool));
     const probeText = `${tool.title || ""} ${command} ${jsonText(tool.rawInput ?? tool.raw_input ?? tool.input ?? tool)}`;
+    const optionsRaw = (params.options as Array<Record<string, unknown>>) || [];
     if (isGeneratedImageProbe(probeText)) {
-      const reject = ((params.options as Array<Record<string, unknown>>) || []).find((option) =>
-        /reject|deny|cancel/i.test(
-          `${option.optionId || option.option_id || option.id || ""} ${option.kind || ""} ${option.name || ""}`,
-        ),
-      );
+      const reject = pickPermissionChoice(optionsRaw, true);
       void invoke("answer_interaction", {
         requestId: payload.requestId,
         result: reject
@@ -2362,7 +2420,29 @@ export default function App() {
       }).catch(() => undefined);
       return;
     }
-    const options = ((params.options as Array<Record<string, unknown>>) || []).map((option) => ({
+    const imageTool = isImageGenEvent({
+      id: `perm-${payload.requestId}`,
+      kind: String(tool.kind || tool.name || ""),
+      title: String(tool.title || tool.name || ""),
+      input: command,
+    });
+    if (imageTool) {
+      const asked = wantsImageGen(
+        lastUserMessageText(
+          conversationsRef.current.find((item) => item.id === (payload.conversationId || selectedIdRef.current))?.messages,
+        ),
+      );
+      const choice = pickPermissionChoice(optionsRaw, !asked);
+      void invoke("answer_interaction", {
+        requestId: payload.requestId,
+        result: choice
+          ? { outcome: { outcome: "selected", optionId: String(choice.optionId || choice.option_id || choice.id) } }
+          : { outcome: { outcome: "cancelled" } },
+        conversationId: payload.conversationId,
+      }).catch(() => undefined);
+      return;
+    }
+    const options = optionsRaw.map((option) => ({
       id: String(option.optionId || option.option_id || option.id || ""),
       name: String(option.name || copy.allow),
       kind: String(option.kind || ""),
@@ -2675,13 +2755,22 @@ export default function App() {
   addPendingImagesRef.current = addPendingImages;
 
   const refreshSkills = useCallback(async () => {
+    const localCwd = isSshWorkspace(cwdRef.current) ? null : cwdRef.current || null;
     try {
-      const next = await invoke<SkillRecord[]>("list_skills", { cwd: cwdRef.current || null });
+      const [next, dirs] = await Promise.all([
+        invoke<SkillRecord[]>("list_skills", { cwd: localCwd }),
+        invoke<{ userDir: string; projectDir?: string | null; serverDir: string }>("list_skill_dirs", { cwd: localCwd }),
+      ]);
       setSkills(next);
+      setSkillDirs(dirs);
     } catch {
       setSkills([]);
     }
   }, []);
+
+  useEffect(() => {
+    void refreshSkills();
+  }, [cwd, refreshSkills]);
 
   const refreshQuotas = useCallback(async () => {
     setRefreshingQuota(true);
@@ -3245,11 +3334,17 @@ export default function App() {
   async function sendText(
     text: string,
     extraAttachments?: PromptAttachment[],
-    options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean },
+    options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean; displayText?: string },
   ) {
     const conversation = conversationsRef.current.find((item) => item.id === (options?.conversationId || selectedIdRef.current));
     const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
-    if ((!text.trim() && !attachments.length) || !conversation) return;
+    const outbound = text.trim();
+    if ((!outbound && !attachments.length) || !conversation) return;
+    const existingQueued = options?.messageId
+      ? conversation.messages.find((item) => item.id === options.messageId)
+      : undefined;
+    const visible =
+      (options?.displayText || (options?.fromQueue ? existingQueued?.text : "") || outbound).trim() || outbound;
     if (liveTurnsRef.current.has(conversation.id) && !options?.fromQueue) {
       if (options?.interrupt) {
         promptQueueRef.current = promptQueueRef.current.filter((item) => item.conversationId !== conversation.id);
@@ -3290,7 +3385,7 @@ export default function App() {
         const queuedUser: ChatMessage = {
           id: uid(),
           role: "user",
-          text: text.trim(),
+          text: visible,
           thought: "",
           events: [],
           media: attachments.map(mediaFromAttachment),
@@ -3303,7 +3398,8 @@ export default function App() {
           id: uid(),
           messageId: queuedUser.id,
           conversationId: conversation.id,
-          text: text.trim(),
+          text: outbound,
+          displayText: visible,
           attachments,
         };
         promptQueueRef.current = [...promptQueueRef.current, queued];
@@ -3372,17 +3468,15 @@ export default function App() {
     setShowJumpToBottom(false);
     const title =
       conversation.title === translate("zh").newChat || conversation.title === translate("zh-Hant").newChat || conversation.title === translate("en").newChat
-        ? (text.trim() || attachments[0]?.name || t.newChat).slice(0, 28)
+        ? (visible || attachments[0]?.name || t.newChat).slice(0, 28)
         : conversation.title;
-    const existingUser = options?.messageId
-      ? conversation.messages.find((item) => item.id === options.messageId)
-      : undefined;
+    const existingUser = existingQueued;
     const user: ChatMessage = existingUser
-      ? { ...existingUser, text: text.trim(), media: attachments.map(mediaFromAttachment), queued: false, streaming: false, local: true, conversationId: conversation.id }
+      ? { ...existingUser, text: visible, media: attachments.map(mediaFromAttachment), queued: false, streaming: false, local: true, conversationId: conversation.id }
       : {
           id: uid(),
           role: "user",
-          text: text.trim(),
+          text: visible,
           thought: "",
           events: [],
           media: attachments.map(mediaFromAttachment),
@@ -3425,7 +3519,7 @@ export default function App() {
       void Notification.requestPermission().catch(() => undefined);
     }
     try {
-      if (isDirectImagePrompt(text.trim(), attachments.length > 0)) {
+      if (isDirectImagePrompt(visible, attachments.length > 0)) {
         if (conversation.id === selectedIdRef.current) setStatusText(t.generatingImage);
         setConversations((list) => {
           const next = list.map((item) => {
@@ -3453,7 +3547,7 @@ export default function App() {
           conversationsRef.current = next;
           return next;
         });
-        await completeDirectImageGen(conversation.id, text.trim(), assistant.id, turnId);
+        await completeDirectImageGen(conversation.id, visible, assistant.id, turnId);
         return;
       }
       const workspaceCwd = sshTarget ? sshWorkspaceId(sshTarget) : conversation.cwd || cwdRef.current;
@@ -3461,7 +3555,7 @@ export default function App() {
       const checkpointPromise = promptCwd
         ? invoke<SnapshotFile[]>("capture_checkpoint", { root: promptCwd, ssh: sshTarget || null }).catch(() => [])
         : Promise.resolve([] as SnapshotFile[]);
-      const expanded = await expandPromptContext(text.trim(), promptCwd, sshTarget || null);
+      const expanded = await expandPromptContext(outbound, promptCwd, sshTarget || null);
       const session = await invoke<SessionInfo>("ensure_session", {
         options: {
           model: canonicalModelId(modelRef.current),
@@ -3528,6 +3622,34 @@ export default function App() {
   }
 
   async function send() {
+    const parsed = parseSlashInput(prompt, skillsRef.current);
+    if (parsed?.kind === "mode" && parsed.mode) {
+      setPermissionMode(parsed.mode);
+      setPrompt("");
+      setSlash(null);
+      if (parsed.rest || pendingImagesRef.current.length) await sendText(parsed.rest);
+      return;
+    }
+    if (parsed?.kind === "skills") {
+      setPrompt(parsed.rest ? `/${parsed.rest}` : "/");
+      setSlash({ query: parsed.rest, index: 0, skillsOnly: true });
+      return;
+    }
+    if (prompt.trim() === "/") {
+      setSlash({ query: "", index: 0, skillsOnly: false });
+      return;
+    }
+    const skill = parsed?.kind === "skill" ? parsed.skill : activeSkillRef.current;
+    const task = parsed?.kind === "skill" ? parsed.rest : prompt;
+    if (skill) {
+      const display =
+        parsed?.kind === "skill" ? `/${skill.name}${parsed.rest ? ` ${parsed.rest}` : ""}` : prompt.trim() || `/${skill.name}`;
+      setActiveSkill(null);
+      setSlash(null);
+      await sendText(wrapSkillPrompt(skill, task), undefined, { displayText: display });
+      return;
+    }
+    setSlash(null);
     await sendText(prompt);
   }
 
@@ -3641,6 +3763,34 @@ export default function App() {
     await sendText(lastUser.text, extras);
   }
 
+  function applySlashItem(item: ReturnType<typeof allSlashItems>[number], rest = "") {
+    setSlash(null);
+    if (item.kind === "mode" && item.mode) {
+      setPermissionMode(item.mode);
+      const next = rest.trim();
+      setPrompt(next);
+      if (next || pendingImagesRef.current.length) void sendText(next);
+      return;
+    }
+    if (item.kind === "skills") {
+      setPrompt("/");
+      setSlash({ query: "", index: 0, skillsOnly: true });
+      return;
+    }
+    if (item.kind === "skill" && item.skill) {
+      const task = rest.trim();
+      setPrompt(task);
+      if (task || pendingImagesRef.current.length) {
+        void sendText(wrapSkillPrompt(item.skill, task), undefined, {
+          displayText: `/${item.skill.name}${task ? ` ${task}` : ""}`,
+        });
+        setActiveSkill(null);
+      } else {
+        setActiveSkill(item.skill);
+      }
+    }
+  }
+
   function isImeBlocked(event: { nativeEvent?: globalThis.KeyboardEvent } & { isComposing?: boolean; keyCode?: number; key?: string }) {
     const native = event.nativeEvent || (event as globalThis.KeyboardEvent);
     if (isImeEvent(native)) return true;
@@ -3650,6 +3800,44 @@ export default function App() {
   }
   function onComposerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (isImeBlocked(event)) return;
+    const detected = slashQuery(event.currentTarget.value, event.currentTarget.selectionStart || 0);
+    const slashMenu = slashRef.current || (detected ? { query: detected.query, index: 0, skillsOnly: false } : null);
+    if (slashMenu && (detected || slashMenu.skillsOnly)) {
+      const items = filterSlashItems(
+        allSlashItems(tRef.current, skillsRef.current),
+        detected?.query ?? slashMenu.query,
+        slashMenu.skillsOnly,
+      );
+      const ensure = (index: number) =>
+        setSlash((current) => ({
+          query: detected?.query ?? current?.query ?? "",
+          skillsOnly: Boolean(current?.skillsOnly),
+          index,
+        }));
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        ensure(Math.min(Math.max(items.length - 1, 0), (slashMenu.index || 0) + 1));
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        ensure(Math.max(0, (slashMenu.index || 0) - 1));
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        const item = items[slashMenu.index] || items[0];
+        if (item) {
+          event.preventDefault();
+          applySlashItem(item);
+          return;
+        }
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSlash(null);
+        return;
+      }
+    }
     const menu = mentionRef.current;
     if (menu) {
       if (event.key === "ArrowDown") {
@@ -4304,6 +4492,24 @@ export default function App() {
         skillsQuery={skillsQuery}
         setSkillsQuery={setSkillsQuery}
         onRefreshSkills={() => void refreshSkills()}
+        skillDirs={skillDirs}
+        onOpenSkillsDir={(kind) => {
+          const localCwd = isSshWorkspace(cwdRef.current) ? null : cwdRef.current || null;
+          void invoke<string>("open_skills_dir", { kind, cwd: localCwd })
+            .then(() => refreshSkills())
+            .catch((error) => setStatusText(localizeThrown(error, t)));
+        }}
+        onRevealSkill={(path) => {
+          if (!path) return;
+          void invoke("reveal_in_folder", { path }).catch((error) => setStatusText(localizeThrown(error, t)));
+        }}
+        onUseSkill={(skill) => {
+          setSelectedSkill(null);
+          setActiveSkill(skill);
+          setPrompt("");
+          setView("chat");
+          requestAnimationFrame(() => composerRef.current?.focus());
+        }}
         selectedSkill={selectedSkill}
         setSelectedSkill={setSelectedSkill}
         archived={conversations.filter((item) => item.archivedAt).map((item) => ({ id: item.id, title: item.title, cwd: item.cwd }))}
@@ -5006,7 +5212,55 @@ export default function App() {
                 ))}
               </div>
             ) : null}
+            {activeSkill ? (
+              <div className="slash-chip-row">
+                <span className="slash-chip" title={t.usingSkill}>
+                  /{activeSkill.name}
+                  <button type="button" title={t.cancel} onClick={() => setActiveSkill(null)}>
+                    <IconClose />
+                  </button>
+                </span>
+                <em>{t.usingSkill}</em>
+              </div>
+            ) : null}
             <div className="composer-input-wrap">
+              {slashMenuItems.length || slash?.skillsOnly ? (
+                <div className="mention-menu slash-menu" role="listbox" aria-label={t.slashCommands}>
+                  <div className="slash-menu-head">
+                    <strong>{t.slashCommands}</strong>
+                    <span>{t.slashMenuHint}</span>
+                  </div>
+                  {slashMenuItems.map((item, index) => {
+                    const prev = slashMenuItems[index - 1];
+                    const section =
+                      index === 0 && item.kind !== "skill"
+                        ? t.slashMenuModes
+                        : item.kind === "skill" && prev?.kind !== "skill"
+                          ? t.slashMenuSkills
+                          : "";
+                    return (
+                      <Fragment key={item.id}>
+                        {section ? <div className="slash-menu-label">{section}</div> : null}
+                        <button
+                          type="button"
+                          className={index === (slash?.index || 0) ? "on" : ""}
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            applySlashItem(item);
+                          }}
+                        >
+                          <kbd>/{item.command}</kbd>
+                          <span className="slash-menu-copy">
+                            <strong>{item.title}</strong>
+                            <em>{item.hint}</em>
+                          </span>
+                        </button>
+                      </Fragment>
+                    );
+                  })}
+                  {slashMenuItems.length ? null : <div className="slash-empty">{t.skillsEmpty}</div>}
+                </div>
+              ) : null}
               {mention?.items.length ? (
                 <div className="mention-menu" role="listbox" aria-label={t.mentionFiles}>
                   {mention.items.map((item, index) => (
@@ -5033,8 +5287,18 @@ export default function App() {
                 onChange={(event) => {
                   const value = event.target.value;
                   setPrompt(value);
-                  const found = mentionQuery(value, event.target.selectionStart || 0);
+                  const cursor = event.target.selectionStart || 0;
+                  const found = mentionQuery(value, cursor);
                   setMention(found ? { start: found.start, query: found.query, items: mentionRef.current?.query === found.query ? mentionRef.current.items : [], index: 0 } : null);
+                  const nextSlash = slashQuery(value, cursor);
+                  setSlash((current) => {
+                    if (!nextSlash) return null;
+                    return {
+                      query: nextSlash.query,
+                      index: current?.query === nextSlash.query ? current.index : 0,
+                      skillsOnly: Boolean(current?.skillsOnly),
+                    };
+                  });
                   requestAnimationFrame(resizeComposer);
                 }}
                 onClick={(event) => {

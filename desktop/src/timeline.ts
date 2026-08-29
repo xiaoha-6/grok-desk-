@@ -128,10 +128,10 @@ export function categoryFor(event: TimelineEvent): ActivityCategory {
 }
 
 export function isImageGenEvent(event: TimelineEvent) {
-  const haystack = `${event.kind} ${event.title} ${event.input || ""} ${event.output || ""}`.toLowerCase();
-  return /imagine|image[_-]?gen|imagegen|variant["']?\s*:\s*["']?imagegen|generate[- ]?image|文生图|生成图片|生成圖片/.test(
-    haystack,
-  );
+  // Kind/title only. Scanning output matched any 503 that mentioned grok-imagine-image.
+  const haystack = `${event.kind} ${event.title}`.toLowerCase();
+  if (/image[_-]?gen|imagegen|generate[- ]?image|文生图|文生圖|生成图片|生成圖片/.test(haystack)) return true;
+  return /\bimagine\b/.test(haystack) && !haystack.includes("images/");
 }
 
 export function visibleEvents(events: TimelineEvent[]) {

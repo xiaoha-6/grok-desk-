@@ -1454,12 +1454,44 @@ pub fn session_update_from(params: &Value) -> Option<Value> {
     None
 }
 
+fn is_image_gen_label(label: &str) -> bool {
+    let h = label.trim().to_ascii_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    h == "imagine"
+        || h.starts_with("imagine ")
+        || h.contains("image_gen")
+        || h.contains("imagegen")
+        || h.contains("generate image")
+        || h.contains("生成图片")
+        || h.contains("生成圖片")
+        || h.contains("文生图")
+        || h.contains("文生圖")
+        || h.contains("grok-imagine")
+}
+
+fn is_image_gen_tool_params(params: &Value) -> bool {
+    let Some(tool) = tool_call_from_params(params) else {
+        return false;
+    };
+    let kind = tool.get("kind").and_then(Value::as_str).unwrap_or("");
+    let title = tool.get("title").and_then(Value::as_str).unwrap_or("");
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+    is_image_gen_label(kind) || is_image_gen_label(title) || is_image_gen_label(name)
+}
+
 fn should_auto_allow(permission_mode: &str, params: &Value) -> bool {
     // Ask 本身是只读交互工具：权限必须先放行，工具才会通过
     // `x.ai/ask_user_question` 把选择题发给桌面。卡住权限的话，
     // 界面只会看到 JSON，模型也会自己猜答案。
     if is_ask_payload(params) {
         return true;
+    }
+    // ImageGen 即使在 bypass 也不自动放行：模型常把“检查插件”误当成出图，
+    // 桌面按用户原话决定允许或拒绝，避免一提问就打 grok-imagine-image。
+    if is_image_gen_tool_params(params) {
+        return false;
     }
     match permission_mode {
         "bypassPermissions" | "auto" => true,
@@ -1743,6 +1775,38 @@ mod tests {
         assert!(should_auto_allow("bypassPermissions", &ask));
         assert!(should_auto_allow("default", &ask));
         assert!(is_ask_payload(&ask));
+        let imagine = json!({
+            "toolCall": {
+                "kind": "other",
+                "title": "Generate Image",
+                "rawInput": { "prompt": "a cat" }
+            }
+        });
+        assert!(is_image_gen_tool_params(&imagine));
+        assert!(!should_auto_allow("bypassPermissions", &imagine));
+        assert!(!should_auto_allow("auto", &imagine));
+        let read_image = json!({
+            "toolCall": {
+                "kind": "read",
+                "title": "Read file",
+                "rawInput": { "path": "html/images/icon.png" }
+            }
+        });
+        assert!(!is_image_gen_tool_params(&read_image));
+        assert!(should_auto_allow("bypassPermissions", &read_image));
+        let reimagine = json!({
+            "toolCall": {
+                "kind": "edit",
+                "title": "Edit reimagine.lua"
+            }
+        });
+        assert!(!is_image_gen_tool_params(&reimagine));
+        assert!(should_auto_allow("bypassPermissions", &reimagine));
+        let imagine_named = json!({
+            "toolCall": { "kind": "other", "title": "Imagine" }
+        });
+        assert!(is_image_gen_tool_params(&imagine_named));
+        assert!(!should_auto_allow("bypassPermissions", &imagine_named));
     }
 
     #[test]

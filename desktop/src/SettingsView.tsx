@@ -6,6 +6,7 @@ import {
   IconBox,
   IconChat,
   IconChevronLeft,
+  IconFolder,
   IconGear,
   IconInfinity,
   IconKeyboard,
@@ -18,7 +19,7 @@ import {
   IconTerminal,
 } from "./icons";
 import { KeybindingsEditor } from "./KeybindingsEditor";
-import type { Copy } from "./i18n";
+import { fill, type Copy } from "./i18n";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
 import {
@@ -244,6 +245,10 @@ export function SettingsView(props: {
   skillsQuery: string;
   setSkillsQuery: (value: string) => void;
   onRefreshSkills: () => void;
+  skillDirs: { userDir: string; projectDir?: string | null; serverDir: string };
+  onOpenSkillsDir: (kind: "user" | "project") => void;
+  onRevealSkill: (path: string) => void;
+  onUseSkill: (skill: SkillRecord) => void;
   selectedSkill: SkillRecord | null;
   setSelectedSkill: (skill: SkillRecord | null) => void;
   archived: { id: string; title: string; cwd: string }[];
@@ -670,15 +675,45 @@ export function SettingsView(props: {
               <div className="skills-head">
                 <p className="lede">{copy.skillsHint}</p>
                 <button className="ghost" type="button" onClick={props.onRefreshSkills}>
-                  {copy.refresh}
+                  {copy.detectSkills}
                 </button>
               </div>
-              <input
-                className="settings-search skills-search"
-                value={props.skillsQuery}
-                placeholder={copy.searchSkills}
-                onChange={(event) => props.setSkillsQuery(event.target.value)}
-              />
+              <div className="skill-dirs">
+                <div className="skill-dir-row">
+                  <div>
+                    <div className="row-title">{copy.skillsUserPath}</div>
+                    <div className="row-detail">{props.skillDirs.userDir}</div>
+                  </div>
+                  <button className="ghost compact nowrap" type="button" onClick={() => props.onOpenSkillsDir("user")}>
+                    <IconFolder />
+                    {copy.openUserSkills}
+                  </button>
+                </div>
+                <div className="skill-dir-row">
+                  <div>
+                    <div className="row-title">{copy.skillsProjectPath}</div>
+                    <div className="row-detail">{props.skillDirs.projectDir || copy.skillsNeedWorkspace}</div>
+                  </div>
+                  <button
+                    className="ghost compact nowrap"
+                    type="button"
+                    disabled={!props.skillDirs.projectDir}
+                    onClick={() => props.onOpenSkillsDir("project")}
+                  >
+                    <IconFolder />
+                    {copy.openProjectSkills}
+                  </button>
+                </div>
+              </div>
+              <div className="skills-toolbar">
+                <input
+                  className="settings-search skills-search"
+                  value={props.skillsQuery}
+                  placeholder={copy.searchSkills}
+                  onChange={(event) => props.setSkillsQuery(event.target.value)}
+                />
+                <span className="muted">{fill(copy.skillsInstalledCount, { n: filteredSkills.length })}</span>
+              </div>
               {filteredSkills.length === 0 ? (
                 <p className="hint left">{copy.skillsEmpty}</p>
               ) : (
@@ -698,6 +733,7 @@ export function SettingsView(props: {
                           {skill.displayName || skill.name}
                           <em>{skill.scope}</em>
                         </span>
+                        <span className="skill-cmd">/{skill.name}</span>
                         <span className="skill-desc">{skill.shortDescription || skill.description}</span>
                       </span>
                       <span className={skill.enabled ? "dot on" : "dot"} />
@@ -883,10 +919,34 @@ export function SettingsView(props: {
               <span className="muted">/{props.selectedSkill.name}</span>
             </h3>
             <p>{props.selectedSkill.description}</p>
+            <p className="hint left">{props.selectedSkill.path}</p>
             <pre className="log skill-body">{props.selectedSkill.content}</pre>
             <div className="actions">
+              <button className="ghost" type="button" onClick={() => props.onRevealSkill(props.selectedSkill?.path || "")}>
+                {copy.revealSkill}
+              </button>
+              <button
+                className="ghost"
+                type="button"
+                onClick={() => {
+                  const name = `/${props.selectedSkill?.name || ""} `;
+                  void navigator.clipboard?.writeText(name).catch(() => undefined);
+                }}
+              >
+                {copy.copySlash}
+              </button>
+              <span className="grow" />
               <button className="ghost" type="button" onClick={() => props.setSelectedSkill(null)}>
                 {copy.cancel}
+              </button>
+              <button
+                className="primary"
+                type="button"
+                onClick={() => {
+                  if (props.selectedSkill) props.onUseSkill(props.selectedSkill);
+                }}
+              >
+                {fill(copy.useSkill, { name: props.selectedSkill.name })}
               </button>
             </div>
           </div>

@@ -169,17 +169,13 @@ fn event_has_image_path(event: &LocalTimelineEvent) -> bool {
 }
 
 fn is_image_gen_event(event: &LocalTimelineEvent) -> bool {
-    let hay = format!(
-        "{} {} {}",
-        event.kind,
-        event.title,
-        event.input.as_deref().unwrap_or("")
-    )
-    .to_ascii_lowercase();
+    let hay = format!("{} {}", event.kind, event.title).to_ascii_lowercase();
     hay.contains("image_gen")
-        || hay.contains("imagine")
         || hay.contains("imagegen")
         || hay.contains("generate image")
+        || hay == "imagine"
+        || hay.starts_with("imagine ")
+        || hay.contains(" grok-imagine")
 }
 
 fn attach_session_images(dir: &Path, messages: &mut [LocalSessionMessage]) {

@@ -556,12 +556,58 @@ fn find_number(value: &Value, keys: &[&str]) -> Option<f64> {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDirs {
+    pub user_dir: String,
+    pub project_dir: Option<String>,
+    pub server_dir: String,
+}
+
+fn is_local_cwd(cwd: &str) -> bool {
+    let value = cwd.trim();
+    !value.is_empty() && !value.starts_with("ssh://") && !value.starts_with("SSH://")
+}
+
+pub fn skill_dirs(cwd: Option<String>) -> SkillDirs {
+    let home = grok_home();
+    let project_dir = cwd
+        .as_deref()
+        .filter(|value| is_local_cwd(value))
+        .map(|value| {
+            PathBuf::from(value)
+                .join(".grok")
+                .join("skills")
+                .display()
+                .to_string()
+        });
+    SkillDirs {
+        user_dir: home.join("skills").display().to_string(),
+        project_dir,
+        server_dir: home.join("server-skills").display().to_string(),
+    }
+}
+
+pub fn ensure_skill_dir(kind: &str, cwd: Option<String>) -> Result<PathBuf, String> {
+    let dirs = skill_dirs(cwd);
+    let path = match kind {
+        "project" => PathBuf::from(
+            dirs.project_dir
+                .ok_or_else(|| "当前没有本地工作区，无法打开项目 Skills 目录".to_string())?,
+        ),
+        "server" => PathBuf::from(dirs.server_dir),
+        _ => PathBuf::from(dirs.user_dir),
+    };
+    fs::create_dir_all(&path).map_err(|err| format!("无法创建 Skills 目录：{err}"))?;
+    Ok(path)
+}
+
 pub fn discover_skills(cwd: Option<String>) -> Vec<SkillRecord> {
     let mut roots: Vec<(PathBuf, &str)> = Vec::new();
     let home = grok_home();
     roots.push((home.join("skills"), "user"));
     roots.push((home.join("server-skills"), "server"));
-    if let Some(cwd) = cwd {
+    if let Some(cwd) = cwd.filter(|value| is_local_cwd(value)) {
         let mut cursor = PathBuf::from(cwd);
         let mut first = true;
         loop {
@@ -712,5 +758,14 @@ mod tests {
         let fields = frontmatter("---\nname: demo\ndescription: Hello\n---\n# Title\nbody");
         assert_eq!(fields.get("name").map(String::as_str), Some("demo"));
         assert_eq!(first_paragraph("---\nname: demo\n---\n\nUseful skill.").as_deref(), Some("Useful skill."));
+    }
+
+    #[test]
+    fn skill_dirs_ignore_ssh_workspace() {
+        let dirs = skill_dirs(Some("ssh://root@example:22/opt/app".into()));
+        assert!(dirs.project_dir.is_none());
+        assert!(dirs.user_dir.ends_with("skills") || dirs.user_dir.contains("skills"));
+        let local = skill_dirs(Some("/tmp/demo-project".into()));
+        assert!(local.project_dir.unwrap().contains(".grok"));
     }
 }

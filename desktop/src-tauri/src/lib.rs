@@ -13,8 +13,8 @@ mod workspace;
 
 use accounts::{
     clear_login, commit_account, create_account, discover_skills, drop_uncommitted_home,
-    fetch_quota, load_state, save_accounts, start_login, AccountRecord, AccountState, LoginSlot,
-    SkillRecord,
+    ensure_skill_dir, fetch_quota, load_state, save_accounts, skill_dirs, start_login,
+    AccountRecord, AccountState, LoginSlot, SkillDirs, SkillRecord,
 };
 use acp::{AcpClient, AcpHub, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
 use config::{
@@ -34,6 +34,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_opener::OpenerExt;
 
 struct AppState {
     pending_import: Mutex<Option<RelayImport>>,
@@ -765,6 +766,32 @@ async fn list_skills(cwd: Option<String>) -> Vec<SkillRecord> {
         .unwrap_or_default()
 }
 
+#[tauri::command]
+fn list_skill_dirs(cwd: Option<String>) -> SkillDirs {
+    skill_dirs(cwd)
+}
+
+#[tauri::command]
+fn open_skills_dir(app: AppHandle, kind: String, cwd: Option<String>) -> Result<String, String> {
+    let dir = ensure_skill_dir(&kind, cwd)?;
+    let path = dir.display().to_string();
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+#[tauri::command]
+fn reveal_in_folder(app: AppHandle, path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(path.trim());
+    if !target.exists() {
+        return Err("路径不存在".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(&target)
+        .map_err(|err| err.to_string())
+}
+
 fn focus_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         focus_window(&window);
@@ -916,6 +943,9 @@ pub fn run() {
             confirm_account,
             refresh_account_quota,
             list_skills,
+            list_skill_dirs,
+            open_skills_dir,
+            reveal_in_folder,
             pty_open,
             pty_write,
             pty_resize,

@@ -1842,6 +1842,82 @@ button { background: none; }
   align-items: flex-start;
   margin-bottom: 12px;
 }
+.skill-dirs {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.skill-dir-row, .skills-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+.skill-dir-row {
+  padding: 10px 12px;
+  border: 0.7px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--input);
+}
+.skill-dir-row .row-detail {
+  font-size: 11px;
+  color: var(--text-3);
+  word-break: break-all;
+}
+.skill-dir-row button, .skills-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.skills-toolbar {
+  margin-bottom: 12px;
+}
+.skills-toolbar .skills-search {
+  flex: 1;
+}
+.skill-cmd {
+  display: block;
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.slash-chip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px 6px;
+}
+.slash-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 4px 10px;
+  border-radius: 999px;
+  background: var(--hover);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.slash-chip button {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  display: inline-flex;
+  cursor: pointer;
+  padding: 0;
+}
+.slash-chip-row em {
+  font-style: normal;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.slash-empty {
+  padding: 10px 12px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.actions .grow {
+  flex: 1;
+}
 .add-account input, .skills-search {
   flex: 1;
   border: 1px solid var(--hairline);
@@ -4101,7 +4177,62 @@ button.ws-row { padding: 4px 8px; }
   max-height: 220px;
   overflow: auto;
   padding: 6px;
-  z-index: 5;
+  z-index: 12;
+}
+.slash-menu {
+  max-height: min(360px, 46vh);
+  padding: 8px;
+}
+.slash-menu-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px 8px;
+}
+.slash-menu-head strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+.slash-menu-head span,
+.slash-menu-label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.slash-menu-label {
+  padding: 8px 8px 4px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.slash-menu button {
+  align-items: center;
+}
+.slash-menu kbd {
+  flex: 0 0 auto;
+  font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--hover);
+  color: var(--text);
+}
+.slash-menu-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+}
+.slash-menu-copy strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.slash-menu-copy em,
+.slash-menu em {
+  font-style: normal;
+  color: var(--text-3);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .mention-menu button {
   width: 100%;
