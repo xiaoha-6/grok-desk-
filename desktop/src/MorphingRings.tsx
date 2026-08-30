@@ -2,14 +2,15 @@ import { useEffect, useRef } from "react";
 
 const RMAX = 1400;
 const FOV = 34;
-const DPR_CAP = 1.5;
+const DPR_CAP = 1.25;
+const FRAME_MS = 1000 / 24;
 const TAU = Math.PI * 2;
 const GAP_PER_WIDTH = 65 / 120;
 const BAND_WIDTH_AT_50 = 120;
 const FUZZ_AT_50 = 55;
 const EDGE_GLOW_AT_50 = 38;
 const AMPLITUDE_AT_100 = 400;
-const COUNT_PER_DENSITY = 240;
+const COUNT_PER_DENSITY = 72;
 const DEPTH_FADE = 55;
 const WAVE_FREQUENCY = 4;
 const WAVE_SPEED = 1.15;
@@ -181,6 +182,7 @@ type Live = {
   hovering: boolean;
   reduced: boolean;
   hidden: boolean;
+  offscreen: boolean;
 };
 
 function parseColor(input: string): [number, number, number] {
@@ -279,7 +281,7 @@ type MorphingRingsProps = {
 
 export function MorphingRings({ className }: MorphingRingsProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const liveRef = useRef<Live>({ dark: true, hovering: false, reduced: false, hidden: false });
+  const liveRef = useRef<Live>({ dark: true, hovering: false, reduced: false, hidden: false, offscreen: false });
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -319,11 +321,11 @@ export function MorphingRings({ className }: MorphingRingsProps) {
     }
     gl.useProgram(prog);
 
-    const density = 52;
-    const ringBands = 16;
+    const density = 36;
+    const ringBands = 12;
     const ringWidth = 50;
     const softness = 50;
-    const count = Math.min(density * COUNT_PER_DENSITY, 36000);
+    const count = Math.min(density * COUNT_PER_DENSITY, 3200);
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, buildParticles(count, ringBands, ringWidth, softness), gl.STATIC_DRAW);
@@ -376,7 +378,7 @@ export function MorphingRings({ className }: MorphingRingsProps) {
     const mediaReduce = window.matchMedia("(prefers-reduced-motion: reduce)");
     const mediaColor = window.matchMedia("(prefers-color-scheme: dark)");
     const resume = () => {
-      if (disposed || raf) return;
+      if (disposed || raf || liveRef.current.hidden || liveRef.current.offscreen) return;
       last = performance.now();
       raf = requestAnimationFrame(tick);
     };
@@ -389,7 +391,11 @@ export function MorphingRings({ className }: MorphingRingsProps) {
     };
     const syncHidden = () => {
       liveRef.current.hidden = document.hidden;
-      if (!document.hidden) resume();
+      if (!document.hidden && !liveRef.current.offscreen) resume();
+    };
+    const syncVisible = (visible: boolean) => {
+      liveRef.current.offscreen = !visible;
+      if (visible && !liveRef.current.hidden) resume();
     };
 
     const host = wrap.parentElement || wrap;
@@ -420,16 +426,28 @@ export function MorphingRings({ className }: MorphingRingsProps) {
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(wrap);
+    const io = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        syncVisible(Boolean(entry?.isIntersecting && (entry.intersectionRatio || 0) > 0.02));
+      },
+      { threshold: [0, 0.02, 0.1] },
+    );
+    io.observe(wrap);
 
     const tick = (now: number) => {
       if (disposed) return;
       const live = liveRef.current;
-      if (live.hidden) {
+      if (live.hidden || live.offscreen) {
         last = now;
         raf = 0;
         return;
       }
-      const dt = live.reduced ? 0 : Math.min(0.05, (now - last) / 1000);
+      if (!live.reduced && now - last < FRAME_MS) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      const dt = live.reduced ? 0 : Math.min(0.08, (now - last) / 1000);
       last = now;
       const target = live.hovering ? hoverMul : 1;
       hoverGate += dt ? (target - hoverGate) * (1 - Math.exp(-dt * HOVER_EASE)) : 0;
@@ -475,12 +493,13 @@ export function MorphingRings({ className }: MorphingRingsProps) {
     syncReduced();
     syncTheme();
     syncHidden();
-    if (!raf) raf = requestAnimationFrame(tick);
+    resume();
 
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
       ro.disconnect();
+      io.disconnect();
       host.removeEventListener("pointerenter", onEnter);
       host.removeEventListener("pointerleave", onLeave);
       mediaReduce.removeEventListener("change", syncReduced);

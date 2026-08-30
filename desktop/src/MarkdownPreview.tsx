@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { memo, useMemo, useRef, type ReactNode } from "react";
 
 type Block =
   | { type: "h"; level: number; text: string }
@@ -10,8 +10,11 @@ type Block =
   | { type: "hr" }
   | { type: "table"; headers: string[]; rows: string[][] };
 
-export function MarkdownPreview({ text }: { text: string }) {
-  const blocks = useMemo(() => parseBlocks(text), [text]);
+type ParseCache = { committed: string; committedBlocks: Block[] };
+
+export const MarkdownPreview = memo(function MarkdownPreview({ text }: { text: string }) {
+  const cacheRef = useRef<ParseCache>({ committed: "", committedBlocks: [] });
+  const blocks = useMemo(() => parseBlocksIncremental(text, cacheRef.current), [text]);
   return (
     <div className="md-preview">
       {blocks.map((block, index) => {
@@ -89,6 +92,42 @@ export function MarkdownPreview({ text }: { text: string }) {
       })}
     </div>
   );
+});
+
+function parseBlocksIncremental(src: string, cache: ParseCache): Block[] {
+  const text = src.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const cut = lastSafeCommit(text);
+  const committed = cut > 0 ? text.slice(0, cut) : "";
+  const tail = cut > 0 ? text.slice(cut) : text;
+  if (committed !== cache.committed) {
+    if (committed.startsWith(cache.committed) && cache.committed) {
+      const extra = committed.slice(cache.committed.length);
+      cache.committedBlocks = extra.trim()
+        ? cache.committedBlocks.concat(parseBlocks(extra))
+        : cache.committedBlocks;
+    } else {
+      cache.committedBlocks = committed ? parseBlocks(committed) : [];
+    }
+    cache.committed = committed;
+  }
+  const tailBlocks = tail ? parseBlocks(tail) : [];
+  return tailBlocks.length ? cache.committedBlocks.concat(tailBlocks) : cache.committedBlocks;
+}
+
+function lastSafeCommit(text: string): number {
+  let inFence = false;
+  let last = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith("```", i) && (i === 0 || text.charCodeAt(i - 1) === 10)) {
+      inFence = !inFence;
+      i += 2;
+      continue;
+    }
+    if (!inFence && text.charCodeAt(i) === 10 && i + 1 < text.length && text.charCodeAt(i + 1) === 10) {
+      last = i + 2;
+    }
+  }
+  return last;
 }
 
 function parseBlocks(src: string): Block[] {

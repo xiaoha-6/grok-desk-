@@ -153,6 +153,28 @@ export type RelayQuota = {
   error?: string | null;
 };
 
+export type RelayUsageDay = {
+  date: string;
+  requests: number;
+  tokens: number;
+};
+
+export type RelayUsageModel = {
+  model: string;
+  requests: number;
+  tokens: number;
+};
+
+export type RelayUsage = {
+  configured: boolean;
+  totalTokens?: number | null;
+  todayTokens?: number | null;
+  todayRequests?: number | null;
+  days: RelayUsageDay[];
+  models: RelayUsageModel[];
+  error?: string | null;
+};
+
 export type CatalogModel = {
   id: string;
   name: string;
@@ -341,6 +363,13 @@ export type AcpTurnDone = {
   conversationId?: string;
 };
 
+export type AcpReconnect = {
+  attempt: number;
+  maxAttempts: number;
+  error?: string;
+  conversationId?: string;
+};
+
 export type PermissionOption = {
   id: string;
   name: string;
@@ -407,6 +436,7 @@ export type SettingsPage =
   | "general"
   | "runtime"
   | "relay"
+  | "usage"
   | "ssh"
   | "agent"
   | "compatibility"

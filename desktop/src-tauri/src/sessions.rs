@@ -723,16 +723,74 @@ fn content_text(value: &Value) -> String {
 }
 
 fn extract_user_query(text: &str) -> String {
-    if let (Some(start), Some(end_tag)) = (text.find("<user_query>"), text.find("</user_query>")) {
+    let raw = if let (Some(start), Some(end_tag)) = (text.find("<user_query>"), text.find("</user_query>")) {
         let inner_start = start + "<user_query>".len();
         if end_tag > inner_start {
-            return text[inner_start..end_tag].trim().to_string();
+            text[inner_start..end_tag].to_string()
+        } else {
+            text.to_string()
+        }
+    } else if text.contains("<system-reminder>") || text.contains("<user_info>") {
+        return String::new();
+    } else {
+        text.to_string()
+    };
+    strip_injected_prompt_context(&raw)
+}
+
+/// Drop desktop-injected wrappers so history bubbles match what the user typed.
+fn strip_injected_prompt_context(text: &str) -> String {
+    let mut out = text.to_string();
+    for tag in ["tool_policy", "file", "folder", "project_rules"] {
+        out = strip_xml_blocks(&out, tag);
+    }
+    collapse_blank_lines(&out)
+}
+
+fn strip_xml_blocks(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(&open) {
+        let after_name = &rest[start + open.len()..];
+        let is_tag = after_name.starts_with('>')
+            || after_name.starts_with(|ch: char| ch.is_ascii_whitespace());
+        if !is_tag {
+            out.push_str(&rest[..start + open.len()]);
+            rest = after_name;
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        let Some(gt) = after_name.find('>') else {
+            break;
+        };
+        let after_open = &after_name[gt + 1..];
+        if let Some(end) = after_open.find(&close) {
+            rest = &after_open[end + close.len()..];
+        } else {
+            break;
         }
     }
-    if text.contains("<system-reminder>") || text.contains("<user_info>") {
-        return String::new();
+    out.push_str(rest);
+    out
+}
+
+fn collapse_blank_lines(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut blank = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank <= 1 && !lines.is_empty() {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        blank = 0;
+        lines.push(line.trim_end().to_string());
     }
-    text.trim().to_string()
+    lines.join("\n").trim().to_string()
 }
 
 fn first_nonempty(values: &[Option<&str>]) -> Option<String> {
@@ -826,6 +884,15 @@ mod tests {
         );
         assert!(extract_user_query("<system-reminder>ignore</system-reminder>").is_empty());
         assert_eq!(extract_user_query("plain hi"), "plain hi");
+        assert_eq!(
+            extract_user_query("hi\n\n<tool_policy>不要出图</tool_policy>"),
+            "hi"
+        );
+        assert!(extract_user_query("<tool_policy>不要出图</tool_policy>").is_empty());
+        assert_eq!(
+            extract_user_query("看 @src/App.tsx\n\n<file path=\"src/App.tsx\">\ncode\n</file>"),
+            "看 @src/App.tsx"
+        );
     }
 
     #[test]
@@ -899,6 +966,26 @@ mod tests {
         assert_eq!(messages[1].text, "完整回答一");
         assert_eq!(messages[2].text, "第二句");
         assert_eq!(messages[3].text, "回答二");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_strips_injected_tool_policy_from_user_bubbles() {
+        let dir = std::env::temp_dir().join(format!("grokdesk-policy-{}", std::process::id()));
+        let path = dir.join("chat_history.jsonl");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"user","prompt_index":0,"content":[{"type":"text","text":"hi\n\n<tool_policy>用户没有要求生成图片。不要调用 ImageGen。</tool_policy>"}]}
+{"type":"assistant","content":"你好"}
+"#,
+        )
+        .unwrap();
+        let messages = reconstruct_turns(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].text, "hi");
+        assert!(!messages[0].text.contains("tool_policy"));
         let _ = fs::remove_dir_all(&dir);
     }
 

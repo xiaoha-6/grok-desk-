@@ -1,6 +1,6 @@
 [package]
 name = "grokdesk"
-version = "0.6.57"
+version = "0.6.62"
 description = "GrokDesk — desktop ACP workspace for official Grok Build"
 authors = ["xiaoha"]
 edition = "2021"

@@ -25,6 +25,8 @@ import {
   isImageProbeEvent,
   mergeMessageMedia,
   wantsImageGen,
+  wantsProjectImageAsset,
+  allowsImageGenTool,
   isDirectImagePrompt,
 } from "./ChatImage";
 import { ThinkingOrb, agentOrbForMessage } from "./components/thinking-orbs/ThinkingOrbs";
@@ -97,6 +99,7 @@ import {
   permissionModeShort,
   type AccountRecord,
   type AccountState,
+  type AcpReconnect,
   type AcpTurnDone,
   type AcpUpdate,
   type AppSettings,
@@ -120,6 +123,7 @@ import {
   type PromptAttachment,
   type RelayImport,
   type RelayQuota,
+  type RelayUsage,
   type RuntimeStatus,
   type SessionInfo,
   type SettingsPage,
@@ -351,6 +355,18 @@ function isUserCancelError(raw?: string) {
   const text = String(raw || "").trim();
   if (!text) return false;
   return /连接已取消|連線已取消|cancelled by user|session\/cancel|user cancel|canceled by the user|prompt cancelled|turn cancelled/i.test(
+    text,
+  );
+}
+
+function isTransientUpstreamError(raw?: string) {
+  const text = String(raw || "").trim();
+  if (!text) return false;
+  if (isUserCancelError(text) || isContextTooLarge(text) || isMissingCredentials(text)) return false;
+  if (/图片太大|圖片太大|weekly limit|run out of credits|status 402|额度不足|周限额|額度不足|週限額|401|unauthorized|invalid api key/i.test(text)) {
+    return false;
+  }
+  return /超时|超時|timeout|timed out|502|503|504|unavailable|overloaded|已退出|尚未连接|尚未連接|尚未就绪|尚未就緒|bad gateway|broken pipe|connection reset|connection refused|写入.*失败|寫入.*失敗|upstream|上游|internal error/i.test(
     text,
   );
 }
@@ -721,6 +737,24 @@ function isGenericTitle(title: string) {
   return !value || value === "Grok Session" || value === translate("zh").newChat || value === translate("zh-Hant").newChat || value === translate("en").newChat;
 }
 
+function stripInjectedPromptContext(text: string) {
+  return String(text || "")
+    .replace(/<(tool_policy|file|folder|project_rules)(?:\s[^>]*)?>[\s\S]*?(?:<\/\1>|$)/gi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function sanitizeConversationTitle(title: string, messages?: ChatMessage[]) {
+  const stripped = stripInjectedPromptContext(title).replace(/\s+/g, " ").trim();
+  if (stripped) return stripped;
+  const fromUser = (messages || [])
+    .filter((item) => item.role === "user")
+    .map((item) => stripInjectedPromptContext(item.text).replace(/\s+/g, " ").trim())
+    .find(Boolean);
+  return (fromUser || "Grok Session").slice(0, 48);
+}
+
 function mergeConversationMessages(left: ChatMessage[] = [], right: ChatMessage[] = []): ChatMessage[] {
   if (!left.length) return right;
   if (!right.length) return left;
@@ -837,20 +871,22 @@ function keepBetter(map: Map<string, Conversation>, key: string, item: Conversat
 function hydrateConversation(item: Conversation): Conversation {
   const cwd = item.cwd || "";
   const ssh = item.ssh?.host ? item.ssh : isSshWorkspace(cwd) ? parseSshWorkspace(cwd) : null;
+  const messages = (item.messages || []).map((message) => ({
+    ...message,
+    text: stripInjectedPromptContext(message.text),
+    events: message.events || [],
+    media: message.media || [],
+    streaming: false,
+    queued: Boolean(message.queued),
+    local: Boolean(message.local),
+    stopped: Boolean(message.stopped),
+  }));
   return {
     ...item,
-    title: item.title || "Grok Session",
+    title: sanitizeConversationTitle(item.title, messages),
     cwd,
     ssh,
-    messages: (item.messages || []).map((message) => ({
-      ...message,
-      events: message.events || [],
-      media: message.media || [],
-      streaming: false,
-      queued: Boolean(message.queued),
-      local: Boolean(message.local),
-      stopped: Boolean(message.stopped),
-    })),
+    messages,
   };
 }
 
@@ -865,10 +901,10 @@ function dedupeConversations(list: Conversation[]): Conversation[] {
 }
 
 function persistConversations(list: Conversation[]): Conversation[] {
-  return dedupeConversations(list).map((item) => ({
-    ...item,
-    messages: persistMessageWindow(item.messages).map((message) => ({
+  return dedupeConversations(list).map((item) => {
+    const messages = persistMessageWindow(item.messages).map((message) => ({
       ...message,
+      text: stripInjectedPromptContext(message.text),
       streaming: false,
       thought: (message.thought || "").slice(-8000),
       // Queued drafts stay local. Completed turns drop the flag so session history
@@ -882,8 +918,13 @@ function persistConversations(list: Conversation[]): Conversation[] {
           : event,
       ),
       media: (message.media || []).map((media) => ({ ...media, data: undefined })),
-    })),
-  }));
+    }));
+    return {
+      ...item,
+      title: sanitizeConversationTitle(item.title, messages),
+      messages,
+    };
+  });
 }
 
 /** Keep a balanced recent window so user turns are not dropped behind assistant fragments. */
@@ -972,7 +1013,7 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
     seen.add(sessionId);
     extras.push({
       id: sessionId,
-      title: item.title || "Grok Session",
+      title: sanitizeConversationTitle(item.title),
       cwd: item.cwd,
       grokSessionId: sessionId,
       messages: [],
@@ -989,7 +1030,7 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
     const untitled = isGenericTitle(item.title);
     return {
       ...item,
-      title: untitled ? summary.title : item.title,
+      title: untitled ? sanitizeConversationTitle(summary.title) : sanitizeConversationTitle(item.title, item.messages),
       cwd: item.cwd || summary.cwd,
       grokSessionId: item.grokSessionId || summary.grokSessionId,
       updatedAt: Math.max(item.updatedAt || 0, summary.updatedAt || 0),
@@ -1207,9 +1248,13 @@ function relPath(cwd: string, raw: string) {
 }
 
 async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | null) {
-  let next = text.trim();
+  let next = stripInjectedPromptContext(text);
   const askedImage = wantsImageGen(text);
-  if (!askedImage) {
+  const projectAsset = wantsProjectImageAsset(text);
+  if (projectAsset) {
+    next +=
+      "\n\n<tool_policy>用户要的是项目素材，不是在对话里看图。可以调用 ImageGen、Imagine 或 grok-imagine-image，但必须把图片保存到当前工作区（优先用户指定路径，否则 assets/ 或 images/），不要把图片、base64 或预览贴进对话。生成后继续改代码引用这些文件。</tool_policy>";
+  } else if (!askedImage) {
     next +=
       "\n\n<tool_policy>用户没有要求生成图片。不要调用 ImageGen、Imagine 或 grok-imagine-image。用读文件和改代码回答。</tool_policy>";
   }
@@ -1290,6 +1335,9 @@ export default function App() {
   const [runJob, setRunJob] = useState<RunJob | null>(null);
   const [workspaceFocusPath, setWorkspaceFocusPath] = useState("");
   const [workspaceFocusTick, setWorkspaceFocusTick] = useState(0);
+  const workspaceFocusPathRef = useRef("");
+  const workspaceFocusDebounceRef = useRef(0);
+  workspaceFocusPathRef.current = workspaceFocusPath;
   const [workspaceRestoreTick, setWorkspaceRestoreTick] = useState(0);
   const [paletteMode, setPaletteMode] = useState<null | "file" | "grep">(null);
   const [mention, setMention] = useState<{ start: number; query: string; items: WorkspaceEntry[]; index: number } | null>(null);
@@ -1383,6 +1431,8 @@ export default function App() {
     compactionCount: 0,
   });
   const [relayQuota, setRelayQuota] = useState<RelayQuota | null>(null);
+  const [relayUsage, setRelayUsage] = useState<RelayUsage | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
   const [pendingImages, setPendingImages] = useState<PromptAttachment[]>([]);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -1717,11 +1767,13 @@ export default function App() {
   showInspectorRef.current = showInspector;
 
   useEffect(() => {
-    const delay = liveTurns.length ? 1800 : 400;
+    const delay = liveTurns.length ? 4000 : 800;
     window.clearTimeout(persistTimerRef.current);
     persistTimerRef.current = window.setTimeout(() => persistNowRef.current(), delay);
     return () => window.clearTimeout(persistTimerRef.current);
   }, [lang, theme, model, cwd, selectedId, conversations, projectRecords, activeProjectId, sidebarGroupMode, sidebarWidth, workspaceWidth, showWorkspace, showTerminal, showSidebar, workspaceSide, terminalHeight, form, settings, availableModels, relayReady, liveTurns.length]);
+
+  useEffect(() => () => window.clearTimeout(workspaceFocusDebounceRef.current), []);
 
   useEffect(() => {
     const flush = () => persistNowRef.current();
@@ -1925,7 +1977,7 @@ export default function App() {
           const messages = [...conversation.messages];
           for (let i = messages.length - 1; i >= 0; i -= 1) {
             if (messages[i].role === "assistant" && messages[i].streaming) {
-              const assistant = { ...messages[i], events: [...messages[i].events], media: [...messages[i].media] };
+              const assistant = { ...messages[i] };
               messages[i] = assistant;
               const next = mutator(assistant, { ...conversation, messages });
               return next || { ...conversation, messages };
@@ -1986,7 +2038,7 @@ export default function App() {
       if (el && !userPinnedRef.current && followRef.current) {
         el.scrollTop = el.scrollHeight;
       }
-    }, 48);
+    }, 80);
   }, [flushPendingStream]);
 
   const finishTurn = useCallback((error?: string, conversationId?: string) => {
@@ -2005,7 +2057,15 @@ export default function App() {
         const sealed = item.messages.map((message) => {
           if (message.role === "assistant" && message.streaming) {
             sealedLive = true;
-            return sealAssistantMessage(message, { error, stopped: cancelled, copy: tRef.current });
+            const next = sealAssistantMessage(message, { error, stopped: cancelled, copy: tRef.current });
+            if (!err && !cancelled) {
+              next.events = next.events.map((event) =>
+                event.id === "upstream-reconnect" && event.status === "in_progress"
+                  ? { ...event, status: "completed" }
+                  : event,
+              );
+            }
+            return next;
           }
           return message;
         });
@@ -2235,7 +2295,11 @@ export default function App() {
       mutateAssistant((assistant, conversation) => {
         if (type === "agent_message_chunk") {
           const content = asRecord(update.content) || {};
-          assistant.media = mergeMessageMedia(
+          const chunkType = String(content.type || "text").toLowerCase();
+          const mime = String(content.mimeType || "");
+          const showInChat = wantsImageGen(lastUserMessageText(conversation.messages));
+          if (showInChat || (chunkType !== "image" && chunkType !== "imagegen" && !mime.startsWith("image/"))) {
+            assistant.media = mergeMessageMedia(
               assistant.media,
               [
                 {
@@ -2250,6 +2314,7 @@ export default function App() {
               ],
               assistant.text.length,
             );
+          }
         } else if (type === "tool_call" || type === "tool_call_update") {
           const id = String(update.toolCallId || update.tool_call_id || uid());
           const metaTool = toolMeta(update);
@@ -2300,21 +2365,23 @@ export default function App() {
               diffs: diffs.length ? diffs : undefined,
             });
           }
-          assistant.media = mergeMessageMedia(
-            assistant.media,
-            extractMessageMedia(
-              [
-                update.rawOutput,
-                update.raw_output,
-                update.content,
-                update.output,
-                update.embeddedContent,
-                asRecord(update._meta),
-              ],
+          if (askedImage) {
+            assistant.media = mergeMessageMedia(
+              assistant.media,
+              extractMessageMedia(
+                [
+                  update.rawOutput,
+                  update.raw_output,
+                  update.content,
+                  update.output,
+                  update.embeddedContent,
+                  asRecord(update._meta),
+                ],
+                assistant.text.length,
+              ),
               assistant.text.length,
-            ),
-            assistant.text.length,
-          );
+            );
+          }
           if (
             isActiveView &&
             showTerminalRef.current &&
@@ -2349,9 +2416,18 @@ export default function App() {
           }
           if (editPath && isEdit) {
             if (isActiveView) {
-              setWorkspaceFocusPath(editPath);
-              setWorkspaceFocusTick((tick) => tick + 1);
               setShowWorkspace(true);
+              if (workspaceFocusPathRef.current !== editPath) {
+                workspaceFocusPathRef.current = editPath;
+                window.clearTimeout(workspaceFocusDebounceRef.current);
+                setWorkspaceFocusPath(editPath);
+                setWorkspaceFocusTick((tick) => tick + 1);
+              } else {
+                window.clearTimeout(workspaceFocusDebounceRef.current);
+                workspaceFocusDebounceRef.current = window.setTimeout(() => {
+                  setWorkspaceFocusTick((tick) => tick + 1);
+                }, 1500);
+              }
             }
             const convId = targetId || selectedIdRef.current;
             const userId = convId ? turnUserIdRef.current[convId] : "";
@@ -2510,12 +2586,10 @@ export default function App() {
       input: command,
     });
     if (imageTool) {
-      const asked = wantsImageGen(
-        lastUserMessageText(
-          conversationsRef.current.find((item) => item.id === (payload.conversationId || selectedIdRef.current))?.messages,
-        ),
+      const userText = lastUserMessageText(
+        conversationsRef.current.find((item) => item.id === (payload.conversationId || selectedIdRef.current))?.messages,
       );
-      const choice = pickPermissionChoice(optionsRaw, !asked);
+      const choice = pickPermissionChoice(optionsRaw, !allowsImageGenTool(userText));
       void invoke("answer_interaction", {
         requestId: payload.requestId,
         result: choice
@@ -2553,6 +2627,31 @@ export default function App() {
   handleAcpUpdateRef.current = handleAcpUpdate;
   const finishTurnRef = useRef(finishTurn);
   finishTurnRef.current = finishTurn;
+  const handleAcpReconnect = useCallback(
+    (payload: AcpReconnect) => {
+      const targetId = payload.conversationId || selectedIdRef.current;
+      const attempt = Math.max(1, Number(payload.attempt) || 1);
+      const copy = tRef.current;
+      const title = fill(copy.reconnectingUpstreamEvent, { n: attempt });
+      if (targetId && targetId === selectedIdRef.current) {
+        setStatusText(fill(copy.reconnectingUpstream, { n: attempt }));
+      }
+      mutateTargetRef.current = targetId;
+      mutateAssistant((assistant) => {
+        assistant.error = undefined;
+        assistant.events = upsertEvent(assistant.events, {
+          id: "upstream-reconnect",
+          kind: "retry",
+          title,
+          status: "in_progress",
+          output: payload.error || "",
+        });
+      });
+    },
+    [mutateAssistant],
+  );
+  const handleAcpReconnectRef = useRef(handleAcpReconnect);
+  handleAcpReconnectRef.current = handleAcpReconnect;
   const completeDirectImageGenRef = useRef(completeDirectImageGen);
   completeDirectImageGenRef.current = completeDirectImageGen;
   const handleInteractionRef = useRef(handleInteraction);
@@ -2622,7 +2721,7 @@ export default function App() {
       const incoming: ChatMessage[] = (history.messages || []).map((item) => ({
         id: uid(),
         role: item.role === "assistant" ? "assistant" : "user",
-        text: item.text || "",
+        text: stripInjectedPromptContext(item.text || ""),
         thought: "",
         events: (item.events || []).map((event) => ({
           id: event.id || uid(),
@@ -2778,6 +2877,22 @@ export default function App() {
     }
   }, []);
 
+  const loadRelayUsage = useCallback(async () => {
+    setUsageLoading(true);
+    try {
+      const next = await invoke<RelayUsage>("get_relay_usage");
+      setRelayUsage(next);
+    } catch {
+      setRelayUsage(null);
+    } finally {
+      setUsageLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (view === "settings" && settingsPage === "usage") void loadRelayUsage();
+  }, [view, settingsPage, loadRelayUsage]);
+
   const selectModel = useCallback((id: string) => {
     const next = canonicalModelId(id.trim());
     if (!next) return;
@@ -2890,6 +3005,7 @@ export default function App() {
         setImportMessage(`${tRef.current.wrote} ${result.configPath}${backup}\n${tRef.current.imported}`);
         await refresh();
         await loadRelayQuota();
+        await loadRelayUsage();
         await loadRelayModels(false);
         setView("chat");
         setStatusText(tRef.current.imported);
@@ -2906,7 +3022,7 @@ export default function App() {
         setImporting(false);
       }
     },
-    [loadRelayModels, loadRelayQuota, refresh],
+    [loadRelayModels, loadRelayQuota, loadRelayUsage, refresh],
   );
 
   const consumeDeeplink = useCallback(
@@ -3032,6 +3148,7 @@ export default function App() {
           finishTurnRef.current(event.payload.ok ? undefined : error, conversationId);
         }),
       );
+      await add(listen<AcpReconnect>("acp-reconnect", (event) => handleAcpReconnectRef.current(event.payload)));
       await add(
         listen<{ method: string; requestId: string; params: Record<string, unknown>; conversationId?: string }>("acp-interaction", (event) =>
           handleInteractionRef.current(event.payload),
@@ -3409,7 +3526,6 @@ export default function App() {
       setStatusText(localizeThrown(error, t));
     }
   }
-
   async function sendText(
     text: string,
     extraAttachments?: PromptAttachment[],
@@ -3417,16 +3533,20 @@ export default function App() {
   ) {
     const conversation = conversationsRef.current.find((item) => item.id === (options?.conversationId || selectedIdRef.current));
     const attachments = (extraAttachments ?? pendingImagesRef.current).filter((item) => item.data);
-    const outbound = appendMentions(
-      text,
-      pendingFilesRef.current.map((item) => item.mention),
-    ).trim();
+    const outbound = stripInjectedPromptContext(
+      appendMentions(
+        text,
+        pendingFilesRef.current.map((item) => item.mention),
+      ),
+    );
     if ((!outbound && !attachments.length) || !conversation) return;
     const existingQueued = options?.messageId
       ? conversation.messages.find((item) => item.id === options.messageId)
       : undefined;
     const visible =
-      (options?.displayText || (options?.fromQueue ? existingQueued?.text : "") || outbound).trim() || outbound;
+      stripInjectedPromptContext(
+        options?.displayText || (options?.fromQueue ? existingQueued?.text : "") || outbound,
+      ) || outbound;
     if (liveTurnsRef.current.has(conversation.id) && !options?.fromQueue) {
       if (options?.interrupt) {
         promptQueueRef.current = promptQueueRef.current.filter((item) => item.conversationId !== conversation.id);
@@ -3552,8 +3672,8 @@ export default function App() {
     setShowJumpToBottom(false);
     const title =
       conversation.title === translate("zh").newChat || conversation.title === translate("zh-Hant").newChat || conversation.title === translate("en").newChat
-        ? (visible || attachments[0]?.name || t.newChat).slice(0, 28)
-        : conversation.title;
+        ? sanitizeConversationTitle(visible || attachments[0]?.name || t.newChat).slice(0, 28)
+        : sanitizeConversationTitle(conversation.title, conversation.messages);
     const existingUser = existingQueued;
     const user: ChatMessage = existingUser
       ? { ...existingUser, text: visible, media: attachments.map(mediaFromAttachment), queued: false, streaming: false, local: true, conversationId: conversation.id }
@@ -3640,59 +3760,98 @@ export default function App() {
         ? invoke<SnapshotFile[]>("capture_checkpoint", { root: promptCwd, ssh: sshTarget || null }).catch(() => [])
         : Promise.resolve([] as SnapshotFile[]);
       const expanded = await expandPromptContext(outbound, promptCwd, sshTarget || null);
-      const session = await invoke<SessionInfo>("ensure_session", {
-        options: {
-          model: canonicalModelId(modelRef.current),
-          cwd: sshTarget?.remotePath || conversation.cwd || cwdRef.current,
-          ssh: sshTarget,
-          existingSessionId: conversation.grokSessionId ?? null,
-          grokHome: relayOn ? null : account?.homePath || null,
-          permissionMode: settingsRef.current.permissionMode,
-          reasoningEffort: settingsRef.current.reasoningEffort,
-          contextWindowTokens: settingsRef.current.contextWindowTokens,
-          autoCompactThresholdPercent: settingsRef.current.autoCompactThresholdPercent,
-          enableMemory: settingsRef.current.enableMemory,
-          enableWebSearch: settingsRef.current.enableWebSearch,
-          enableSubagents: settingsRef.current.enableSubagents,
-          conversationId: conversation.id,
-        },
-      });
-      if (turnId !== conversationTurn(conversation.id)) return;
-      setConversations((list) => {
-        const next = list.map((item) => {
-          if (item.id !== conversation.id) return item;
-          // Re-assert optimistic bubbles after session id attach — history merge may race here.
-          const hasUser = item.messages.some((message) => message.id === user.id);
-          const hasAssistant = item.messages.some((message) => message.id === assistant.id);
-          const messages =
-            hasUser && hasAssistant
-              ? item.messages
-              : mergeConversationMessages(item.messages, [user, assistant]);
-          return {
-            ...item,
-            title,
-            messages,
-            grokSessionId: session.sessionId,
-            cwd: workspaceCwd,
-            ssh: sshTarget || item.ssh || null,
-            accountId: relayOn ? undefined : account?.id,
-          };
-        });
-        conversationsRef.current = next;
-        return next;
-      });
-      if (conversation.id === selectedIdRef.current) setStatusText(t.running);
-      const snapshot = await checkpointPromise;
-      const key = checkpointKey(conversation.id, user.id);
-      if (snapshot.length) {
-        checkpointsRef.current.set(key, snapshot);
-        setCheckpointFlags((flags) => ({ ...flags, [key]: true }));
-      }
-      await invoke("send_prompt", {
-        text: expanded,
-        attachments: attachments.length ? attachments : null,
+      const sessionOptions = {
+        model: canonicalModelId(modelRef.current),
+        cwd: sshTarget?.remotePath || conversation.cwd || cwdRef.current,
+        ssh: sshTarget,
+        existingSessionId: conversation.grokSessionId ?? null,
+        grokHome: relayOn ? null : account?.homePath || null,
+        permissionMode: settingsRef.current.permissionMode,
+        reasoningEffort: settingsRef.current.reasoningEffort,
+        contextWindowTokens: settingsRef.current.contextWindowTokens,
+        autoCompactThresholdPercent: settingsRef.current.autoCompactThresholdPercent,
+        enableMemory: settingsRef.current.enableMemory,
+        enableWebSearch: settingsRef.current.enableWebSearch,
+        enableSubagents: settingsRef.current.enableSubagents,
         conversationId: conversation.id,
-      });
+      };
+      const maxAttempts = 4;
+      let lastError = "";
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (turnId !== conversationTurn(conversation.id)) return;
+        try {
+          if (attempt > 1) {
+            if (conversation.id === selectedIdRef.current) {
+              setStatusText(fill(t.reconnectingUpstream, { n: attempt }));
+            }
+            mutateTargetRef.current = conversation.id;
+            mutateAssistant((current) => {
+              current.error = undefined;
+              current.events = upsertEvent(current.events, {
+                id: "upstream-reconnect",
+                kind: "retry",
+                title: fill(t.reconnectingUpstreamEvent, { n: attempt }),
+                status: "in_progress",
+              });
+            });
+            await new Promise((resolve) => setTimeout(resolve, Math.min(8000, 800 * 2 ** (attempt - 2))));
+            if (turnId !== conversationTurn(conversation.id)) return;
+            const latest = conversationsRef.current.find((item) => item.id === conversation.id);
+            sessionOptions.existingSessionId = latest?.grokSessionId ?? sessionOptions.existingSessionId;
+          }
+          const session = await invoke<SessionInfo>("ensure_session", { options: sessionOptions });
+          if (turnId !== conversationTurn(conversation.id)) return;
+          setConversations((list) => {
+            const next = list.map((item) => {
+              if (item.id !== conversation.id) return item;
+              // Re-assert optimistic bubbles after session id attach — history merge may race here.
+              const hasUser = item.messages.some((message) => message.id === user.id);
+              const hasAssistant = item.messages.some((message) => message.id === assistant.id);
+              const messages =
+                hasUser && hasAssistant
+                  ? item.messages
+                  : mergeConversationMessages(item.messages, [user, assistant]);
+              return {
+                ...item,
+                title,
+                messages,
+                grokSessionId: session.sessionId,
+                cwd: workspaceCwd,
+                ssh: sshTarget || item.ssh || null,
+                accountId: relayOn ? undefined : account?.id,
+              };
+            });
+            conversationsRef.current = next;
+            return next;
+          });
+          if (conversation.id === selectedIdRef.current) setStatusText(t.running);
+          const snapshot = await checkpointPromise;
+          const key = checkpointKey(conversation.id, user.id);
+          if (snapshot.length) {
+            checkpointsRef.current.set(key, snapshot);
+            setCheckpointFlags((flags) => ({ ...flags, [key]: true }));
+          }
+          await invoke("send_prompt", {
+            text: expanded,
+            attachments: attachments.length ? attachments : null,
+            conversationId: conversation.id,
+          });
+          lastError = "";
+          break;
+        } catch (error) {
+          lastError = String(error);
+          if (!isTransientUpstreamError(lastError) || attempt === maxAttempts) break;
+        }
+      }
+      if (lastError) {
+        if (turnId !== conversationTurn(conversation.id)) return;
+        setPendingImages(attachments);
+        if (isMissingCredentials(lastError)) {
+          setView("settings");
+          setSettingsPage("relay");
+        }
+        finishTurn(lastError, conversation.id);
+      }
     } catch (error) {
       if (turnId !== conversationTurn(conversation.id)) return;
       setPendingImages(attachments);
@@ -4709,6 +4868,9 @@ export default function App() {
         onRefreshQuotas={() => void refreshQuotas()}
         relayQuota={relayQuota}
         relayQuotaText={relayQuotaText}
+        relayUsage={relayUsage}
+        usageLoading={usageLoading}
+        onRefreshUsage={() => void loadRelayUsage()}
         onOpenAccount={(account) => newConversation(account)}
         onRemoveAccount={(id) => void persistAccounts(accounts.filter((account) => account.id !== id))}
         routedAccountId={routed?.id}
@@ -5120,7 +5282,7 @@ export default function App() {
             ) : null}
             {!visibleMessages.length && !pendingQuestion && !pendingPlan && !pendingPermission ? (
               <div className="empty">
-                <MorphingRings className="empty-rings" />
+                {splash ? null : <MorphingRings className="empty-rings" />}
                 <div className="empty-copy">
                   <div className="empty-hero">
                     <GrokMark size={28} className="empty-mark" />

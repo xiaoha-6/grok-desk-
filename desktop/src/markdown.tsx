@@ -1,7 +1,11 @@
-import { memo, type ReactNode } from "react";
+import { memo, useMemo, useRef, type ReactNode } from "react";
+
+type TextBlock = { type: "code" | "text"; text: string };
+type ParseCache = { committed: string; committedBlocks: TextBlock[] };
 
 export const MessageBody = memo(function MessageBody({ text, streaming }: { text: string; streaming?: boolean }) {
-  const blocks = splitBlocks(text);
+  const cacheRef = useRef<ParseCache>({ committed: "", committedBlocks: [] });
+  const blocks = useMemo(() => splitBlocksIncremental(text, cacheRef.current), [text]);
   return (
     <div className={streaming ? "md streaming" : "md"}>
       {blocks.map((block, index) => {
@@ -37,7 +41,44 @@ export const MessageBody = memo(function MessageBody({ text, streaming }: { text
   );
 });
 
-function splitBlocks(text: string) {
+function splitBlocksIncremental(text: string, cache: ParseCache): TextBlock[] {
+  const cut = lastSafeCommit(text);
+  const committed = cut > 0 ? text.slice(0, cut) : "";
+  const tail = cut > 0 ? text.slice(cut) : text;
+  if (committed !== cache.committed) {
+    if (committed.startsWith(cache.committed) && cache.committed) {
+      const extra = committed.slice(cache.committed.length);
+      cache.committedBlocks = extra.trim()
+        ? cache.committedBlocks.concat(splitBlocks(extra))
+        : cache.committedBlocks;
+    } else {
+      cache.committedBlocks = committed ? splitBlocks(committed) : [];
+    }
+    cache.committed = committed;
+  }
+  const tailBlocks = tail ? splitBlocks(tail) : [];
+  return tailBlocks.length ? cache.committedBlocks.concat(tailBlocks) : cache.committedBlocks;
+}
+
+function lastSafeCommit(text: string): number {
+  let inFence = false;
+  let last = 0;
+  for (let i = 0; i < text.length; ) {
+    if (text.startsWith("```", i)) {
+      inFence = !inFence;
+      i += 3;
+      if (!inFence) last = i;
+      continue;
+    }
+    if (!inFence && text.charCodeAt(i) === 10 && i + 1 < text.length && text.charCodeAt(i + 1) === 10) {
+      last = i + 2;
+    }
+    i += 1;
+  }
+  return last;
+}
+
+function splitBlocks(text: string): TextBlock[] {
   const chunks = text.split(/```/);
   return chunks
     .map((chunk, index) => {

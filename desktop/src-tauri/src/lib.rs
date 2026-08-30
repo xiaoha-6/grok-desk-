@@ -18,7 +18,7 @@ use accounts::{
 };
 use acp::{AcpClient, AcpHub, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
 use config::{
-    parse_deeplink, write_config, ModelCatalog, ModelListRequest, RelayImport, RelayQuota,
+    parse_deeplink, write_config, ModelCatalog, ModelListRequest, RelayImport, RelayQuota, RelayUsage,
 };
 use install::{install_official, InstallEventSink};
 use pty::{pty_close, pty_detect, pty_open, pty_resize, pty_write};
@@ -107,7 +107,7 @@ async fn ensure_session(
     run_blocking(move || {
         let conversation_id = options.conversation_id.clone();
         let client = hub.client(conversation_id.as_deref())?;
-        AcpClient::connect(&client, &app, options)
+        AcpClient::connect_resilient(&client, &app, options)
     })
     .await
 }
@@ -123,8 +123,7 @@ async fn send_prompt(
     let hub = Arc::clone(&state.acp);
     run_blocking(move || {
         let client = hub.client(conversation_id.as_deref())?;
-        let guard = client.lock().map_err(|_| "无法锁定 ACP 会话".to_string())?;
-        guard.send_prompt(&app, text, attachments.unwrap_or_default())
+        AcpClient::send_prompt(&client, &app, text, attachments.unwrap_or_default())
     })
     .await
 }
@@ -134,6 +133,13 @@ async fn get_relay_quota() -> RelayQuota {
     tauri::async_runtime::spawn_blocking(|| config::fetch_relay_quota(&grok_home()))
         .await
         .unwrap_or_else(|_| config::fetch_relay_quota(&grok_home()))
+}
+
+#[tauri::command]
+async fn get_relay_usage() -> RelayUsage {
+    tauri::async_runtime::spawn_blocking(|| config::fetch_relay_usage(&grok_home()))
+        .await
+        .unwrap_or_else(|_| config::fetch_relay_usage(&grok_home()))
 }
 
 #[tauri::command]
@@ -890,6 +896,7 @@ pub fn run() {
             get_runtime_status,
             import_relay,
             get_relay_quota,
+            get_relay_usage,
             list_relay_models,
             set_active_model,
             generate_image,

@@ -590,8 +590,19 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
 
   useEffect(() => {
     if (activity !== "scm" || !cwd) return;
-    const timer = window.setInterval(() => void refreshGit(), 4000);
-    return () => window.clearInterval(timer);
+    const tick = () => {
+      if (document.hidden) return;
+      void refreshGit();
+    };
+    const timer = window.setInterval(tick, 8000);
+    const onVis = () => {
+      if (!document.hidden) void refreshGit();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
   }, [activity, cwd, refreshGit]);
 
   useEffect(() => {

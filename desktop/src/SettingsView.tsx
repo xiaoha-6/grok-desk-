@@ -13,12 +13,14 @@ import {
   IconPerson,
   IconPencil,
   IconPlan,
+  IconContext,
   IconRelay,
   IconSliders,
   IconSpark,
   IconTerminal,
 } from "./icons";
 import { KeybindingsEditor } from "./KeybindingsEditor";
+import { RelayUsagePanel } from "./RelayUsagePanel";
 import { fill, type Copy } from "./i18n";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
@@ -33,6 +35,7 @@ import {
   type Lang,
   type RelayImport,
   type RelayQuota,
+  type RelayUsage,
   type RuntimeStatus,
   type SettingsPage,
   type SkillRecord,
@@ -238,6 +241,9 @@ export function SettingsView(props: {
   onRefreshQuotas: () => void;
   relayQuota: RelayQuota | null;
   relayQuotaText: string;
+  relayUsage: RelayUsage | null;
+  usageLoading: boolean;
+  onRefreshUsage: () => void;
   onOpenAccount: (account: AccountRecord) => void;
   onRemoveAccount: (id: string) => void;
   routedAccountId?: string;
@@ -257,19 +263,21 @@ export function SettingsView(props: {
   const [query, setQuery] = useState("");
   const [newName, setNewName] = useState("");
   const copy = props.t;
-  const items: Array<{ id: SettingsPage; title: string; icon: ReactNode }> = [
-    { id: "general", title: copy.general, icon: <IconGear /> },
-    { id: "runtime", title: copy.runtime, icon: <IconTerminal /> },
-    { id: "relay", title: copy.relay, icon: <IconRelay /> },
-    { id: "ssh", title: copy.ssh, icon: <IconTerminal /> },
-    { id: "agent", title: copy.agent, icon: <IconSpark size={15} /> },
-    { id: "compatibility", title: copy.compatibility, icon: <IconSliders /> },
-    { id: "keyboard", title: copy.kbPage, icon: <IconKeyboard /> },
-    { id: "skills", title: copy.skills, icon: <IconBox /> },
-    { id: "accounts", title: copy.accounts, icon: <IconPerson /> },
-    { id: "archived", title: copy.archived, icon: <IconArchive /> },
+  const items: Array<{ id: SettingsPage; title: string; icon: ReactNode; group: string; keys?: string }> = [
+    { id: "general", title: copy.general, icon: <IconGear />, group: copy.usageNavApp },
+    { id: "runtime", title: copy.runtime, icon: <IconTerminal />, group: copy.usageNavApp },
+    { id: "relay", title: copy.relay, icon: <IconRelay />, group: copy.usageNavRelay, keys: "api key token" },
+    { id: "usage", title: copy.usagePage, icon: <IconContext />, group: copy.usageNavRelay, keys: "token 用量 编码 usage quota" },
+    { id: "ssh", title: copy.ssh, icon: <IconTerminal />, group: copy.usageNavWork },
+    { id: "agent", title: copy.agent, icon: <IconSpark size={15} />, group: copy.usageNavWork },
+    { id: "compatibility", title: copy.compatibility, icon: <IconSliders />, group: copy.usageNavWork },
+    { id: "keyboard", title: copy.kbPage, icon: <IconKeyboard />, group: copy.usageNavWork },
+    { id: "skills", title: copy.skills, icon: <IconBox />, group: copy.usageNavWork },
+    { id: "accounts", title: copy.accounts, icon: <IconPerson />, group: copy.usageNavAccount },
+    { id: "archived", title: copy.archived, icon: <IconArchive />, group: copy.usageNavAccount },
   ];
-  const visible = items.filter((item) => item.title.toLowerCase().includes(query.trim().toLowerCase()));
+  const q = query.trim().toLowerCase();
+  const visible = items.filter((item) => `${item.title} ${item.keys || ""}`.toLowerCase().includes(q));
   const title = items.find((item) => item.id === props.settingsPage)?.title || copy.settings;
   const routingHint =
     props.settings.routingMode === "sequential"
@@ -301,17 +309,20 @@ export function SettingsView(props: {
           placeholder={copy.searchSettings}
           onChange={(event) => setQuery(event.target.value)}
         />
-        <div className="section-label">{copy.settings}</div>
-        {visible.map((item) => (
-          <button
-            key={item.id}
-            className={props.settingsPage === item.id ? "nav-item on" : "nav-item"}
-            type="button"
-            onClick={() => props.setSettingsPage(item.id)}
-          >
-            <span className="nav-icon">{item.icon}</span>
-            {item.title}
-          </button>
+        {visible.map((item, index) => (
+          <div key={item.id}>
+            {index === 0 || visible[index - 1].group !== item.group ? (
+              <div className="section-label">{item.group}</div>
+            ) : null}
+            <button
+              className={props.settingsPage === item.id ? "nav-item on" : "nav-item"}
+              type="button"
+              onClick={() => props.setSettingsPage(item.id)}
+            >
+              <span className="nav-icon">{item.icon}</span>
+              {item.title}
+            </button>
+          </div>
         ))}
       </aside>
       <div className="resize" onPointerDown={props.beginResize} />
@@ -589,6 +600,16 @@ export function SettingsView(props: {
                 </section>
               ) : null}
             </>
+          )}
+
+          {props.settingsPage === "usage" && (
+            <RelayUsagePanel
+              usage={props.relayUsage}
+              loading={props.usageLoading}
+              copy={copy}
+              lang={props.lang}
+              onRefresh={props.onRefreshUsage}
+            />
           )}
 
           {props.settingsPage === "agent" && (

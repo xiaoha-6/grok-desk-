@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 const CLIENT_VERSION: &str = "0.6.29";
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 30);
+const RECONNECT_MAX_ATTEMPTS: u32 = 12;
+const CONNECT_RETRY_MAX_ATTEMPTS: u32 = 8;
 pub const DEFAULT_CONTEXT_WINDOW: u64 = 500_000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -237,7 +240,9 @@ pub struct AcpClient {
     agent: Option<Arc<AgentProcess>>,
     session: Option<SessionInfo>,
     spawn_fingerprint: Option<String>,
+    connect_options: Option<SessionOptions>,
     generation: u64,
+    cancel_epoch: u64,
     conversation_id: String,
 }
 
@@ -247,7 +252,9 @@ impl Default for AcpClient {
             agent: None,
             session: None,
             spawn_fingerprint: None,
+            connect_options: None,
             generation: 0,
+            cancel_epoch: 0,
             conversation_id: String::new(),
         }
     }
@@ -360,8 +367,19 @@ impl AcpClient {
 
     pub fn stop(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.cancel_epoch = self.cancel_epoch.wrapping_add(1);
         if let Some(agent) = self.agent.take() {
             agent.interrupt("连接已取消");
+        }
+        self.session = None;
+        self.spawn_fingerprint = None;
+        self.connect_options = None;
+    }
+
+    fn recycle_for_reconnect(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(agent) = self.agent.take() {
+            agent.interrupt("上游断开，正在重连");
         }
         self.session = None;
         self.spawn_fingerprint = None;
@@ -514,7 +532,13 @@ impl AcpClient {
                                 .unwrap_or_else(|| "default".to_string());
                         }
                     }
-                    return Ok(current.clone());
+                    let current = current.clone();
+                    let mut saved = options.clone();
+                    saved.existing_session_id = Some(current.session_id.clone());
+                    saved.conversation_id = Some(conversation_id.clone()).filter(|value| !value.is_empty());
+                    this.connect_options = Some(saved);
+                    this.conversation_id = conversation_id;
+                    return Ok(current);
                 }
             }
 
@@ -566,6 +590,10 @@ impl AcpClient {
                 };
                 this.session = Some(info.clone());
                 this.conversation_id = conversation_id;
+                let mut saved = options.clone();
+                saved.existing_session_id = Some(info.session_id.clone());
+                saved.conversation_id = Some(this.conversation_id.clone()).filter(|value| !value.is_empty());
+                this.connect_options = Some(saved);
                 Ok(info)
             }
             Err(error) => {
@@ -575,7 +603,7 @@ impl AcpClient {
                         .as_ref()
                         .is_some_and(|current| Arc::ptr_eq(current, &agent))
                     {
-                        this.stop();
+                        this.recycle_for_reconnect();
                     }
                 }
                 Err(error)
@@ -583,73 +611,56 @@ impl AcpClient {
         }
     }
 
+    pub fn connect_resilient(
+        shared: &Arc<Mutex<Self>>,
+        app: &AppHandle,
+        options: SessionOptions,
+    ) -> Result<SessionInfo, String> {
+        let epoch = lock_client(shared)?.cancel_epoch;
+        let mut last = "连接失败".to_string();
+        for attempt in 1..=CONNECT_RETRY_MAX_ATTEMPTS {
+            if cancel_epoch_changed(shared, epoch) {
+                return Err("连接已取消".into());
+            }
+            match Self::connect(shared, app, options.clone()) {
+                Ok(info) => return Ok(info),
+                Err(error) if is_user_cancel_error(&error) => return Err(error),
+                Err(error) if !is_retryable_rpc_error(&error) || attempt == CONNECT_RETRY_MAX_ATTEMPTS => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    last = error;
+                    emit_reconnect(app, options.conversation_id.as_deref().unwrap_or(""), attempt, CONNECT_RETRY_MAX_ATTEMPTS, &last);
+                    if sleep_interruptible(reconnect_backoff(attempt), shared, epoch) {
+                        return Err("连接已取消".into());
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+
     pub fn send_prompt(
-        &self,
+        shared: &Arc<Mutex<Self>>,
         app: &AppHandle,
         text: String,
         attachments: Vec<PromptAttachment>,
     ) -> Result<(), String> {
-        let agent = self.agent.as_ref().ok_or_else(|| "Agent 尚未连接".to_string())?;
-        let session_id = self
-            .session
-            .as_ref()
-            .map(|s| s.session_id.clone())
-            .ok_or_else(|| "ACP Session 尚未就绪".to_string())?;
-        let trimmed = text.trim();
-        let mut prompt: Vec<Value> = Vec::new();
-        if !trimmed.is_empty() {
-            prompt.push(json!({ "type": "text", "text": trimmed }));
-        }
-        for attachment in attachments {
-            let data = attachment.data.unwrap_or_default();
-            if data.is_empty() {
-                continue;
+        let prompt = build_prompt_parts(&text, &attachments)?;
+        let (conversation_id, epoch) = {
+            let this = lock_client(shared)?;
+            if this.agent.is_none() {
+                return Err("Agent 尚未连接".into());
             }
-            if data.len() > 35_000_000 {
-                return Err("图片太大，请控制在 25MB 以内".into());
+            if this.session.is_none() {
+                return Err("ACP Session 尚未就绪".into());
             }
-            prompt.push(json!({
-                "type": "image",
-                "data": data,
-                "mimeType": attachment.mime_type.unwrap_or_else(|| "image/png".into()),
-                "name": attachment.name.unwrap_or_default()
-            }));
-        }
-        if prompt.is_empty() {
-            return Err("请输入要发送的内容，或粘贴一张图片".into());
-        }
-
-        let stdin = Arc::clone(&agent.stdin);
-        let next_id = Arc::clone(&agent.next_id);
-        let pending = Arc::clone(&agent.pending);
+            (this.conversation_id.clone(), this.cancel_epoch)
+        };
+        let shared = Arc::clone(shared);
         let app = app.clone();
-        let conversation_id = self.conversation_id.clone();
         thread::spawn(move || {
-            let result = rpc_request(
-                &stdin,
-                &next_id,
-                &pending,
-                "session/prompt",
-                json!({
-                    "sessionId": session_id,
-                    "prompt": prompt
-                }),
-                Duration::from_secs(60 * 30),
-            );
-            match result {
-                Ok(_) => {
-                    let _ = app.emit(
-                        "acp-turn-done",
-                        with_conversation(json!({ "ok": true }), &conversation_id),
-                    );
-                }
-                Err(error) => {
-                    let _ = app.emit(
-                        "acp-turn-done",
-                        with_conversation(json!({ "ok": false, "error": error }), &conversation_id),
-                    );
-                }
-            }
+            send_prompt_with_reconnect(shared, app, prompt, conversation_id, epoch);
         });
         Ok(())
     }
@@ -1204,6 +1215,237 @@ fn decorate_rpc_error(method: &str, err: String, diagnostics: &DiagnosticBuffer)
     } else {
         out
     }
+}
+
+fn build_prompt_parts(text: &str, attachments: &[PromptAttachment]) -> Result<Vec<Value>, String> {
+    let trimmed = text.trim();
+    let mut prompt: Vec<Value> = Vec::new();
+    if !trimmed.is_empty() {
+        prompt.push(json!({ "type": "text", "text": trimmed }));
+    }
+    for attachment in attachments {
+        let data = attachment.data.clone().unwrap_or_default();
+        if data.is_empty() {
+            continue;
+        }
+        if data.len() > 35_000_000 {
+            return Err("图片太大，请控制在 25MB 以内".into());
+        }
+        prompt.push(json!({
+            "type": "image",
+            "data": data,
+            "mimeType": attachment.mime_type.clone().unwrap_or_else(|| "image/png".into()),
+            "name": attachment.name.clone().unwrap_or_default()
+        }));
+    }
+    if prompt.is_empty() {
+        return Err("请输入要发送的内容，或粘贴一张图片".into());
+    }
+    Ok(prompt)
+}
+
+fn is_user_cancel_error(err: &str) -> bool {
+    let text = err.trim();
+    if text.is_empty() {
+        return false;
+    }
+    text.contains("连接已取消")
+        || text.contains("連線已取消")
+        || text.to_ascii_lowercase().contains("cancelled by user")
+        || text.contains("session/cancel")
+        || text.to_ascii_lowercase().contains("canceled by the user")
+}
+
+fn is_fatal_rpc_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    looks_like_official_quota(err)
+        || is_user_cancel_error(err)
+        || lower.contains("context_too_large")
+        || lower.contains("context too large")
+        || err.contains("请求内容过大")
+        || err.contains("上下文") && (err.contains("过大") || err.contains("太长"))
+        || err.contains("图片太大")
+        || lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || err.contains(NO_CREDENTIALS_CODE)
+        || err.contains("请输入要发送的内容")
+}
+
+fn is_retryable_rpc_error(err: &str) -> bool {
+    if is_fatal_rpc_error(err) {
+        return false;
+    }
+    let lower = err.to_ascii_lowercase();
+    lower.contains("超时")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || err.contains("已退出")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("bad gateway")
+        || lower.contains("unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("temporarily")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("eof")
+        || err.contains("写入 Grok Agent 失败")
+        || err.contains("无法写入 Grok Agent")
+        || err.contains("尚未连接")
+        || err.contains("尚未就绪")
+        || err.contains("上游")
+        || lower.contains("internal error")
+}
+
+fn reconnect_backoff(attempt: u32) -> Duration {
+    let secs = match attempt {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 6,
+        5 => 8,
+        6 => 10,
+        7 => 12,
+        _ => 15,
+    };
+    Duration::from_secs(secs)
+}
+
+fn cancel_epoch_changed(shared: &Arc<Mutex<AcpClient>>, epoch: u64) -> bool {
+    lock_client(shared)
+        .map(|this| this.cancel_epoch != epoch)
+        .unwrap_or(true)
+}
+
+fn sleep_interruptible(total: Duration, shared: &Arc<Mutex<AcpClient>>, epoch: u64) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if cancel_epoch_changed(shared, epoch) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    cancel_epoch_changed(shared, epoch)
+}
+
+fn emit_reconnect(app: &AppHandle, conversation_id: &str, attempt: u32, max_attempts: u32, error: &str) {
+    let _ = app.emit(
+        "acp-reconnect",
+        with_conversation(
+            json!({
+                "attempt": attempt,
+                "maxAttempts": max_attempts,
+                "error": error
+            }),
+            conversation_id,
+        ),
+    );
+}
+
+fn emit_turn_done(app: &AppHandle, conversation_id: &str, ok: bool, error: Option<&str>) {
+    let payload = match error {
+        Some(error) => json!({ "ok": ok, "error": error }),
+        None => json!({ "ok": ok }),
+    };
+    let _ = app.emit("acp-turn-done", with_conversation(payload, conversation_id));
+}
+
+fn send_one_prompt(shared: &Arc<Mutex<AcpClient>>, prompt: &[Value], epoch: u64) -> Result<Value, String> {
+    let (stdin, next_id, pending, session_id) = {
+        let this = lock_client(shared)?;
+        if this.cancel_epoch != epoch {
+            return Err("连接已取消".into());
+        }
+        let agent = this
+            .agent
+            .as_ref()
+            .ok_or_else(|| "Agent 尚未连接".to_string())?;
+        let session_id = this
+            .session
+            .as_ref()
+            .map(|session| session.session_id.clone())
+            .ok_or_else(|| "ACP Session 尚未就绪".to_string())?;
+        (
+            Arc::clone(&agent.stdin),
+            Arc::clone(&agent.next_id),
+            Arc::clone(&agent.pending),
+            session_id,
+        )
+    };
+    rpc_request(
+        &stdin,
+        &next_id,
+        &pending,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": prompt
+        }),
+        PROMPT_TIMEOUT,
+    )
+}
+
+fn send_prompt_with_reconnect(
+    shared: Arc<Mutex<AcpClient>>,
+    app: AppHandle,
+    prompt: Vec<Value>,
+    conversation_id: String,
+    epoch: u64,
+) {
+    let mut last = "ACP 请求失败".to_string();
+    for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
+        if cancel_epoch_changed(&shared, epoch) {
+            emit_turn_done(&app, &conversation_id, false, Some("连接已取消"));
+            return;
+        }
+        match send_one_prompt(&shared, &prompt, epoch) {
+            Ok(_) => {
+                emit_turn_done(&app, &conversation_id, true, None);
+                return;
+            }
+            Err(error) if is_user_cancel_error(&error) || cancel_epoch_changed(&shared, epoch) => {
+                emit_turn_done(&app, &conversation_id, false, Some(&error));
+                return;
+            }
+            Err(error) if !is_retryable_rpc_error(&error) || attempt == RECONNECT_MAX_ATTEMPTS => {
+                emit_turn_done(&app, &conversation_id, false, Some(&error));
+                return;
+            }
+            Err(error) => {
+                last = error;
+                emit_reconnect(&app, &conversation_id, attempt, RECONNECT_MAX_ATTEMPTS, &last);
+                if sleep_interruptible(reconnect_backoff(attempt), &shared, epoch) {
+                    emit_turn_done(&app, &conversation_id, false, Some("连接已取消"));
+                    return;
+                }
+                let options = match lock_client(&shared) {
+                    Ok(mut this) => {
+                        this.recycle_for_reconnect();
+                        this.connect_options.clone()
+                    }
+                    Err(error) => {
+                        emit_turn_done(&app, &conversation_id, false, Some(&error));
+                        return;
+                    }
+                };
+                let Some(options) = options else {
+                    emit_turn_done(&app, &conversation_id, false, Some(&last));
+                    return;
+                };
+                if let Err(error) = AcpClient::connect(&shared, &app, options) {
+                    last = error;
+                    if is_user_cancel_error(&last) || !is_retryable_rpc_error(&last) {
+                        emit_turn_done(&app, &conversation_id, false, Some(&last));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    emit_turn_done(&app, &conversation_id, false, Some(&last));
 }
 
 fn rpc_request(
@@ -1892,5 +2134,17 @@ mod tests {
         pending.insert("1".into(), tx);
         pending.fail_all("连接已取消");
         assert_eq!(rx.recv().unwrap(), Err("连接已取消".into()));
+    }
+
+    #[test]
+    fn retries_transient_upstream_errors() {
+        assert!(is_retryable_rpc_error("ACP 请求超时：session/prompt"));
+        assert!(is_retryable_rpc_error("Grok Agent 已退出"));
+        assert!(is_retryable_rpc_error("responses API error status=502 Bad Gateway"));
+        assert!(is_retryable_rpc_error("上游模型服务暂时不可用"));
+        assert!(is_retryable_rpc_error("写入 Grok Agent 失败：Broken pipe"));
+        assert!(!is_retryable_rpc_error("连接已取消"));
+        assert!(!is_retryable_rpc_error("图片太大，请控制在 25MB 以内"));
+        assert!(!is_retryable_rpc_error("status 402 weekly limit"));
     }
 }

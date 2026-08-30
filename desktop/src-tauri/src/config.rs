@@ -532,6 +532,48 @@ impl RelayQuota {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayUsageDay {
+    pub date: String,
+    pub requests: i64,
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayUsageModel {
+    pub model: String,
+    pub requests: i64,
+    pub tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayUsage {
+    pub configured: bool,
+    pub total_tokens: Option<i64>,
+    pub today_tokens: Option<i64>,
+    pub today_requests: Option<i64>,
+    pub days: Vec<RelayUsageDay>,
+    pub models: Vec<RelayUsageModel>,
+    pub error: Option<String>,
+}
+
+impl RelayUsage {
+    fn empty() -> Self {
+        Self {
+            configured: false,
+            total_tokens: None,
+            today_tokens: None,
+            today_requests: None,
+            days: Vec::new(),
+            models: Vec::new(),
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogModel {
@@ -788,6 +830,33 @@ fn fetch_relay_quota_inner(profile: &RelayProfile) -> Result<RelayQuota, String>
         }
     }
     Err(last_error)
+}
+
+pub fn fetch_relay_usage(grok_home: &Path) -> RelayUsage {
+    let Some(profile) = read_relay_profile(grok_home) else {
+        return RelayUsage::empty();
+    };
+    if is_official_endpoint(&profile.endpoint) {
+        return RelayUsage::empty();
+    }
+    match fetch_relay_usage_inner(&profile) {
+        Ok(mut usage) => {
+            usage.configured = true;
+            usage
+        }
+        Err(error) => RelayUsage {
+            configured: true,
+            error: Some(error),
+            ..RelayUsage::empty()
+        },
+    }
+}
+
+fn fetch_relay_usage_inner(profile: &RelayProfile) -> Result<RelayUsage, String> {
+    let base = profile.endpoint.trim_end_matches('/');
+    let url = format!("{base}/usage?days=90");
+    let value = http_json_get_timeout(&url, &profile.api_key, "15")?;
+    Ok(parse_relay_usage(&value))
 }
 
 pub fn fetch_model_catalog(
@@ -1117,6 +1186,57 @@ fn parse_relay_quota(value: &serde_json::Value) -> RelayQuota {
     }
 }
 
+fn parse_relay_usage(value: &serde_json::Value) -> RelayUsage {
+    let root = value
+        .get("data")
+        .filter(|item| item.is_object())
+        .unwrap_or(value);
+    let usage = root.get("usage").unwrap_or(root);
+    let today = usage.get("today").unwrap_or(usage);
+    let total = usage.get("total").unwrap_or(usage);
+    let mut days = Vec::new();
+    if let Some(items) = root.get("daily_usage").or_else(|| root.get("dailyUsage")).and_then(|item| item.as_array()) {
+        for item in items {
+            let date = json_string(item, &["date", "day"]).unwrap_or_default();
+            if date.is_empty() {
+                continue;
+            }
+            days.push(RelayUsageDay {
+                date,
+                requests: json_number(item, &["requests", "count"]).unwrap_or(0.0) as i64,
+                tokens: json_number(item, &["total_tokens", "totalTokens", "tokens"]).unwrap_or(0.0) as i64,
+            });
+        }
+    }
+    let mut models = Vec::new();
+    if let Some(items) = root.get("model_stats").or_else(|| root.get("modelStats")).and_then(|item| item.as_array()) {
+        for item in items {
+            let model = json_string(item, &["model", "name", "id"]).unwrap_or_default();
+            if model.is_empty() {
+                continue;
+            }
+            models.push(RelayUsageModel {
+                model,
+                requests: json_number(item, &["requests", "count"]).unwrap_or(0.0) as i64,
+                tokens: json_number(item, &["total_tokens", "totalTokens", "tokens"]).unwrap_or(0.0) as i64,
+            });
+        }
+    }
+    models.sort_by(|left, right| right.tokens.cmp(&left.tokens).then(right.requests.cmp(&left.requests)));
+    if models.len() > 8 {
+        models.truncate(8);
+    }
+    RelayUsage {
+        configured: true,
+        total_tokens: json_number(total, &["total_tokens", "totalTokens", "tokens"]).map(|item| item as i64),
+        today_tokens: json_number(today, &["total_tokens", "totalTokens", "tokens"]).map(|item| item as i64),
+        today_requests: json_number(today, &["requests", "count"]).map(|item| item as i64),
+        days,
+        models,
+        error: None,
+    }
+}
+
 fn json_number(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     for key in keys {
         if let Some(found) = value.get(*key).and_then(value_as_f64) {
@@ -1358,6 +1478,28 @@ mod tests {
         assert_eq!(quota.plan_name.as_deref(), Some("API Key 额度"));
         let unlimited = parse_relay_quota(&serde_json::json!({ "remaining": -1, "balance": -1 }));
         assert_eq!(unlimited.remaining, Some(-1.0));
+    }
+
+    #[test]
+    fn parses_usage_payload() {
+        let usage = parse_relay_usage(&serde_json::json!({
+            "usage": {
+                "today": { "requests": 12, "total_tokens": 3400 },
+                "total": { "requests": 7100, "total_tokens": 725900000 }
+            },
+            "daily_usage": [
+                { "date": "2026-08-29", "requests": 4, "total_tokens": 1200 },
+                { "date": "2026-08-30", "requests": 8, "total_tokens": 2200 }
+            ],
+            "model_stats": [
+                { "model": "grok-4.6", "requests": 20, "total_tokens": 9000 },
+                { "model": "grok-4.5", "requests": 3, "total_tokens": 400 }
+            ]
+        }));
+        assert_eq!(usage.total_tokens, Some(725_900_000));
+        assert_eq!(usage.today_requests, Some(12));
+        assert_eq!(usage.days.len(), 2);
+        assert_eq!(usage.models[0].model, "grok-4.6");
     }
 
     #[test]

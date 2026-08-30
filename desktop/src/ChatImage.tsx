@@ -27,10 +27,17 @@ export function isImageGenBusy(message?: ChatMessage, prevUserText = "") {
 const CODING_OR_REVIEW =
   /改代码|修改文件|修复|修復|实现|實作|refactor|\bbug\b|\bfix\b|函数|函式|组件|元件|按钮|按鈕|\bhover\b|报错|報錯|为什么|為什麼|\.lua\b|\.tsx\b|\.jsx\b|\.css\b|\.html\b|\.js\b|\.ts\b|工作区|工作區|根据.{0,8}截图|根據.{0,8}截圖|从截图|從截圖|界面|頁面|页面|layout|screenshot|插件|\bplugin\b|检查|檢查|看看|帮我看|幫我看|帮我改|幫我改|代码|代碼|程式|fxmanifest|\breview\b|\bdebug\b|\binspect\b|\bcheck\b|有没有问题|有沒有問題|是否有需要/;
 
+const PROJECT_ASSET_HINT =
+  /素材|图标|圖標|\bicons?\b|\blogos?\b|\bassets?\b|配图|配圖|封面图|封面圖|背景图|背景圖|占位图|佔位圖|favicon|images\/|assets\/|public\/|(?:写进|寫進|保存到|存到|放到).{0,16}(?:图|圖|png|jpe?g|webp|项目|專案|目录|目錄)/i;
+
 function looksLikeImageIntent(text: string) {
   return /(?:生成|画|畫|绘制|繪製).{0,12}(?:图|圖|照片|插画|插畫)|一张图|一張圖|(?<![产產])生图|(?<![产產])生圖|(?<![列找提])出图|(?<![列找提])出圖|文生图|文生圖|帮我画|幫我畫|(?:^|[\n\s])imagine(?:\s+(?:a|an|me)\b|\s*:)|image\s*gen|(?:draw|make|create|generate)\s+(?:me\s+)?(?:an?\s+)?(?:image|picture|illustration)\b(?!\s*(?:component|element|tag|url|path|asset|slider|src|file|icon))/i.test(
     text,
   );
+}
+
+function looksLikeAssetMake(text: string) {
+  return /(?:生成|画|畫|做|出|准备|準備).{0,12}(?:素材|图标|圖標|配图|配圖|封面|背景|logo|icon|asset)/i.test(text);
 }
 
 export function wantsImageGen(text: string) {
@@ -38,7 +45,19 @@ export function wantsImageGen(text: string) {
   if (!value) return false;
   if (!looksLikeImageIntent(value)) return false;
   // Mixed coding / review prompts stay on Grok. "帮我画一下这个界面" is UI work, not Imagine.
-  return !CODING_OR_REVIEW.test(value);
+  return !CODING_OR_REVIEW.test(value) && !PROJECT_ASSET_HINT.test(value);
+}
+
+/** Coding task that needs files on disk, not a picture in the transcript. */
+export function wantsProjectImageAsset(text: string) {
+  const value = text.trim();
+  if (!value || wantsImageGen(value)) return false;
+  if (!looksLikeImageIntent(value) && !looksLikeAssetMake(value)) return false;
+  return CODING_OR_REVIEW.test(value) || PROJECT_ASSET_HINT.test(value);
+}
+
+export function allowsImageGenTool(text: string) {
+  return wantsImageGen(text) || wantsProjectImageAsset(text);
 }
 
 /** Bypass ACP only for short, image-only prompts. Coding / screenshot-to-UI stays on Grok. */
@@ -378,6 +397,8 @@ function GeneratingField() {
 
     let raf = 0;
     let live = true;
+    let lastPaint = 0;
+    const frameMs = 50;
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const blobs = [
       { phase: 0.2, speed: 0.22, radius: 0.3, ampX: 0.22, ampY: 0.18 },
@@ -387,10 +408,19 @@ function GeneratingField() {
 
     const paint = (now: number) => {
       if (!live) return;
+      if (document.hidden) {
+        raf = 0;
+        return;
+      }
+      if (!reduced && lastPaint && now - lastPaint < frameMs) {
+        raf = requestAnimationFrame(paint);
+        return;
+      }
+      lastPaint = now;
       const parent = canvas.parentElement;
       const width = Math.max(1, parent?.clientWidth || 420);
       const height = Math.max(1, parent?.clientHeight || 236);
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const dpr = Math.min(1.25, window.devicePixelRatio || 1);
       const pixelW = Math.floor(width * dpr);
       const pixelH = Math.floor(height * dpr);
       if (canvas.width !== pixelW || canvas.height !== pixelH) {
@@ -410,7 +440,7 @@ function GeneratingField() {
         r: blob.radius,
       }));
 
-      const gap = 11;
+      const gap = 16;
       for (let y = gap * 0.55; y < height + gap; y += gap) {
         for (let x = gap * 0.55; x < width + gap; x += gap) {
           const nx = x / width;
@@ -434,13 +464,22 @@ function GeneratingField() {
       if (!reduced) raf = requestAnimationFrame(paint);
     };
 
+    const resume = () => {
+      if (!live || raf || document.hidden || reduced) return;
+      raf = requestAnimationFrame(paint);
+    };
     paint(performance.now());
-    const observer = new ResizeObserver(() => paint(performance.now()));
+    const observer = new ResizeObserver(() => {
+      lastPaint = 0;
+      resume();
+    });
     if (canvas.parentElement) observer.observe(canvas.parentElement);
+    document.addEventListener("visibilitychange", resume);
     return () => {
       live = false;
       cancelAnimationFrame(raf);
       observer.disconnect();
+      document.removeEventListener("visibilitychange", resume);
     };
   }, []);
 
@@ -606,14 +645,16 @@ export const ChatMessageMedia = memo(function ChatMessageMedia({
   sessionDir?: string;
   onRedraw?: () => void;
 }) {
-  const images = mergeMessageMedia(
-    (message.media || []).map((item) =>
-      item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
-    ),
-    mediaFromEvents(message.events, 0).map((item) =>
-      item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
-    ),
-  ).filter(isShowableImage);
+  const images = allowImageUi
+    ? mergeMessageMedia(
+        (message.media || []).map((item) =>
+          item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
+        ),
+        mediaFromEvents(message.events, 0).map((item) =>
+          item.uri ? { ...item, uri: resolveMediaUri(item.uri, sessionDir) } : item,
+        ),
+      ).filter(isShowableImage)
+    : [];
   const imageEvents = allowImageUi ? message.events || [] : [];
   let pending = imageEvents.filter(isImageGenActive).length;
   if (expectImage && allowImageUi && !images.length && message.streaming) pending = Math.max(pending, 1);
@@ -622,7 +663,10 @@ export const ChatMessageMedia = memo(function ChatMessageMedia({
   const failed = Boolean(!images.length && !message.streaming && rawFail);
   const placeholders = Math.max(0, pending - images.length);
   const others = (message.media || []).filter((item) => !isShowableImage(item));
-  const text = stripImageDumpText(message.text || "", images.length > 0 || placeholders > 0 || failed);
+  const text = stripImageDumpText(
+    allowImageUi ? message.text || "" : (message.text || "").replace(/!\[[^\]]*\]\([^)]+\)/g, ""),
+    images.length > 0 || placeholders > 0 || failed || !allowImageUi,
+  );
   const aspect = aspectFromEvents(message.events);
   if (!text && !images.length && !placeholders && !others.length && !failed) return null;
 
