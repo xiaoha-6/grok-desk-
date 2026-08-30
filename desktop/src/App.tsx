@@ -78,6 +78,7 @@ import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
 import { QuickOpen } from "./QuickOpen";
 import { SettingsView } from "./SettingsView";
+import { bridgeLabel, bridgeSessionMeta } from "./bridgeCatalog";
 import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
 import type { RunJob } from "./launch";
 import { applySubagentUpdate, exploreTitle, isBuildCommand, isCommandEvent, isImageGenEvent, isRedundantExtension, isSubagentUpdate, jsonText, looksLikeCommand } from "./timeline";
@@ -103,6 +104,8 @@ import {
   type AcpTurnDone,
   type AcpUpdate,
   type AppSettings,
+  type BridgeInbound,
+  type BridgePairing,
   type CatalogModel,
   type ChatMessage,
   type ContextUsage,
@@ -1645,6 +1648,7 @@ export default function App() {
     extraAttachments?: PromptAttachment[],
     options?: { fromQueue?: boolean; conversationId?: string; messageId?: string; interrupt?: boolean; displayText?: string },
   ) => Promise<void>>(async () => {});
+  const handleBridgeInboundRef = useRef<(payload: BridgeInbound) => void>(() => {});
   const shownCountRef = useRef(VIEW_PAGE);
   const showTerminalRef = useRef(showTerminal);
   const workspaceRootRef = useRef("");
@@ -1667,6 +1671,7 @@ export default function App() {
   shownCountRef.current = shownCount;
   showTerminalRef.current = showTerminal;
   sendTextRef.current = sendText;
+  handleBridgeInboundRef.current = handleBridgeInbound;
 
   useEffect(() => {
     const next = resolveSelectedId(conversations, selectedId);
@@ -2274,6 +2279,28 @@ export default function App() {
       setStatusText(cancelled ? tRef.current.stopped : err || tRef.current.ready);
     }
     notifyTurnDone(tRef.current, !cancelled && !err);
+    if (!cancelled && !err && targetId) {
+      const conv = conversationsRef.current.find((item) => item.id === targetId);
+      const assistant = [...(conv?.messages || [])].reverse().find((item) => item.role === "assistant" && !item.streaming);
+      const text = (assistant?.text || "").trim();
+      if (text && !targetId.startsWith("bridge-pending")) {
+        const session = bridgeSessionMeta(targetId, conv);
+        const media = (assistant?.media || [])
+          .filter((item) => item.uri || item.data)
+          .map((item) => ({ uri: item.uri, data: item.data, mimeType: item.mimeType, name: item.name }));
+        void invoke<string>("bridges_send", {
+          text,
+          title: conv?.title || "",
+          ...(session.kind ? { kind: session.kind } : {}),
+          ...(session.target ? { target: session.target } : {}),
+          media,
+        })
+          .then((out) => {
+            if (out && /:\s/.test(out)) setStatusText(`${tRef.current.bridgeSendFailed} ${out}`);
+          })
+          .catch((err) => setStatusText(`${tRef.current.bridgeSendFailed} ${String(err)}`));
+      }
+    }
     if (!cancelled && !err && settingsRef.current.gitAutoCommit) {
       const root = workspaceRootRef.current;
       if (root) {
@@ -3412,6 +3439,12 @@ export default function App() {
         }),
       );
       await add(listen<RelayImport>("relay-import", (event) => void consumeDeeplinkRef.current(event.payload)));
+      await add(listen<BridgeInbound>("bridge-inbound", (event) => handleBridgeInboundRef.current(event.payload)));
+      await add(
+        listen<BridgePairing[]>("bridge-pairing", (event) => {
+          if (event.payload?.length) setStatusText(tRef.current.bridgePairingPending);
+        }),
+      );
       await add(
         getCurrentWebview().onDragDropEvent((event) => {
           if (event.payload.type === "over" || event.payload.type === "enter") setDragOver(true);
@@ -3774,6 +3807,44 @@ export default function App() {
     } catch (error) {
       setStatusText(localizeThrown(error, t));
     }
+  }
+  function handleBridgeInbound(payload: BridgeInbound) {
+    const kind = String(payload.kind || "").trim() || "unknown";
+    const slot = String(payload.target || payload.sender || "inbox")
+      .replace(/[^\w:@.+-]/g, "")
+      .slice(0, 48) || "inbox";
+    const id = `bridge-${kind}-${slot}`;
+    const label = bridgeLabel(kind, lang);
+    const text = String(payload.text || "").trim();
+    if (!text) return;
+    const existing = conversationsRef.current.find((item) => item.id === id);
+    const bridgeTarget = String(payload.target || payload.sender || "").trim();
+    if (!existing) {
+      const path = usableWorkspace(cwdRef.current, statusRef.current?.homeDir || "");
+      const created: Conversation = {
+        id,
+        title: `${label}${payload.sender ? ` · ${payload.sender}` : ""}`,
+        cwd: path,
+        messages: [],
+        updatedAt: Date.now(),
+        bridgeKind: kind,
+        bridgeTarget,
+      };
+      setConversations((list) => {
+        const next = [created, ...list.filter((item) => item.id !== id)];
+        conversationsRef.current = next;
+        return next;
+      });
+    } else if (!existing.bridgeKind || !existing.bridgeTarget) {
+      setConversations((list) => {
+        const next = list.map((item) =>
+          item.id === id ? { ...item, bridgeKind: item.bridgeKind || kind, bridgeTarget: item.bridgeTarget || bridgeTarget } : item,
+        );
+        conversationsRef.current = next;
+        return next;
+      });
+    }
+    void sendTextRef.current(text, [], { conversationId: id, displayText: text });
   }
   async function sendText(
     text: string,

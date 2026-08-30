@@ -1,6 +1,8 @@
 mod accounts;
 mod acp;
+mod bridges;
 mod config;
+mod feishu_ws;
 mod git;
 mod image_gen;
 mod install;
@@ -17,6 +19,7 @@ use accounts::{
     AccountRecord, AccountState, LoginSlot, SkillDirs, SkillRecord,
 };
 use acp::{AcpClient, AcpHub, AcpStatus, PromptAttachment, SessionInfo, SessionOptions};
+use bridges::{BridgeHub, BridgeMedia, BridgesConfig, BridgesStatus, BridgePairing};
 use config::{
     parse_deeplink, write_config, ModelCatalog, ModelListRequest, RelayImport, RelayQuota, RelayUsage,
 };
@@ -39,6 +42,7 @@ use tauri_plugin_opener::OpenerExt;
 struct AppState {
     pending_import: Mutex<Option<RelayImport>>,
     acp: Arc<AcpHub>,
+    bridges: Arc<BridgeHub>,
     login: LoginSlot,
 }
 
@@ -47,6 +51,7 @@ impl Default for AppState {
         Self {
             pending_import: Mutex::new(None),
             acp: Arc::new(AcpHub::default()),
+            bridges: Arc::new(BridgeHub::default()),
             login: Arc::new(Mutex::new(None)),
         }
     }
@@ -303,7 +308,6 @@ async fn read_project_rules(root: String, ssh: Option<SshTarget>) -> Result<Opti
     })
     .await
 }
-
 #[tauri::command]
 async fn write_project_rules(root: String, content: String, ssh: Option<SshTarget>) -> Result<ProjectRules, String> {
     run_blocking(move || {
@@ -803,6 +807,60 @@ fn reveal_in_folder(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+fn bridges_load(state: State<AppState>) -> BridgesConfig {
+    state.bridges.snapshot()
+}
+
+#[tauri::command]
+fn bridges_status(state: State<AppState>) -> BridgesStatus {
+    state.bridges.status()
+}
+
+#[tauri::command]
+fn bridges_apply(app: AppHandle, state: State<AppState>, config: BridgesConfig) -> Result<BridgesStatus, String> {
+    state.bridges.apply(app, config)
+}
+
+#[tauri::command]
+fn bridges_send(
+    state: State<AppState>,
+    text: String,
+    title: Option<String>,
+    kind: Option<String>,
+    target: Option<String>,
+    media: Option<Vec<BridgeMedia>>,
+) -> Result<String, String> {
+    state.bridges.send(
+        kind,
+        &text,
+        title.as_deref().unwrap_or(""),
+        media.as_deref().unwrap_or(&[]),
+        target.as_deref().unwrap_or(""),
+    )
+}
+
+#[tauri::command]
+fn bridges_test(state: State<AppState>, kind: String) -> Result<String, String> {
+    state.bridges.test(&kind)
+}
+
+#[tauri::command]
+fn bridges_probe(state: State<AppState>, kind: String) -> Result<String, String> {
+    state.bridges.probe(&kind)
+}
+
+#[tauri::command]
+fn bridges_pairing_decide(
+    app: AppHandle,
+    state: State<AppState>,
+    kind: String,
+    sender: String,
+    accept: bool,
+) -> Result<Vec<BridgePairing>, String> {
+    state.bridges.decide_pairing(app, &kind, &sender, accept)
+}
+
 fn focus_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         focus_window(&window);
@@ -890,6 +948,12 @@ pub fn run() {
                     urls.into_iter().map(|u| u.to_string()).collect(),
                 );
             }
+            if let Some(state) = app.try_state::<AppState>() {
+                let config = state.bridges.snapshot();
+                if config.enabled {
+                    let _ = state.bridges.apply(app.handle().clone(), config);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -963,7 +1027,14 @@ pub fn run() {
             pty_write,
             pty_resize,
             pty_close,
-            pty_detect
+            pty_detect,
+            bridges_load,
+            bridges_status,
+            bridges_apply,
+            bridges_send,
+            bridges_test,
+            bridges_probe,
+            bridges_pairing_decide
         ])
         .run(tauri::generate_context!())
         .expect("error while running GrokDesk");

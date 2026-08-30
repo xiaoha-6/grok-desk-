@@ -8,6 +8,7 @@ import {
   IconChevronLeft,
   IconFolder,
   IconGear,
+  IconGlobe,
   IconInfinity,
   IconKeyboard,
   IconPerson,
@@ -19,6 +20,7 @@ import {
   IconSpark,
   IconTerminal,
 } from "./icons";
+import { BridgesPanel } from "./BridgesPanel";
 import { KeybindingsEditor } from "./KeybindingsEditor";
 import { RelayUsagePanel } from "./RelayUsagePanel";
 import { fill, type Copy } from "./i18n";
@@ -273,6 +275,7 @@ export function SettingsView(props: {
     { id: "compatibility", title: copy.compatibility, icon: <IconSliders />, group: copy.usageNavWork },
     { id: "keyboard", title: copy.kbPage, icon: <IconKeyboard />, group: copy.usageNavWork },
     { id: "skills", title: copy.skills, icon: <IconBox />, group: copy.usageNavWork },
+    { id: "bridges", title: copy.bridges, icon: <IconGlobe />, group: copy.usageNavWork, keys: "飞书 微信 qq discord telegram slack whatsapp 钉钉 teams 桥接 bot channel" },
     { id: "accounts", title: copy.accounts, icon: <IconPerson />, group: copy.usageNavAccount },
     { id: "archived", title: copy.archived, icon: <IconArchive />, group: copy.usageNavAccount },
   ];
@@ -764,6 +767,8 @@ export function SettingsView(props: {
               )}
             </>
           )}
+
+          {props.settingsPage === "bridges" && <BridgesPanel copy={copy} lang={props.lang} />}
 
           {props.settingsPage === "accounts" && (
             <>

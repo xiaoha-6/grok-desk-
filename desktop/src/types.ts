@@ -278,6 +278,8 @@ export type Conversation = {
   archivedAt?: number;
   historyHasMore?: boolean;
   historySkip?: number;
+  bridgeKind?: string;
+  bridgeTarget?: string;
 };
 
 export type LocalSessionSummary = {
@@ -430,6 +432,98 @@ export type AppSettings = {
   gitAutoCommitMessage?: string;
 };
 
+export type BridgeKind = string;
+
+export type BridgeDmPolicy = "pairing" | "allowlist" | "open" | "disabled";
+export type BridgeGroupPolicy = "open" | "allowlist" | "disabled";
+
+export type BridgeChannel = {
+  enabled: boolean;
+  dmPolicy: BridgeDmPolicy;
+  allowFrom: string;
+  groupPolicy: BridgeGroupPolicy;
+  requireMention: boolean;
+  mirrorOutbound: boolean;
+  acceptInbound: boolean;
+  defaultTarget: string;
+  token: string;
+  appId: string;
+  appSecret: string;
+  domain: string;
+  connectionMode: "websocket" | "webhook";
+  verificationToken: string;
+  encryptKey: string;
+  webhookUrl: string;
+};
+
+export type BridgesConfig = {
+  enabled: boolean;
+  channels: Record<string, BridgeChannel>;
+};
+
+export type BridgeChannelStatus = {
+  id: BridgeKind;
+  enabled: boolean;
+  running: boolean;
+  error?: string;
+};
+
+export type BridgesStatus = {
+  enabled: boolean;
+  running: boolean;
+  webhook: string;
+  channels: BridgeChannelStatus[];
+  pairings: BridgePairing[];
+};
+
+export type BridgeInbound = {
+  kind: BridgeKind;
+  sender: string;
+  target: string;
+  text: string;
+};
+
+export type BridgePairing = {
+  kind: BridgeKind;
+  sender: string;
+  target: string;
+  code: string;
+  preview: string;
+  createdAt: number;
+};
+
+export type BridgeMedia = {
+  uri?: string;
+  data?: string;
+  mimeType?: string;
+  name?: string;
+};
+
+export function defaultBridgeChannel(): BridgeChannel {
+  return {
+    enabled: false,
+    dmPolicy: "pairing",
+    allowFrom: "",
+    groupPolicy: "allowlist",
+    requireMention: true,
+    mirrorOutbound: true,
+    acceptInbound: true,
+    defaultTarget: "",
+    token: "",
+    appId: "",
+    appSecret: "",
+    domain: "",
+    connectionMode: "websocket",
+    verificationToken: "",
+    encryptKey: "",
+    webhookUrl: "",
+  };
+}
+
+export function defaultBridgesConfig(): BridgesConfig {
+  return { enabled: false, channels: {} };
+}
+
 export type Theme = "system" | "light" | "dark";
 export type View = "chat" | "settings";
 export type SettingsPage =
@@ -442,6 +536,7 @@ export type SettingsPage =
   | "compatibility"
   | "keyboard"
   | "skills"
+  | "bridges"
   | "accounts"
   | "archived";
 

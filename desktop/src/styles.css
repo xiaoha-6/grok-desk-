@@ -1347,12 +1347,15 @@ button { background: none; }
   margin: 0 0 24px;
   font-size: 25px;
   font-weight: 600;
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
+  line-height: 1.25;
 }
 .lede {
   margin: 0 0 18px;
   color: var(--text-2);
-  line-height: 1.55;
+  line-height: 1.65;
+  letter-spacing: 0;
+  max-width: 42em;
 }
 .group {
   background: var(--group);
@@ -1378,13 +1381,15 @@ button { background: none; }
   flex: 1 1 auto;
 }
 .group .settings-row:last-child { border-bottom: 0; }
-.row-title { font-size: var(--item); }
+.row-title { font-size: var(--item); letter-spacing: 0; line-height: 1.35; }
 .row-detail {
   margin-top: 3px;
   color: var(--text-2);
-  font-size: 12.5px;
-  line-height: 1.4;
-  word-break: break-all;
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 .row-control {
   flex: 0 0 auto;
@@ -5127,6 +5132,116 @@ button.ws-row { padding: 4px 8px; }
 }
 .kb-empty, .kb-wait { font-size: 12px; color: var(--text-3); }
 .kb-wait { color: var(--text); }
+
+.bridge-group {
+  display: grid;
+  gap: 8px;
+  margin: 22px 0 4px;
+}
+.bridge-group .section-label {
+  padding: 0 2px 2px;
+  letter-spacing: 0.02em;
+  font-size: 12px;
+  font-weight: 600;
+}
+.bridge-group .group {
+  margin-bottom: 0;
+}
+.bridge-card.on {
+  border-color: color-mix(in srgb, var(--text) 16%, var(--hairline));
+}
+.bridge-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  border: 0;
+  background: none;
+  color: inherit;
+  padding: 14px 16px;
+  cursor: pointer;
+  text-align: left;
+}
+.bridge-card-copy {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 4px;
+}
+.bridge-card-head strong {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.3;
+}
+.bridge-card-hint {
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.bridge-card-head .pill {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.bridge-fields {
+  display: grid;
+  gap: 0;
+  padding: 0;
+  border-top: 1px solid var(--hairline);
+}
+.bridge-fields .bridge-field {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+.bridge-fields > .actions {
+  padding: 12px 16px 14px;
+  margin: 0;
+}
+.bridge-fields > .error {
+  margin: 8px 16px 0;
+}
+.bridge-field {
+  display: grid;
+  gap: 6px;
+}
+.bridge-field span {
+  display: grid;
+  gap: 2px;
+  font-size: 13px;
+  line-height: 1.45;
+  letter-spacing: 0;
+  color: var(--text);
+}
+.bridge-field em {
+  font-style: normal;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+.bridge-pairing {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 12px 16px;
+}
+.bridge-pairing strong {
+  display: block;
+  letter-spacing: 0;
+  line-height: 1.3;
+}
+.bridge-pairing span,
+.bridge-pairing em {
+  display: block;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-3);
+  font-style: normal;
+}
 
 @media (max-width: 860px) {
   .sidebar, .resize, .inspector, .workspace, .workspace-edge { display: none; }

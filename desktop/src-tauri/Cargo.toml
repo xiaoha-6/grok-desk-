@@ -1,6 +1,6 @@
 [package]
 name = "grokdesk"
-version = "0.6.69"
+version = "0.6.70"
 description = "GrokDesk — desktop ACP workspace for official Grok Build"
 authors = ["xiaoha"]
 edition = "2021"
@@ -25,6 +25,12 @@ arboard = "3"
 png = "0.17"
 base64 = "0.22"
 portable-pty = { path = "vendor/portable-pty" }
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+sha2 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = "0.4"
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
