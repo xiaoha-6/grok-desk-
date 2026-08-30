@@ -92,7 +92,7 @@ export function friendlyImageError(raw: string, copy: Copy) {
   if (/timeout|timed out|超时|超時|逾時/i.test(text)) {
     return copy.imageGenTimeout;
   }
-  if (/context_too_large|context too large|请求内容过大|上下文.{0,8}过大/i.test(text)) {
+  if (/context_too_large|context too large|请求内容过大|上下文.{0,16}(过大|太长|超限|爆了)|maximum context|too many tokens|prompt is too long/i.test(text)) {
     return copy.contextTooLarge;
   }
   return text || copy.imageGenFailed;

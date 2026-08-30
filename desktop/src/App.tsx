@@ -80,7 +80,7 @@ import { QuickOpen } from "./QuickOpen";
 import { SettingsView } from "./SettingsView";
 import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
 import type { RunJob } from "./launch";
-import { isCommandEvent, isImageGenEvent, isRedundantExtension, jsonText } from "./timeline";
+import { applySubagentUpdate, exploreTitle, isBuildCommand, isCommandEvent, isImageGenEvent, isRedundantExtension, isSubagentUpdate, jsonText, looksLikeCommand } from "./timeline";
 import {
   allSlashItems,
   filterSlashItems,
@@ -140,11 +140,17 @@ import {
 
 const LEGACY_CONTEXT_WINDOW = 225000;
 const DEFAULT_CONTEXT_WINDOW = 500000;
+const RELAY_SAFE_CONTEXT_WINDOW = 128000;
+const RELAY_COMPACT_PERCENT = 60;
 const HISTORY_PAGE = 80;
 const VIEW_PAGE = 80;
+const PROJECT_CHAT_PREVIEW = 8;
 const MAX_ATTACHMENTS = 8;
 const MAX_PENDING_FILES = 16;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const CHAT_MIN_WIDTH = 440;
+const WORKSPACE_MIN_WIDTH = 320;
+const WORKSPACE_MAX_WIDTH = 720;
 
 type PendingFile = {
   id: string;
@@ -153,6 +159,36 @@ type PendingFile = {
   mention: string;
   isDir: boolean;
 };
+
+type IgnoredDrop = {
+  name: string;
+  reason: "limit" | "unreadable";
+};
+
+function windowWidth() {
+  return typeof window === "undefined" ? 1280 : window.innerWidth;
+}
+
+function layoutChrome(sidebarWidth: number, showSidebar: boolean) {
+  return (showSidebar ? sidebarWidth + 7 : 0) + 7;
+}
+
+function maxWorkspaceForWindow(sidebarWidth: number, showSidebar: boolean, width = windowWidth()) {
+  const leftover = width - layoutChrome(sidebarWidth, showSidebar) - CHAT_MIN_WIDTH;
+  if (leftover >= WORKSPACE_MIN_WIDTH) return leftover;
+  return Math.max(240, width - layoutChrome(sidebarWidth, showSidebar) - 360);
+}
+
+function fitWorkspaceWidth(width: number, sidebarWidth: number, showSidebar: boolean, viewport = windowWidth()) {
+  const max = Math.min(WORKSPACE_MAX_WIDTH, maxWorkspaceForWindow(sidebarWidth, showSidebar, viewport));
+  const min = Math.min(WORKSPACE_MIN_WIDTH, max);
+  return Math.round(Math.min(Math.max(min, width), max));
+}
+
+function preferredWorkspaceWidth(sidebarWidth: number, showSidebar: boolean, viewport = windowWidth()) {
+  const remain = Math.max(0, viewport - layoutChrome(sidebarWidth, showSidebar));
+  return fitWorkspaceWidth(Math.round(remain * 0.38), sidebarWidth, showSidebar, viewport);
+}
 
 type LocalPathInfo = {
   path: string;
@@ -310,6 +346,38 @@ function hydrateProjects(list: ProjectRecord[] | undefined): ProjectRecord[] {
   return next;
 }
 
+function SidebarSession(props: {
+  item: Conversation;
+  selected: boolean;
+  live: boolean;
+  nested?: boolean;
+  deleteLabel: string;
+  onSelect: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <button
+      className={`session${props.nested ? " nested" : ""}${props.selected ? " on" : ""}`}
+      type="button"
+      onClick={props.onSelect}
+    >
+      {props.nested ? null : <IconChat className="session-ico" size={15} />}
+      <span className="session-title">{props.item.title}</span>
+      {props.live ? <span className="session-live" /> : null}
+      <span
+        className="session-delete"
+        title={props.deleteLabel}
+        onClick={(event) => {
+          event.stopPropagation();
+          props.onDelete();
+        }}
+      >
+        <IconClose />
+      </span>
+    </button>
+  );
+}
+
 function isMissingCredentials(raw: string) {
   return /GROKDESK_NO_CREDENTIALS|还没有可用的登录或 API Key|還沒有可用的登入或 API Key|no login or api key/i.test(
     raw,
@@ -326,9 +394,22 @@ function localizeThrown(error: unknown, copy: Copy) {
 }
 
 function isContextTooLarge(raw?: string) {
-  return /context_too_large|context too large|请求内容过大|上下文.{0,8}过大|超過了可處理|超过了可处理/i.test(
+  return /context_too_large|context too large|请求内容过大|上下文.{0,16}(过大|太长|超限|爆了)|超過了可處理|超过了可处理|maximum context|context length|too many tokens|prompt is too long|input.{0,12}too long|长度超限|超過最大|超过最大/i.test(
     String(raw || ""),
   );
+}
+
+function channelContextWindow(settings: AppSettings, relayOn: boolean, catalog?: CatalogModel | null) {
+  const user = Math.max(16_000, Number(settings.contextWindowTokens) || DEFAULT_CONTEXT_WINDOW);
+  if (!relayOn) return user;
+  const listed = Number(catalog?.contextWindow || 0);
+  const channel = listed > 0 && listed < 400_000 ? listed : RELAY_SAFE_CONTEXT_WINDOW;
+  return Math.min(user, channel);
+}
+
+function channelCompactPercent(settings: AppSettings, relayOn: boolean) {
+  const user = Math.min(99, Math.max(50, Number(settings.autoCompactThresholdPercent) || 85));
+  return relayOn ? Math.min(user, RELAY_COMPACT_PERCENT) : user;
 }
 
 function friendlyError(raw: string, copy: Copy) {
@@ -385,8 +466,12 @@ function sealAssistantMessage(message: ChatMessage, options?: { error?: string; 
     error: err || (cancelled ? undefined : message.error),
     events: (message.events || []).map((event) => {
       let next = event;
-      if (event.kind === "thought" && thoughtOut) {
-        next = { ...event, output: thoughtOut };
+      if (event.kind === "thought") {
+        next = {
+          ...event,
+          output: thoughtOut || event.output,
+          input: thoughtTimingPayload(event.input, true),
+        };
       }
       if (!cancelled && err && isImageGenEvent(next)) {
         const status = String(next.status || "").toLowerCase();
@@ -400,6 +485,22 @@ function sealAssistantMessage(message: ChatMessage, options?: { error?: string; 
       return { ...next, status: "cancelled" };
     }),
   };
+}
+
+function thoughtTimingPayload(existing?: string, end = false) {
+  let startedAt = Date.now();
+  let endedAt: number | undefined;
+  try {
+    const rec = existing ? (JSON.parse(existing) as Record<string, unknown>) : {};
+    if (rec && typeof rec === "object") {
+      startedAt = Number(rec.startedAt) || startedAt;
+      endedAt = Number(rec.endedAt) || undefined;
+    }
+  } catch {
+    /* keep defaults */
+  }
+  if (end && !endedAt) endedAt = Date.now();
+  return jsonText({ startedAt, endedAt });
 }
 
 function importSig(payload: RelayImport) {
@@ -557,7 +658,7 @@ function isAskToolTitle(title: string) {
 function extractShellCommand(inputRec?: Record<string, unknown>, input?: string) {
   const rec = inputRec || parseJsonRecord(input) || {};
   const nested = asRecord(rec.command) || asRecord(rec.cmd);
-  return firstString(
+  const found = firstString(
     rec.command,
     rec.cmd,
     rec.script,
@@ -573,6 +674,10 @@ function extractShellCommand(inputRec?: Record<string, unknown>, input?: string)
     parseJsonRecord(input)?.command,
     parseJsonRecord(input)?.cmd,
   );
+  if (found) return found;
+  const raw = String(input || "").trim();
+  if (raw && !raw.startsWith("{") && !raw.startsWith("[") && looksLikeCommand(raw)) return raw;
+  return "";
 }
 
 function extractShellOutput(output?: string) {
@@ -1185,6 +1290,8 @@ type PersistShape = {
   projects?: ProjectRecord[];
   activeProjectId?: string | null;
   sidebarGroupMode?: "project" | "list";
+  sidebarNavVersion?: number;
+  sidebarCollapsed?: Record<string, boolean>;
   form?: Partial<RelayImport>;
   sidebarWidth?: number;
   workspaceWidth?: number;
@@ -1247,7 +1354,12 @@ function relPath(cwd: string, raw: string) {
   return path.replace(/^\.\//, "");
 }
 
-async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | null) {
+async function expandPromptContext(
+  text: string,
+  cwd: string,
+  ssh: SshTarget | null,
+  options?: { slim?: boolean },
+) {
   let next = stripInjectedPromptContext(text);
   const askedImage = wantsImageGen(text);
   const projectAsset = wantsProjectImageAsset(text);
@@ -1258,11 +1370,19 @@ async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | n
     next +=
       "\n\n<tool_policy>用户没有要求生成图片。不要调用 ImageGen、Imagine 或 grok-imagine-image。用读文件和改代码回答。</tool_policy>";
   }
+  const slim = Boolean(options?.slim);
   const mentions = [...text.matchAll(/(?:^|[\s])@([^\s@]+)/g)].map((item) => item[1]);
   if (!cwd && !mentions.some((path) => isAbsoluteLocalPath(path))) return next;
+  if (slim) {
+    if (mentions.length) {
+      next += `\n\n<file_mentions>\n${mentions.join("\n")}\n请按需读取这些路径，不要把整文件贴回对话。\n</file_mentions>`;
+    }
+    return next;
+  }
   const seen = new Set<string>();
+  let inlineBudget = 40_000;
   for (const path of mentions) {
-    if (!path || seen.has(path)) continue;
+    if (!path || seen.has(path) || inlineBudget <= 0) continue;
     seen.add(path);
     const target = mentionReadTarget(cwd, path);
     const localOnly = isAbsoluteLocalPath(path) ? null : ssh || null;
@@ -1272,10 +1392,11 @@ async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | n
         path: target.path,
         ssh: localOnly,
       });
-      if (file.truncated || file.content.length > 80_000) {
-        next += `\n\n<file path="${path}">\n[file too large to inline]\n</file>`;
+      if (file.truncated || file.content.length > 24_000 || file.content.length > inlineBudget) {
+        next += `\n\n<file path="${path}">\n[file too large to inline — read it with tools]\n</file>`;
       } else {
         next += `\n\n<file path="${path}">\n${file.content}\n</file>`;
+        inlineBudget -= file.content.length;
       }
     } catch {
       try {
@@ -1293,9 +1414,9 @@ async function expandPromptContext(text: string, cwd: string, ssh: SshTarget | n
   }
   try {
     const rules = await invoke<{ path: string; content: string } | null>("read_project_rules", { root: cwd, ssh: ssh || null });
-  if (rules?.content.trim() && !askedImage) {
-        next += `\n\n<project_rules path="${rules.path}">\n${rules.content.slice(0, 20_000)}\n</project_rules>`;
-      }
+    if (rules?.content.trim() && !askedImage && inlineBudget > 2_000) {
+      next += `\n\n<project_rules path="${rules.path}">\n${rules.content.slice(0, Math.min(8_000, inlineBudget))}\n</project_rules>`;
+    }
   } catch {
     // no rules file is fine
   }
@@ -1345,7 +1466,12 @@ export default function App() {
   const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [showUsageCard, setShowUsageCard] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(Math.min(400, Math.max(220, saved.sidebarWidth || 280)));
-  const [workspaceWidth, setWorkspaceWidth] = useState(Math.min(820, Math.max(420, saved.workspaceWidth || 560)));
+  const [workspaceWidth, setWorkspaceWidth] = useState(() => {
+    const side = Math.min(400, Math.max(220, saved.sidebarWidth || 280));
+    const show = saved.showSidebar !== false;
+    if (saved.workspaceWidth) return fitWorkspaceWidth(saved.workspaceWidth, side, show);
+    return preferredWorkspaceWidth(side, show);
+  });
   const [model, setModel] = useState(canonicalModelId(saved.model || "grok-4.5") || "grok-4.5");
   const [cwd, setCwd] = useState(saved.cwd || "");
   const [prompt, setPrompt] = useState("");
@@ -1402,7 +1528,7 @@ export default function App() {
   const [projectRecords, setProjectRecords] = useState<ProjectRecord[]>(() => hydrateProjects(saved.projects));
   const [activeProjectId, setActiveProjectId] = useState<string | null>(saved.activeProjectId || null);
   const [sidebarGroupMode, setSidebarGroupMode] = useState<"project" | "list">(
-    saved.sidebarGroupMode === "list" ? "list" : "project",
+    (saved.sidebarNavVersion || 0) >= 2 && saved.sidebarGroupMode === "list" ? "list" : "project",
   );
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [createProjectKind, setCreateProjectKind] = useState<"local" | "remote">("local");
@@ -1410,7 +1536,11 @@ export default function App() {
   const sshForProjectRef = useRef(false);
   const [shownCount, setShownCount] = useState(VIEW_PAGE);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() =>
+    saved.sidebarCollapsed && typeof saved.sidebarCollapsed === "object" ? saved.sidebarCollapsed : {},
+  );
+  const [sidebarQuery, setSidebarQuery] = useState("");
+  const [showAllInProject, setShowAllInProject] = useState<Record<string, boolean>>({});
   const [accounts, setAccounts] = useState<AccountRecord[]>([]);
   const [addingAccount, setAddingAccount] = useState(false);
   const [refreshingQuota, setRefreshingQuota] = useState(false);
@@ -1435,6 +1565,7 @@ export default function App() {
   const [usageLoading, setUsageLoading] = useState(false);
   const [pendingImages, setPendingImages] = useState<PromptAttachment[]>([]);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  const [ignoredDrops, setIgnoredDrops] = useState<IgnoredDrop[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [rawEvents, setRawEvents] = useState<Array<{ method: string; payload: string }>>([]);
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null);
@@ -1471,6 +1602,9 @@ export default function App() {
   const persistTimerRef = useRef(0);
   const persistNowRef = useRef(() => {});
   const contextRetryRef = useRef(new Set<string>());
+  const compactRetryingRef = useRef(new Set<string>());
+  const lastOutboundRef = useRef<Record<string, { text: string; attachments: PromptAttachment[]; assistantId: string; turnId: number }>>({});
+  const retryCompactRef = useRef<(conversationId: string) => Promise<void>>(async () => {});
   const modelRef = useRef(model);
   const cwdRef = useRef(cwd);
   const statusRef = useRef(status);
@@ -1565,18 +1699,15 @@ export default function App() {
       setAgentTermJobs([]);
       return;
     }
-    if (!runningRef.current) {
-      setAgentTermJobs([]);
-      return;
-    }
     const conversation = conversationsRef.current.find((item) => item.id === selectedIdRef.current);
     const last = findLast(conversation?.messages, (item) => item.role === "assistant");
     const jobs = (last?.events || [])
       .map(agentJobFromEvent)
       .filter((item): item is AgentTermJob => Boolean(item))
-      .filter((item) => !isGeneratedImageProbe(item.command) && !/complete|success|fail|error|cancel/i.test(item.status));
+      .filter((item) => !isGeneratedImageProbe(item.command))
+      .slice(-6);
     setAgentTermJobs(jobs);
-  }, [showTerminal, selectedId, liveTurns]);
+  }, [showTerminal, selectedId, liveTurns, conversations]);
   const visibleMessages = useMemo(() => {
     const base = selected?.messages || [];
     if (!stickyOutgoing.length) return base;
@@ -1649,10 +1780,10 @@ export default function App() {
   const projectListSig = conversations
     .map((item) => `${item.id}\t${item.title}\t${item.cwd}\t${item.archivedAt || ""}\t${item.projectId || ""}\t${item.updatedAt}`)
     .join("\n");
-  const projects = useMemo(() => {
+  const sidebarTree = useMemo(() => {
     const explicit = hydrateProjects(projectRecords);
     const assigned = new Set<string>();
-    const groups: Array<{
+    const folders: Array<{
       id: string;
       path: string;
       name: string;
@@ -1661,11 +1792,14 @@ export default function App() {
       explicit: boolean;
       items: Conversation[];
     }> = [];
+    const recent: Conversation[] = [];
     const live = dedupeConversations(conversationsRef.current).filter((conversation) => !conversation.archivedAt);
     for (const project of explicit) {
-      const items = live.filter((item) => item.projectId === project.id || (!item.projectId && sameWorkspace(item, project)));
+      const items = live
+        .filter((item) => item.projectId === project.id || (!item.projectId && sameWorkspace(item, project)))
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
       for (const item of items) assigned.add(item.id);
-      groups.push({
+      folders.push({
         id: project.id,
         path: workspaceKey(project.cwd, project.ssh),
         name: project.name,
@@ -1684,22 +1818,47 @@ export default function App() {
       leftovers.set(key, list);
     }
     for (const [path, items] of leftovers) {
-      groups.push({
+      items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      const ssh = items[0]?.ssh || null;
+      const homeish = !ssh?.host && isHomeLikePath(path, homeDir);
+      if (homeish) {
+        recent.push(...items);
+        continue;
+      }
+      folders.push({
         id: `cwd:${path || "home"}`,
         path,
-        name: items[0]?.ssh ? sshLabel(items[0].ssh) : workspaceLabel(path, homeDir, t.home),
+        name: ssh?.host ? sshLabel(ssh) : workspaceLabel(path, homeDir, t.home),
         cwd: path,
-        ssh: items[0]?.ssh || null,
+        ssh,
         explicit: false,
         items,
       });
     }
-    return groups.sort((a, b) => {
+    recent.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    folders.sort((a, b) => {
       const aTime = Math.max(a.explicit ? (explicit.find((item) => item.id === a.id)?.updatedAt || 0) : 0, a.items[0]?.updatedAt || 0);
       const bTime = Math.max(b.explicit ? (explicit.find((item) => item.id === b.id)?.updatedAt || 0) : 0, b.items[0]?.updatedAt || 0);
       return bTime - aTime;
     });
+    return { folders, recent };
   }, [projectListSig, homeDir, t.home, projectRecords]);
+
+  const visibleTree = useMemo(() => {
+    const query = sidebarQuery.trim().toLowerCase();
+    const match = (text: string) => !query || text.toLowerCase().includes(query);
+    const folders = sidebarTree.folders
+      .map((folder) => ({
+        ...folder,
+        items: folder.items.filter((item) => match(item.title) || match(folder.name)),
+      }))
+      .filter((folder) => !query || match(folder.name) || folder.items.length > 0);
+    return {
+      query,
+      folders,
+      recent: sidebarTree.recent.filter((item) => match(item.title)),
+    };
+  }, [sidebarTree, sidebarQuery]);
 
   const modelOptions = useMemo(() => mergeModelOptions(availableModels, model), [availableModels, model]);
   const usagePercent = Math.round(
@@ -1747,6 +1906,8 @@ export default function App() {
           projects: projectRecords,
           activeProjectId,
           sidebarGroupMode,
+          sidebarNavVersion: 2,
+          sidebarCollapsed: collapsed,
           sidebarWidth,
           workspaceWidth,
           showWorkspace,
@@ -1771,7 +1932,7 @@ export default function App() {
     window.clearTimeout(persistTimerRef.current);
     persistTimerRef.current = window.setTimeout(() => persistNowRef.current(), delay);
     return () => window.clearTimeout(persistTimerRef.current);
-  }, [lang, theme, model, cwd, selectedId, conversations, projectRecords, activeProjectId, sidebarGroupMode, sidebarWidth, workspaceWidth, showWorkspace, showTerminal, showSidebar, workspaceSide, terminalHeight, form, settings, availableModels, relayReady, liveTurns.length]);
+  }, [lang, theme, model, cwd, selectedId, conversations, projectRecords, activeProjectId, sidebarGroupMode, collapsed, sidebarWidth, workspaceWidth, showWorkspace, showTerminal, showSidebar, workspaceSide, terminalHeight, form, settings, availableModels, relayReady, liveTurns.length]);
 
   useEffect(() => () => window.clearTimeout(workspaceFocusDebounceRef.current), []);
 
@@ -1860,12 +2021,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    setUsage((current) =>
-      current.totalTokens === settings.contextWindowTokens
-        ? current
-        : { ...current, totalTokens: settings.contextWindowTokens },
-    );
-  }, [settings.contextWindowTokens]);
+    const catalogModel = availableModels.find((item) => item.id === canonicalModelId(model));
+    const total = channelContextWindow(settings, relayConfigured, catalogModel);
+    setUsage((current) => (current.totalTokens === total ? current : { ...current, totalTokens: total }));
+  }, [availableModels, model, relayConfigured, settings]);
+
+  useEffect(() => {
+    const clamp = () => {
+      setWorkspaceWidth((current) => fitWorkspaceWidth(current, sidebarWidth, showSidebar));
+    };
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, [sidebarWidth, showSidebar, showWorkspace]);
 
   const patchSettings = useCallback((patch: Partial<AppSettings>) => {
     const nextPatch =
@@ -2014,11 +2182,13 @@ export default function App() {
             final || assistant.thought.length <= 8000
               ? assistant.thought
               : assistant.thought.slice(-8000);
+          const prev = assistant.events.find((event) => event.id === "thought");
           assistant.events = upsertEvent(assistant.events, {
             id: "thought",
             kind: "thought",
             title: translate(uiLang).thinking,
             output,
+            input: thoughtTimingPayload(prev?.input, final),
           });
         }
       });
@@ -2085,20 +2255,15 @@ export default function App() {
               sticky.map((message) => ({ ...message, queued: false, local: true })),
             )
           : sealed;
-        const overflow = !cancelled && isContextTooLarge(error);
         return {
           ...item,
           messages: merged,
-          grokSessionId: overflow ? "" : item.grokSessionId,
           updatedAt: Date.now(),
         };
       });
       conversationsRef.current = next;
       return next;
     });
-    if (targetId && !cancelled && isContextTooLarge(error)) {
-      void invoke("stop_session", { conversationId: targetId }).catch(() => undefined);
-    }
     // Keep sticky until conversations have absorbed them on the next idle pass.
     if (targetId) {
       liveTurnsRef.current.delete(targetId);
@@ -2342,6 +2507,9 @@ export default function App() {
           const output = diffs.length ? undefined : jsonText(update.content ?? update.output ?? update.rawOutput);
           const askQuestions = parseAskQuestions(inputRec || { rawInput: update.rawInput ?? update.raw_input ?? update.input });
           const isAsk = Boolean(askQuestions.length) || isAskToolTitle(rawTitle);
+          const toolName = String(metaTool?.name || "");
+          const isSpawn = /spawn_subagent/i.test(`${kind} ${rawTitle} ${toolName}`);
+          const isPoll = /get_command_or_subagent|kill_command_or_subagent/i.test(`${kind} ${rawTitle} ${toolName}`);
           const imageLike = isImageGenEvent({
             id: `tool-${id}`,
             kind,
@@ -2353,15 +2521,86 @@ export default function App() {
             lastUserMessageText(conversationsRef.current.find((item) => item.id === targetId)?.messages),
           );
           const fileName = editPath.split("/").filter(Boolean).pop() || "";
-          const title = imageLike ? copy.imageGenTool : isAsk ? (rawTitle.startsWith("Ask") ? rawTitle : `Ask: ${rawTitle}`) : isEdit ? (fileName ? `Edit ${fileName}` : "Edit") : rawTitle;
+          const spawnTitle = String(inputRec?.description || "").trim();
+          const command = extractShellCommand(inputRec, input);
+          const shellOut = extractShellOutput(output);
+          const shellEvent = {
+            id: `tool-${id}`,
+            kind,
+            title: command || rawTitle,
+            input: command || input,
+            output: shellOut || output,
+          };
+          const shellLike = !isEdit && !isSpawn && !isAsk && (isCommandEvent(shellEvent) || Boolean(command) || looksLikeCommand(rawTitle));
+          const shellKind = shellLike && isBuildCommand(shellEvent) ? "build" : shellLike ? "execute" : kind;
+          const toolHay = `${kind} ${rawTitle} ${toolName}`;
+          const isSearch =
+            !isEdit &&
+            !isSpawn &&
+            !isAsk &&
+            !shellLike &&
+            /grep|\brg\b|search|glob|list_dir|web_search|web_fetch|^list$|list `/i.test(toolHay);
+          const isRead =
+            !isEdit &&
+            !isSpawn &&
+            !isAsk &&
+            !shellLike &&
+            !isSearch &&
+            (/read_file|^read$|read `/i.test(toolHay) || Boolean(editPath && !command));
+          const searchKind = /list_dir|^list$|glob|list `/i.test(toolHay)
+            ? "list"
+            : /fetch|web_fetch/i.test(toolHay)
+              ? "fetch"
+              : "search";
+          const fileKind = isRead ? "read" : isSearch ? searchKind : kind;
+          const title = imageLike
+            ? copy.imageGenTool
+            : isSpawn
+              ? spawnTitle || copy.subagentDefault
+              : isAsk
+                ? rawTitle.startsWith("Ask")
+                  ? rawTitle
+                  : `Ask: ${rawTitle}`
+                : isEdit
+                  ? fileName
+                    ? `Edit ${fileName}`
+                    : "Edit"
+                  : isRead || isSearch
+                    ? exploreTitle({
+                        id: `tool-${id}`,
+                        kind: fileKind,
+                        title: rawTitle,
+                        input,
+                        output,
+                      })
+                    : command || rawTitle;
+          const storedInput = isAsk ? jsonText({ questions: askQuestions }) : shellLike ? command || input : input;
+          const storedOutput = shellLike ? shellOut || output : output;
           if (!(imageLike && !askedImage)) {
             assistant.events = upsertEvent(assistant.events, {
               id: `tool-${id}`,
-              kind: imageLike ? "image_gen" : isAsk ? "question" : isEdit ? "edit" : kind,
+              kind: imageLike
+                ? "image_gen"
+                : isSpawn
+                  ? "subagent"
+                  : isPoll
+                    ? "subagent_poll"
+                    : isAsk
+                      ? "question"
+                      : isEdit
+                        ? "edit"
+                        : shellLike
+                          ? shellKind
+                          : isRead || isSearch
+                            ? fileKind
+                            : kind,
               title,
-              status: String(update.status || "pending"),
-              input: isAsk ? jsonText({ questions: askQuestions }) : input,
-              output,
+              status:
+                isSpawn && /started in background/i.test(String(output || ""))
+                  ? "in_progress"
+                  : String(update.status || "pending"),
+              input: storedInput,
+              output: storedOutput,
               diffs: diffs.length ? diffs : undefined,
             });
           }
@@ -2382,36 +2621,32 @@ export default function App() {
               assistant.text.length,
             );
           }
+          const commandEvent = {
+            id: `tool-${id}`,
+            kind: isEdit ? "edit" : shellKind,
+            title,
+            status: String(update.status || "pending"),
+            input: storedInput,
+            output: storedOutput,
+          };
           if (
             isActiveView &&
-            showTerminalRef.current &&
-            isCommandEvent({
-              id: `tool-${id}`,
-              kind: isEdit ? "edit" : kind,
-              title,
-              status: String(update.status || "pending"),
-              input,
-              output,
-              diffs: diffs.length ? diffs : undefined,
-            })
+            isCommandEvent(commandEvent) &&
+            !isGeneratedImageProbe(command || title) &&
+            !isImageProbeEvent(commandEvent)
           ) {
-            const command = extractShellCommand(inputRec, input);
-            if (!isGeneratedImageProbe(command || title) && !isImageProbeEvent({
-              id: `tool-${id}`,
-              kind: isEdit ? "edit" : kind,
-              title,
-              input,
-              output,
-            })) {
-              setAgentTermJobs((current) =>
-                upsertAgentJob(current, {
-                  id,
-                  title: terminalJobTitle(command, title),
-                  command: command || title,
-                  output: extractShellOutput(output),
-                  status: update.status ? String(update.status) : "",
-                }),
-              );
+            setAgentTermJobs((current) =>
+              upsertAgentJob(current, {
+                id,
+                title: terminalJobTitle(command, title),
+                command: command || title,
+                output: shellOut,
+                status: update.status ? String(update.status) : "",
+              }),
+            );
+            if (isBuildCommand(commandEvent)) {
+              setShowWorkspace(true);
+              setShowTerminal(true);
             }
           }
           if (editPath && isEdit) {
@@ -2487,6 +2722,9 @@ export default function App() {
             status: "failed",
             output: String(update.error || ""),
           });
+        } else if (isSubagentUpdate(type)) {
+          const next = applySubagentUpdate(assistant.events, update, type);
+          if (next) assistant.events = next;
         } else if (type === "session_summary_generated") {
           const title = String(update.sessionSummary || update.session_summary || "");
           if (title) return { ...conversation, title, updatedAt: Date.now() };
@@ -3120,8 +3358,11 @@ export default function App() {
         listen<AcpTurnDone>("acp-turn-done", (event) => {
           const error = event.payload.error;
           const conversationId = event.payload.conversationId;
+          const targetId = conversationId || selectedIdRef.current;
+          if (targetId && compactRetryingRef.current.has(targetId) && isUserCancelError(error)) {
+            return;
+          }
           if (!event.payload.ok && isContextTooLarge(error)) {
-            const targetId = conversationId || selectedIdRef.current;
             const conv = conversationsRef.current.find((item) => item.id === targetId);
             const lastUser = [...(conv?.messages || [])].reverse().find((item) => item.role === "user");
             const assistant = [...(conv?.messages || [])].reverse().find((item) => item.role === "assistant" && item.streaming);
@@ -3144,7 +3385,14 @@ export default function App() {
                 return;
               }
             }
+            const compactKey = `${conv?.id}:${lastUser?.id}:compact`;
+            if (conv && lastUser && !contextRetryRef.current.has(compactKey)) {
+              contextRetryRef.current.add(compactKey);
+              void retryCompactRef.current(conv.id);
+              return;
+            }
           }
+          if (targetId) compactRetryingRef.current.delete(targetId);
           finishTurnRef.current(event.payload.ok ? undefined : error, conversationId);
         }),
       );
@@ -3253,6 +3501,7 @@ export default function App() {
     setPrompt("");
     setPendingImages([]);
     setPendingFiles([]);
+    setIgnoredDrops([]);
     setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
     followRef.current = true;
     setShowJumpToBottom(false);
@@ -3623,6 +3872,7 @@ export default function App() {
         setPrompt("");
         setPendingImages([]);
         setPendingFiles([]);
+        setIgnoredDrops([]);
         if (composerRef.current) composerRef.current.style.height = "30px";
         if (conversation.id === selectedIdRef.current) {
           setStatusText(`${t.queued} ${promptQueueRef.current.filter((item) => item.conversationId === conversation.id).length}`);
@@ -3665,6 +3915,7 @@ export default function App() {
     setPrompt("");
     setPendingImages([]);
     setPendingFiles([]);
+    setIgnoredDrops([]);
     if (composerRef.current) composerRef.current.style.height = "30px";
     setConversationLive(conversation.id, true);
     if (conversation.id === selectedIdRef.current) setStatusText(t.connecting);
@@ -3759,7 +4010,20 @@ export default function App() {
       const checkpointPromise = promptCwd
         ? invoke<SnapshotFile[]>("capture_checkpoint", { root: promptCwd, ssh: sshTarget || null }).catch(() => [])
         : Promise.resolve([] as SnapshotFile[]);
-      const expanded = await expandPromptContext(outbound, promptCwd, sshTarget || null);
+      const catalogModel = availableModelsRef.current.find((item) => item.id === canonicalModelId(modelRef.current));
+      const contextWindowTokens = channelContextWindow(settingsRef.current, relayOn, catalogModel);
+      const autoCompactThresholdPercent = channelCompactPercent(settingsRef.current, relayOn);
+      const slimPrompt = Boolean(conversation.grokSessionId) || conversation.messages.length > 2 || usagePercent >= 45;
+      const expanded = await expandPromptContext(outbound, promptCwd, sshTarget || null, { slim: slimPrompt });
+      lastOutboundRef.current[conversation.id] = {
+        text: outbound,
+        attachments,
+        assistantId: assistant.id,
+        turnId,
+      };
+      if (conversation.id === selectedIdRef.current) {
+        setUsage((current) => ({ ...current, totalTokens: contextWindowTokens }));
+      }
       const sessionOptions = {
         model: canonicalModelId(modelRef.current),
         cwd: sshTarget?.remotePath || conversation.cwd || cwdRef.current,
@@ -3768,8 +4032,8 @@ export default function App() {
         grokHome: relayOn ? null : account?.homePath || null,
         permissionMode: settingsRef.current.permissionMode,
         reasoningEffort: settingsRef.current.reasoningEffort,
-        contextWindowTokens: settingsRef.current.contextWindowTokens,
-        autoCompactThresholdPercent: settingsRef.current.autoCompactThresholdPercent,
+        contextWindowTokens,
+        autoCompactThresholdPercent,
         enableMemory: settingsRef.current.enableMemory,
         enableWebSearch: settingsRef.current.enableWebSearch,
         enableSubagents: settingsRef.current.enableSubagents,
@@ -3863,6 +4127,67 @@ export default function App() {
       finishTurn(message, conversation.id);
     }
   }
+
+  retryCompactRef.current = async (conversationId: string) => {
+    const outbound = lastOutboundRef.current[conversationId];
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    const copy = tRef.current;
+    if (!outbound || !conversation || outbound.turnId !== conversationTurn(conversationId)) {
+      compactRetryingRef.current.delete(conversationId);
+      finishTurn(copy.contextTooLarge, conversationId);
+      return;
+    }
+    compactRetryingRef.current.add(conversationId);
+    mutateTargetRef.current = conversationId;
+    mutateAssistant((current) => {
+      current.error = undefined;
+      current.events = upsertEvent(current.events, {
+        id: "active-compaction",
+        kind: "compaction",
+        title: copy.contextCompactingRetry,
+        status: "in_progress",
+      });
+    });
+    if (conversationId === selectedIdRef.current) setStatusText(copy.contextCompactingRetry);
+    try {
+      const relayOn = Boolean(relayQuotaRef.current?.configured || relayReadyRef.current);
+      const sshTarget = resolveConversationSsh(conversation, sshHosts);
+      const promptCwd = sshTarget?.remotePath || conversation.cwd || cwdRef.current;
+      const catalogModel = availableModelsRef.current.find((item) => item.id === canonicalModelId(modelRef.current));
+      const slim = await expandPromptContext(outbound.text, promptCwd, sshTarget || null, { slim: true });
+      const session = await invoke<SessionInfo>("ensure_session", {
+        options: {
+          model: canonicalModelId(modelRef.current),
+          cwd: promptCwd,
+          ssh: sshTarget,
+          existingSessionId: conversation.grokSessionId ?? null,
+          grokHome: relayOn ? null : accountsRef.current.find((item) => item.id === conversation.accountId)?.homePath || null,
+          permissionMode: settingsRef.current.permissionMode,
+          reasoningEffort: settingsRef.current.reasoningEffort,
+          contextWindowTokens: channelContextWindow(settingsRef.current, relayOn, catalogModel),
+          autoCompactThresholdPercent: channelCompactPercent(settingsRef.current, relayOn),
+          enableMemory: settingsRef.current.enableMemory,
+          enableWebSearch: settingsRef.current.enableWebSearch,
+          enableSubagents: settingsRef.current.enableSubagents,
+          conversationId,
+        },
+      });
+      if (outbound.turnId !== conversationTurn(conversationId)) return;
+      setConversations((list) => {
+        const next = list.map((item) => (item.id === conversationId ? { ...item, grokSessionId: session.sessionId } : item));
+        conversationsRef.current = next;
+        return next;
+      });
+      await invoke("send_prompt", {
+        text: slim,
+        attachments: outbound.attachments.length ? outbound.attachments : null,
+        conversationId,
+      });
+    } catch (error) {
+      compactRetryingRef.current.delete(conversationId);
+      finishTurn(String(error), conversationId);
+    }
+  };
 
   async function send() {
     const parsed = parseSlashInput(prompt, skillsRef.current);
@@ -4187,6 +4512,7 @@ export default function App() {
   async function ingestDroppedPaths(paths: string[]) {
     const images: string[] = [];
     const others: string[] = [];
+    const ignored: IgnoredDrop[] = [];
     for (const path of paths) {
       const trimmed = path.trim();
       if (!trimmed || rememberDrop(normalizePath(trimmed))) continue;
@@ -4197,10 +4523,10 @@ export default function App() {
       try {
         addPendingImages([await invoke<PromptAttachment>("read_image_file", { path })]);
       } catch (error) {
+        ignored.push({ name: path.split(/[\\/]/).pop() || path, reason: "unreadable" });
         setStatusText(localizeThrown(error, tRef.current));
       }
     }
-    if (!others.length) return;
     const next: PendingFile[] = [];
     for (const path of others) {
       try {
@@ -4222,19 +4548,23 @@ export default function App() {
           isDir: info.isDir,
         });
       } catch (error) {
+        ignored.push({ name: path.split(/[\\/]/).pop() || path, reason: "unreadable" });
         setStatusText(localizeThrown(error, tRef.current));
       }
     }
-    if (!next.length) return;
-    setPendingFiles((current) => {
-      const merged = [...current];
-      for (const item of next) {
-        if (merged.length >= MAX_PENDING_FILES) break;
-        if (merged.some((existing) => samePath(existing.path, item.path))) continue;
-        merged.push(item);
-      }
-      return merged;
-    });
+    const existing = pendingFilesRef.current;
+    const unique = next.filter((item) => !existing.some((entry) => samePath(entry.path, item.path)));
+    const room = Math.max(0, MAX_PENDING_FILES - existing.length);
+    unique.slice(room).forEach((item) => ignored.push({ name: item.name, reason: "limit" }));
+    if (unique.length) setPendingFiles([...existing, ...unique.slice(0, room)]);
+    if (ignored.length) {
+      setIgnoredDrops((current) => {
+        const seen = new Set(current.map((entry) => `${entry.reason}:${entry.name}`));
+        const extra = ignored.filter((entry) => !seen.has(`${entry.reason}:${entry.name}`));
+        return [...current, ...extra].slice(-24);
+      });
+    }
+    if (!unique.length && !ignored.length) return;
     setPrompt((current) => appendMentions(current, next.map((item) => item.mention)));
     setShowWorkspace(true);
     const focus = next.find((item) => !isAbsoluteLocalPath(item.mention));
@@ -4427,7 +4757,9 @@ export default function App() {
     const origin = event.clientX;
     const sign = workspaceSide === "left" ? 1 : -1;
     const move = (next: PointerEvent) => {
-      setWorkspaceWidth(Math.min(920, Math.max(380, start + sign * (next.clientX - origin))));
+      setWorkspaceWidth(
+        fitWorkspaceWidth(start + sign * (next.clientX - origin), sidebarWidth, showSidebar),
+      );
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -4589,6 +4921,10 @@ export default function App() {
     regenerate: () => void regenerate(),
     restoreTurn: (userId) => void restoreTurn(userId),
     startEditingMessage,
+    revealCommandInTerminal: () => {
+      setShowWorkspace(true);
+      setShowTerminal(true);
+    },
     sendRedraw: (_message, prevUser, retryFailed) => {
       if (retryFailed) {
         void regenerate();
@@ -4941,8 +5277,26 @@ export default function App() {
               <IconCompose />
               {t.newChat}
             </button>
+            <label className="sidebar-search">
+              <IconSearch size={14} />
+              <input
+                value={sidebarQuery}
+                onChange={(event) => setSidebarQuery(event.target.value)}
+                placeholder={t.searchChats}
+              />
+              {sidebarQuery ? (
+                <button
+                  className="icon-btn"
+                  type="button"
+                  title={t.close}
+                  onClick={() => setSidebarQuery("")}
+                >
+                  <IconClose />
+                </button>
+              ) : null}
+            </label>
             <div className="section-label-row">
-              <div className="section-label">{t.projects}</div>
+              <div className="section-label">{sidebarGroupMode === "list" ? t.recentChats : t.projects}</div>
               <button
                 className="icon-btn"
                 type="button"
@@ -4954,18 +5308,20 @@ export default function App() {
               >
                 <IconMore />
               </button>
-              <button
-                className="icon-btn"
-                type="button"
-                title={t.addProject}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setCreateProjectKind("local");
-                  setShowCreateProject(true);
-                }}
-              >
-                <IconPlus />
-              </button>
+              {sidebarGroupMode === "project" ? (
+                <button
+                  className="icon-btn"
+                  type="button"
+                  title={t.addProject}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setCreateProjectKind("local");
+                    setShowCreateProject(true);
+                  }}
+                >
+                  <IconPlus />
+                </button>
+              ) : null}
               {showProjectMenu ? (
                 <div className="project-menu" onClick={(event) => event.stopPropagation()}>
                   <div className="project-menu-label">{t.organizeSidebar}</div>
@@ -4996,113 +5352,143 @@ export default function App() {
             </div>
             <div className="session-list">
               {sidebarGroupMode === "list"
-                ? projects
-                    .flatMap((project) => project.items)
-                    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
-                    .map((item) => (
-                      <button
+                ? (() => {
+                    const items = [...visibleTree.folders.flatMap((folder) => folder.items), ...visibleTree.recent]
+                      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+                    if (!items.length) {
+                      return <div className="sidebar-empty">{t.noMatchingChats}</div>;
+                    }
+                    return items.map((item) => (
+                      <SidebarSession
                         key={item.grokSessionId || item.id}
-                        className={item.id === selectedId ? "session on" : "session"}
-                        type="button"
-                        onClick={() => selectConversation(item.id)}
-                      >
-                        <IconChat className="session-ico" size={15} />
-                        <span className="session-title">{item.title}</span>
-                        {liveTurns.includes(item.id) ? <span className="mini-spin" /> : null}
-                        <span
-                          className="session-delete"
-                          title={t.deleteChat}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            deleteConversation(item.id);
-                          }}
-                        >
-                          <IconClose />
-                        </span>
-                      </button>
-                    ))
-                : projects.map((project) => {
-                const open = !collapsed[project.path];
-                const selected = project.explicit
-                  ? activeProjectId === project.id
-                  : !activeProjectId && workspaceKey(cwd, activeSsh) === project.path;
-                return (
-                  <div key={project.id} className="project">
-                    <button
-                      className={selected ? "project-head on" : "project-head"}
-                      type="button"
-                      onClick={() => selectProjectGroup(project)}
-                    >
-                      <span
-                        className={open ? "chevron open" : "chevron"}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setCollapsed((current) => ({ ...current, [project.path]: !current[project.path] }));
-                        }}
-                      >
-                        <IconChevronRight />
-                      </span>
-                      <span className="project-ico">
-                        <IconFolder size={13} />
-                      </span>
-                      <span className="project-name">{project.name}</span>
-                      <span
-                        className="project-add"
-                        title={t.newChatInProject}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          if (project.explicit) {
-                            const record = projectRecords.find((item) => item.id === project.id);
-                            if (record) newConversation(undefined, record);
-                            else newConversation();
-                          } else {
-                            selectProjectGroup(project);
-                            newConversation(undefined, undefined, { cwd: project.path, ssh: project.ssh });
-                          }
-                        }}
-                      >
-                        <IconPlus size={13} />
-                      </span>
-                      {project.explicit ? (
-                        <span
-                          className="project-delete"
-                          title={t.deleteProject}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            deleteProject(project.id);
-                          }}
-                        >
-                          <IconClose />
-                        </span>
-                      ) : null}
-                    </button>
-                    {open
-                      ? project.items.map((item) => (
+                        item={item}
+                        selected={item.id === selectedId}
+                        live={liveTurns.includes(item.id)}
+                        deleteLabel={t.deleteChat}
+                        onSelect={() => selectConversation(item.id)}
+                        onDelete={() => deleteConversation(item.id)}
+                      />
+                    ));
+                  })()
+                : (
+                  <>
+                    {visibleTree.folders.map((project) => {
+                      const searching = Boolean(visibleTree.query);
+                      const defaultOpen =
+                        project.items.some((item) => item.id === selectedId) ||
+                        (project.explicit && activeProjectId === project.id) ||
+                        visibleTree.folders.length <= 2;
+                      const open = searching || (collapsed[project.path] === undefined ? defaultOpen : !collapsed[project.path]);
+                      const selected = project.explicit
+                        ? activeProjectId === project.id
+                        : !activeProjectId && workspaceKey(cwd, activeSsh) === project.path;
+                      const showAll = searching || showAllInProject[project.id];
+                      const visibleItems = showAll ? project.items : project.items.slice(0, PROJECT_CHAT_PREVIEW);
+                      return (
+                        <div key={project.id} className="project">
                           <button
-                            key={item.grokSessionId || item.id}
-                            className={item.id === selectedId ? "session on" : "session"}
+                            className={selected ? "project-head on" : "project-head"}
                             type="button"
-                            onClick={() => selectConversation(item.id)}
+                            onClick={() => selectProjectGroup(project)}
                           >
-                            <IconChat className="session-ico" size={15} />
-                            <span className="session-title">{item.title}</span>
-                            {liveTurns.includes(item.id) ? <span className="mini-spin" /> : null}
                             <span
-                              className="session-delete"
-                              title={t.deleteChat}
+                              className={open ? "chevron open" : "chevron"}
                               onClick={(event) => {
                                 event.stopPropagation();
-                                deleteConversation(item.id);
+                                setCollapsed((current) => ({ ...current, [project.path]: open }));
                               }}
                             >
-                              <IconClose />
+                              <IconChevronRight />
                             </span>
+                            <span className="project-ico">
+                              {project.ssh?.host ? <IconSsh size={13} /> : <IconFolder size={13} />}
+                            </span>
+                            <span className="project-name">{project.name}</span>
+                            {project.items.length ? <span className="project-count">{project.items.length}</span> : null}
+                            <span
+                              className="project-add"
+                              title={t.newChatInProject}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (project.explicit) {
+                                  const record = projectRecords.find((item) => item.id === project.id);
+                                  if (record) newConversation(undefined, record);
+                                  else newConversation();
+                                } else {
+                                  selectProjectGroup(project);
+                                  newConversation(undefined, undefined, { cwd: project.path, ssh: project.ssh });
+                                }
+                              }}
+                            >
+                              <IconPlus size={13} />
+                            </span>
+                            {project.explicit ? (
+                              <span
+                                className="project-delete"
+                                title={t.deleteProject}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  deleteProject(project.id);
+                                }}
+                              >
+                                <IconClose />
+                              </span>
+                            ) : null}
                           </button>
-                        ))
-                      : null}
-                  </div>
-                );
-              })}
+                          {open ? (
+                            <div className="project-chats">
+                              {visibleItems.map((item) => (
+                                <SidebarSession
+                                  key={item.grokSessionId || item.id}
+                                  item={item}
+                                  nested
+                                  selected={item.id === selectedId}
+                                  live={liveTurns.includes(item.id)}
+                                  deleteLabel={t.deleteChat}
+                                  onSelect={() => selectConversation(item.id)}
+                                  onDelete={() => deleteConversation(item.id)}
+                                />
+                              ))}
+                              {!project.items.length ? <div className="sidebar-empty nested">{t.emptyProject}</div> : null}
+                              {!showAll && project.items.length > PROJECT_CHAT_PREVIEW ? (
+                                <button
+                                  className="session-more"
+                                  type="button"
+                                  onClick={() =>
+                                    setShowAllInProject((current) => ({ ...current, [project.id]: true }))
+                                  }
+                                >
+                                  {fill(t.showAllChats, { n: project.items.length })}
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                    {visibleTree.recent.length || (!visibleTree.folders.length && visibleTree.query) ? (
+                      <>
+                        <div className="section-label recent-label">{t.recentChats}</div>
+                        {visibleTree.recent.length
+                          ? visibleTree.recent.map((item) => (
+                              <SidebarSession
+                                key={item.grokSessionId || item.id}
+                                item={item}
+                                selected={item.id === selectedId}
+                                live={liveTurns.includes(item.id)}
+                                deleteLabel={t.deleteChat}
+                                onSelect={() => selectConversation(item.id)}
+                                onDelete={() => deleteConversation(item.id)}
+                              />
+                            ))
+                          : <div className="sidebar-empty">{t.noMatchingChats}</div>}
+                      </>
+                    ) : null}
+                    {!visibleTree.folders.length && !visibleTree.recent.length && !visibleTree.query ? (
+                      <div className="sidebar-empty">{t.emptyProject}</div>
+                    ) : null}
+                  </>
+                )}
             </div>
             <div className="sidebar-foot account-foot" onClick={(event) => event.stopPropagation()}>
               <button
@@ -5204,7 +5590,10 @@ export default function App() {
               className={`icon-btn${showWorkspace ? " on" : ""}`}
               type="button"
               title={withShortcut(showWorkspace ? t.hideWorkspace : t.showWorkspace, keys.toggleWorkspace)}
-              onClick={() => setShowWorkspace((value) => !value)}
+              onClick={() => {
+                setShowWorkspace((value) => !value);
+                setWorkspaceWidth((current) => fitWorkspaceWidth(current, sidebarWidth, showSidebar));
+              }}
             >
               {workspaceSide === "left" ? <IconPanelLeft /> : <IconCodePane />}
             </button>
@@ -5555,27 +5944,63 @@ export default function App() {
                 </button>
               </div>
             )}
-            {pendingImages.length || pendingFiles.length ? (
-              <div className="attach-row">
-                {pendingFiles.map((item) => (
-                  <div key={item.id} className="attach-chip file">
-                    {item.isDir ? <IconFolder /> : <IconFile />}
-                    <button
-                      type="button"
-                      className="attach-name"
-                      title={t.selectDroppedFile}
-                      onClick={() => openDroppedFile(item)}
-                    >
-                      {item.name}
-                    </button>
-                    <button type="button" title={t.revealInFolder} onClick={() => revealDroppedFile(item.path)}>
-                      <IconFolder />
-                    </button>
-                    <button type="button" title={t.cancel} onClick={() => removePendingFile(item.id)}>
-                      <IconClose />
-                    </button>
+            {pendingFiles.length || ignoredDrops.length ? (
+              <div className="drop-card">
+                {pendingFiles.length ? (
+                  <div className="drop-card-block">
+                    <div className="drop-card-head">
+                      <strong>{fill(t.addedFiles, { n: pendingFiles.length })}</strong>
+                      <button type="button" className="ghost compact nowrap" onClick={() => {
+                        pendingFiles.forEach((item) => setPrompt((current) => stripMention(current, item.mention)));
+                        setPendingFiles([]);
+                      }}>
+                        {t.cancel}
+                      </button>
+                    </div>
+                    <ul className="drop-card-list">
+                      {pendingFiles.map((item) => (
+                        <li key={item.id}>
+                          <button type="button" className="drop-card-name" title={item.path} onClick={() => openDroppedFile(item)}>
+                            {item.isDir ? <IconFolder /> : <IconFile />}
+                            <span>{item.name}</span>
+                          </button>
+                          <em>{item.mention}</em>
+                          <button type="button" title={t.revealInFolder} onClick={() => revealDroppedFile(item.path)}>
+                            <IconFolder />
+                          </button>
+                          <button type="button" title={t.cancel} onClick={() => removePendingFile(item.id)}>
+                            <IconClose />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
-                ))}
+                ) : null}
+                {ignoredDrops.length ? (
+                  <div className="drop-card-block ignored">
+                    <div className="drop-card-head">
+                      <strong>{fill(t.ignoredFiles, { n: ignoredDrops.length })}</strong>
+                      <button type="button" className="ghost compact nowrap" onClick={() => setIgnoredDrops([])}>
+                        {t.cancel}
+                      </button>
+                    </div>
+                    <ul className="drop-card-list">
+                      {ignoredDrops.map((item, index) => (
+                        <li key={`${item.reason}-${item.name}-${index}`}>
+                          <span className="drop-card-name">
+                            <IconFile />
+                            <span>{item.name}</span>
+                          </span>
+                          <em>{item.reason === "limit" ? t.ignoredTooMany : t.ignoredUnreadable}</em>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {pendingImages.length ? (
+              <div className="attach-row">
                 {pendingImages.map((item, index) => (
                   <div key={`${item.name || "img"}-${index}`} className="attach-chip">
                     {item.data ? (
@@ -5792,7 +6217,7 @@ export default function App() {
                   {formatTokens(usage.usedTokens)} / {formatTokens(usage.totalTokens)} tokens
                 </p>
                 <p>
-                  {t.compactAt} {settings.autoCompactThresholdPercent}%
+                  {t.compactAt} {channelCompactPercent(settings, relayConfigured)}%
                 </p>
                 {usage.compactionCount ? (
                   <p>

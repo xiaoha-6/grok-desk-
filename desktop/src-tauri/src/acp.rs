@@ -1262,8 +1262,15 @@ fn is_fatal_rpc_error(err: &str) -> bool {
         || is_user_cancel_error(err)
         || lower.contains("context_too_large")
         || lower.contains("context too large")
+        || lower.contains("maximum context")
+        || lower.contains("context length")
+        || lower.contains("too many tokens")
+        || lower.contains("prompt is too long")
         || err.contains("请求内容过大")
-        || err.contains("上下文") && (err.contains("过大") || err.contains("太长"))
+        || err.contains("长度超限")
+        || err.contains("超过最大")
+        || err.contains("上下文爆")
+        || err.contains("上下文") && (err.contains("过大") || err.contains("太长") || err.contains("超限"))
         || err.contains("图片太大")
         || lower.contains("401")
         || lower.contains("unauthorized")
@@ -1885,6 +1892,9 @@ fn explain_upstream(message: String) -> String {
     } else if lower.contains("context_too_large")
         || message.contains("请求内容过大")
         || lower.contains("context too large")
+        || lower.contains("maximum context")
+        || lower.contains("too many tokens")
+        || message.contains("上下文爆")
     {
         format!(
             "{message}\n这次对话或附件太长，当前渠道处理不了。出图请直接说「生成一张…」；写代码请开新对话或把问题说短一点。"
@@ -2146,5 +2156,7 @@ mod tests {
         assert!(!is_retryable_rpc_error("连接已取消"));
         assert!(!is_retryable_rpc_error("图片太大，请控制在 25MB 以内"));
         assert!(!is_retryable_rpc_error("status 402 weekly limit"));
+        assert!(!is_retryable_rpc_error("maximum context length exceeded"));
+        assert!(!is_retryable_rpc_error("上下文爆了"));
     }
 }

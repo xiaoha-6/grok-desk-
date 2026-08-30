@@ -1,5 +1,5 @@
 import { memo, type KeyboardEvent, type MutableRefObject } from "react";
-import { ActivityTimeline, InlineCommands, InlineEdits } from "./ActivityTimeline";
+import { ActivityTimeline, InlineCommands, InlineEdits, InlineExplore, InlineThought } from "./ActivityTimeline";
 import {
   ChatMessageMedia,
   imageGenFailure,
@@ -7,10 +7,10 @@ import {
   isShowableImage,
   wantsImageGen,
 } from "./ChatImage";
-import { TextShimmer } from "./components/prompt-kit/text-shimmer";
-import { AgentStatus, ThinkingOrb, agentOrbForMessage } from "./components/thinking-orbs/ThinkingOrbs";
+import { AgentStatus, SubagentSwarm, agentOrbForMessage } from "./components/thinking-orbs/ThinkingOrbs";
 import type { Copy, Lang } from "./i18n";
 import { isImeEvent } from "./keybindings";
+import { isSubagentEvent, statusLabel } from "./timeline";
 import type { ChatMessage } from "./types";
 
 export type TranscriptRowActions = {
@@ -22,6 +22,7 @@ export type TranscriptRowActions = {
   restoreTurn: (userId: string) => void;
   startEditingMessage: (message: ChatMessage) => void;
   sendRedraw: (message: ChatMessage, prevUser: ChatMessage, retryFailed: boolean) => void;
+  revealCommandInTerminal: () => void;
 };
 
 function assistantLivePhase(message: ChatMessage): "thinking" | "working" | null {
@@ -76,8 +77,10 @@ export const TranscriptRow = memo(function TranscriptRow({
   const imageBusy = isImageGenBusy(message, prevUser?.text || "");
   const expectImage = imageBusy && !(message.media || []).some(isShowableImage);
   const activity = agentOrbForMessage(message, copy, { imageBusy });
-  const showThinkingBar = livePhase === "thinking" && !(message.thought && !message.events.length);
-  const showWorkingBar = livePhase === "working" && !imageBusy;
+  const hasSubagents = message.events.some(isSubagentEvent);
+  const hasThought = Boolean(message.thought) || message.events.some((event) => event.kind === "thought" && event.output);
+  const showThinkingBar = livePhase === "thinking" && !hasThought;
+  const showWorkingBar = livePhase === "working" && !imageBusy && !hasSubagents;
   const canRedraw = message.role === "assistant" && Boolean(prevUser) && askedImage && !running;
   const imageFail = askedImage ? imageGenFailure(message) : "";
   const actions = actionsRef;
@@ -118,28 +121,36 @@ export const TranscriptRow = memo(function TranscriptRow({
             </div>
           </div>
         ) : null}
-        {message.role === "assistant" && message.events.length ? (
+        {message.role === "assistant" && (hasThought || message.events.length) ? (
           <>
-            <InlineEdits events={message.events} lang={lang} />
-            <InlineCommands events={message.events} lang={lang} />
-            <ActivityTimeline
+            <InlineThought
+              thought={message.thought}
               events={message.events}
               lang={lang}
-              defaultOpen={message.streaming || Boolean(message.stopped)}
+              streaming={Boolean(message.streaming)}
             />
+            {message.events.length ? (
+              <>
+                <InlineExplore events={message.events} lang={lang} streaming={Boolean(message.streaming)} />
+                <InlineEdits events={message.events} lang={lang} />
+                <InlineCommands
+                  events={message.events}
+                  lang={lang}
+                  onOpenTerminal={() => actions.current.revealCommandInTerminal()}
+                />
+                <SubagentSwarm
+                  events={message.events}
+                  copy={copy}
+                  statusLabel={(status) => statusLabel(status, lang)}
+                />
+                <ActivityTimeline
+                  events={message.events}
+                  lang={lang}
+                  defaultOpen={message.streaming || Boolean(message.stopped)}
+                />
+              </>
+            ) : null}
           </>
-        ) : message.thought ? (
-          <details className="thought" open={(livePhase === "thinking" || Boolean(message.stopped)) && !message.text}>
-            <summary>
-              {livePhase === "thinking" ? <ThinkingOrb state="solving" size={20} /> : null}
-              {livePhase === "thinking" ? <TextShimmer>{copy.thinkingNow}</TextShimmer> : copy.thinking}
-            </summary>
-            <pre>
-              {livePhase === "thinking" && message.thought.length > 3500
-                ? `…\n${message.thought.slice(-3500)}`
-                : message.thought}
-            </pre>
-          </details>
         ) : null}
         {showThinkingBar ? <AgentStatus className="thinking-bar" state="solving" label={copy.thinkingNow} /> : null}
         {editing ? null : (

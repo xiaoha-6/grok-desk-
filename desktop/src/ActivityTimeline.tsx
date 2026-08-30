@@ -5,18 +5,27 @@ import {
   categoryTitle,
   commandTitle,
   editTitle,
+  eventFilePath,
   eventIconKind,
   eventProgress,
+  exploreTitle,
   groupRuns,
   isCommandEvent,
   isEditEvent,
+  isExploreEvent,
+  isReadEvent,
+  isThoughtEvent,
+  isOpaqueJson,
+  readableToolText,
   statusLabel,
+  thoughtTiming,
   visibleEvents,
   type ActivityCategory,
 } from "./timeline";
 import type { Lang, TimelineEvent } from "./types";
 import { fill, t as translate } from "./i18n";
 import { isImageProbeEvent } from "./ChatImage";
+import { fileBadge } from "./fileIcons";
 function Disclosure({
   open,
   onToggle,
@@ -99,13 +108,13 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
               ))}
             </div>
           ) : null}
-          {!hasDiff && !ask.length && event.input ? (
+          {!hasDiff && !ask.length && readableToolText(event.input) && !isOpaqueJson(event.input) ? (
             <div className="timeline-block">
               <div className="timeline-kicker">{copy.input}</div>
-              <pre>{clip(event.input)}</pre>
+              <pre>{clip(readableToolText(event.input))}</pre>
             </div>
           ) : null}
-          {event.output && !hasDiff && !ask.length ? (
+          {event.output && !hasDiff && !ask.length && !isOpaqueJson(event.output) ? (
             event.kind === "thought" ? (
               <pre className="thought-md">{clip(event.output, 4000)}</pre>
             ) : (
@@ -113,7 +122,7 @@ function EventRow({ event, lang, startOpen }: { event: TimelineEvent; lang: Lang
                 <div className="timeline-kicker">
                   {event.kind === "plan" ? copy.content : copy.result}
                 </div>
-                <pre>{clip(event.output)}</pre>
+                <pre>{clip(readableToolText(event.output) || event.output)}</pre>
               </div>
             )
           ) : null}
@@ -133,7 +142,7 @@ function CategoryGroup({
   lang: Lang;
   streaming?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(category === "commands" || category === "files" || Boolean(streaming && category !== "other"));
   const shown = events.slice(0, 30);
   const hidden = events.length - shown.length;
   return (
@@ -161,13 +170,109 @@ function CategoryGroup({
   );
 }
 
-export const InlineCommands = memo(function InlineCommands({
+export const InlineThought = memo(function InlineThought({
+  thought,
   events,
   lang,
+  streaming,
+}: {
+  thought?: string;
+  events: TimelineEvent[];
+  lang: Lang;
+  streaming?: boolean;
+}) {
+  const copy = translate(lang);
+  const event = events.find(isThoughtEvent);
+  const text = String(thought || event?.output || "").trim();
+  if (!text) return null;
+  const seconds = thoughtTiming(event);
+  const heading =
+    streaming && !seconds
+      ? copy.thinkingNow
+      : seconds
+        ? fill(copy.thoughtFor, { n: seconds })
+        : copy.thinking;
+  const shown = streaming && text.length > 3500 ? `…\n${text.slice(-3500)}` : clip(text, 6000);
+  return (
+    <div className={`inline-thought${streaming ? " live" : ""}`}>
+      <div className="inline-thought-head">{heading}</div>
+      <pre className="inline-thought-body">{shown}</pre>
+    </div>
+  );
+});
+
+export const InlineExplore = memo(function InlineExplore({
+  events,
+  lang,
+  streaming,
 }: {
   events: TimelineEvent[];
   lang: Lang;
+  streaming?: boolean;
 }) {
+  const copy = translate(lang);
+  const items = events.filter(isExploreEvent);
+  if (!items.length) return null;
+  const exploring = items.some((event) => /in_progress|running|pending/i.test(event.status || ""));
+  const files = items.filter(isReadEvent).length;
+  const searches = items.length - files;
+  const heading = exploring
+    ? copy.exploring
+    : files && searches
+      ? fill(copy.exploredSummary, { files, searches })
+      : files
+        ? fill(copy.exploredFiles, { n: files })
+        : fill(copy.exploredSearches, { n: searches });
+  return (
+    <div className="inline-explore">
+      <div className="inline-explore-head">{heading}</div>
+      <div className="inline-explore-list">
+        {items.map((event) => (
+          <ExploreRow key={event.id} event={event} />
+        ))}
+        {streaming && !exploring ? <div className="inline-explore-next">{copy.planningNext}</div> : null}
+      </div>
+    </div>
+  );
+});
+
+function ExploreRow({ event }: { event: TimelineEvent }) {
+  const snippet = readableToolText(event.output);
+  const [open, setOpen] = useState(false);
+  const running = /in_progress|running|pending/i.test(event.status || "");
+  const label = exploreTitle(event);
+  const body = (
+    <>
+      <span className="timeline-ico">
+        <EventKindIcon kind={isReadEvent(event) ? "file" : "search"} />
+      </span>
+      <span className="inline-explore-title">{label}</span>
+      {running ? <span className="inline-explore-dot" /> : null}
+    </>
+  );
+  if (!snippet) {
+    return <div className={`inline-explore-row${running ? " run" : ""}`}>{body}</div>;
+  }
+  return (
+    <div className={`inline-explore-item${open ? " open" : ""}`}>
+      <button className={`inline-explore-row${running ? " run" : ""}`} type="button" onClick={() => setOpen((value) => !value)}>
+        {body}
+      </button>
+      {open ? <pre className="inline-explore-snippet">{clip(snippet, 4000)}</pre> : null}
+    </div>
+  );
+}
+
+export const InlineCommands = memo(function InlineCommands({
+  events,
+  lang,
+  onOpenTerminal,
+}: {
+  events: TimelineEvent[];
+  lang: Lang;
+  onOpenTerminal?: () => void;
+}) {
+  const copy = translate(lang);
   const commands = events.filter((event) => isCommandEvent(event) && !isImageProbeEvent(event));
   if (!commands.length) return null;
   return (
@@ -177,27 +282,38 @@ export const InlineCommands = memo(function InlineCommands({
         const failed = /fail|error/i.test(event.status || "");
         const done = /complete|success/i.test(event.status || "");
         const progress = eventProgress(event);
-        const detail = event.output || event.input || "";
+        const command = readableToolText(event.input) || event.title;
+        const output = readableToolText(event.output);
         return (
-          <div key={event.id} className={`inline-command${failed ? " bad" : done ? " ok" : running ? " run" : ""}`}>
-            <div className="inline-command-head">
-              <span className="timeline-ico">
-                <EventKindIcon kind="terminal" />
+          <div key={event.id} className={`inline-term${failed ? " bad" : done ? " ok" : running ? " run" : ""}`}>
+            <div className="inline-term-bar">
+              <span className="inline-term-dots" aria-hidden>
+                <i />
+                <i />
+                <i />
               </span>
-              <div className="inline-command-copy">
-                <strong>{commandTitle(event, lang)}</strong>
-                <span>{event.title}</span>
-              </div>
+              <strong>{running ? copy.cmdWindow : commandTitle(event, lang)}</strong>
               {event.status ? (
                 <span className={`timeline-status ${failed ? "bad" : done ? "ok" : ""}`}>
                   {statusLabel(event.status, lang)}
                 </span>
               ) : null}
+              {onOpenTerminal ? (
+                <button className="ghost compact nowrap inline-term-open" type="button" onClick={onOpenTerminal}>
+                  {copy.openInTerminal}
+                </button>
+              ) : null}
+            </div>
+            <div className="inline-term-screen">
+              <div className="inline-term-prompt">$ {command}</div>
+              <pre>
+                {output || (running ? copy.cmdRunning : "")}
+                {running ? <span className="inline-term-cursor" /> : null}
+              </pre>
             </div>
             <div className="tool-progress" aria-hidden>
               <span style={{ width: `${progress}%` }} className={running ? "pulse" : ""} />
             </div>
-            {detail ? <pre className="inline-command-body">{clip(detail, 3500)}</pre> : null}
           </div>
         );
       })}
@@ -212,32 +328,36 @@ export const InlineEdits = memo(function InlineEdits({
   events: TimelineEvent[];
   lang: Lang;
 }) {
+  const copy = translate(lang);
   const edits = events.filter((event) => isEditEvent(event) && (event.diffs?.length || event.input || event.output));
   if (!edits.length) return null;
   return (
     <div className="inline-edits">
-      {edits.map((event) => (
-        <div key={event.id} className="inline-edit">
-          <div className="inline-edit-head">
-            <span className="timeline-ico">
-              <EventKindIcon kind="file" />
-            </span>
-            <span className="inline-edit-title">{editTitle(event)}</span>
-            {event.status ? (
-              <span className={`timeline-status ${/fail|error/i.test(event.status) ? "bad" : /complete|success/i.test(event.status) ? "ok" : ""}`}>
-                {statusLabel(event.status, lang)}
-              </span>
-            ) : null}
+      {edits.map((event) => {
+        const path = event.diffs?.find((item) => item.path)?.path || eventFilePath(event);
+        const name = path.split(/[\\/]/).filter(Boolean).pop() || editTitle(event);
+        return (
+          <div key={event.id} className="inline-edit">
+            <div className="inline-edit-head">
+              <span className="inline-edit-kicker">{copy.wroteCode}</span>
+              {path ? <em className="inline-edit-badge">{fileBadge(path)}</em> : null}
+              <span className="inline-edit-title">{name}</span>
+              {event.status ? (
+                <span className={`timeline-status ${/fail|error/i.test(event.status) ? "bad" : /complete|success/i.test(event.status) ? "ok" : ""}`}>
+                  {statusLabel(event.status, lang)}
+                </span>
+              ) : null}
+            </div>
+            {event.diffs?.length
+              ? event.diffs.map((diff, index) => (
+                  <CodeDiffView key={`${event.id}-${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />
+                ))
+              : event.input || event.output ? (
+                <pre className="inline-edit-body">{clip(event.input || event.output || "", 6000)}</pre>
+              ) : null}
           </div>
-          {event.diffs?.length
-            ? event.diffs.map((diff, index) => (
-                <CodeDiffView key={`${event.id}-${diff.path || "diff"}-${index}`} diff={diff} lang={lang} />
-              ))
-            : event.input || event.output ? (
-              <pre className="inline-edit-body">{clip(event.input || event.output || "", 6000)}</pre>
-            ) : null}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 });

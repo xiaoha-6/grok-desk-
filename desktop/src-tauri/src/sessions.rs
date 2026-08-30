@@ -611,6 +611,17 @@ fn tool_label(name: &str, args: &Value) -> (&'static str, String) {
         "web_fetch" => ("fetch", "Fetch URL".into()),
         "list_dir" | "Glob" => ("list", format!("List `{path}`")),
         "image_gen" | "imagine" | "ImageGen" => ("image_gen", "Generate Image".into()),
+        "spawn_subagent" => (
+            "subagent",
+            args
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Subagent")
+                .to_string(),
+        ),
+        "get_command_or_subagent_output" | "kill_command_or_subagent" => {
+            ("subagent_poll", name.replace('_', " "))
+        }
         _ => ("other", name.replace('_', " ")),
     }
 }
