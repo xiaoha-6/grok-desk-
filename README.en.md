@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · English
+  <a href="README.md">简体中文</a> · <a href="README.zh-Hant.md">繁體中文</a> · English
 </p>
 
 > [!TIP]
@@ -36,7 +36,7 @@ GrokDesk is the desktop experience layer for Grok Build, not a separate general-
 - Isolated multi-account authentication with renaming, ordering, health controls, and smart-usage, sequential, round-robin, or fixed-account routing.
 - Weekly/monthly usage, active account, context-window, and runtime status visibility.
 - Chat bridges (Telegram, Discord, Slack, Feishu, and more) so desktop replies can sync out and platform messages can come back in.
-- System, light, and dark appearance with English and Simplified Chinese interfaces.
+- System, light, and dark appearance with English, Simplified Chinese, and Traditional Chinese interfaces.
 
 ## Requirements
 

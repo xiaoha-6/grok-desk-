@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  简体中文 · <a href="README.en.md">English</a>
+  简体中文 · <a href="README.zh-Hant.md">繁體中文</a> · <a href="README.en.md">English</a>
 </p>
 
 > [!TIP]
@@ -45,7 +45,7 @@ GrokDesk 是 Grok Build 的桌面体验层，而不是另一套通用 Agent。�
 - 多账号登录、改名、启停和排序；智能额度优先、顺序、轮询和固定账号路由。
 - 周/月额度、本轮账号、Context Window 和 Runtime 状态可视化。
 - 聊天桥接：Telegram、Discord、Slack、飞书等，桌面回复能同步出去，平台消息也能收回来继续聊。
-- 浅色、深色和跟随系统外观；English 与简体中文界面。
+- 浅色、深色和跟随系统外观；English、简体中文与繁体中文界面。
 
 ## 系统要求
 

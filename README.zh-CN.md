@@ -4,4 +4,5 @@
 
 - 官网中转站：[https://xiaohaweb.com/](https://xiaohaweb.com/)
 - QQ 售后群：`863407368`
+- 繁體中文：[README.zh-Hant.md](README.zh-Hant.md)
 - English：[README.en.md](README.en.md)
