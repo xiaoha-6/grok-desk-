@@ -18,7 +18,7 @@ use tauri::{AppHandle, Emitter};
 type Aes256CbcDec = Decryptor<Aes256>;
 
 const WEBHOOK_PORT: u16 = 18791;
-const UA: &str = "GrokDesk-Bridge/0.6.71";
+const UA: &str = "GrokDesk-Bridge/0.6.72";
 const KNOWN_KINDS: &[&str] = &[
     "telegram", "discord", "slack", "whatsapp", "feishu", "qq", "wechat", "wecom", "dingtalk",
     "line", "zalo", "googlechat", "msteams", "mattermost", "matrix", "sms", "synology", "signal",
@@ -474,10 +474,7 @@ impl BridgeHub {
                 get_json(&format!("https://api.telegram.org/bot{}/getMe", ch.token.trim()), None)
                     .map(|_| "Telegram Bot 有效".into())
             }
-            "discord" if !ch.token.trim().is_empty() => {
-                get_json("https://discord.com/api/v10/users/@me", Some(&format!("Bot {}", ch.token.trim())))
-                    .map(|_| "Discord Bot 有效".into())
-            }
+            "discord" if !discord_token(&ch.token).is_empty() => probe_discord(&ch),
             "slack" if !ch.token.trim().is_empty() => {
                 get_json("https://slack.com/api/auth.test", Some(&format!("Bearer {}", ch.token.trim())))
                     .map(|_| "Slack Token 有效".into())
@@ -521,11 +518,18 @@ fn spawn_pollers(ctx: &InboundCtx, config: &BridgesConfig, stop: &Arc<AtomicBool
         thread::spawn(move || telegram_poll_loop(ctx, telegram, stop));
     }
     let discord = channel_of(config, "discord");
-    if discord.enabled && discord.accept_inbound && !discord.token.trim().is_empty() && !discord.default_target.trim().is_empty()
-    {
-        let ctx = ctx.clone();
-        let stop = stop.clone();
-        thread::spawn(move || discord_poll_loop(ctx, discord, stop));
+    if discord.enabled && discord.accept_inbound {
+        if discord_token(&discord.token).is_empty() || discord_channel(&discord.default_target).is_empty() {
+            record_error(
+                &ctx.errors,
+                "discord",
+                "入站需要 Bot Token + 频道 Channel ID。只填 Webhook 只能往 Discord 发，收不到频道消息。",
+            );
+        } else {
+            let ctx = ctx.clone();
+            let stop = stop.clone();
+            thread::spawn(move || discord_poll_loop(ctx, discord, stop));
+        }
     }
     let slack = channel_of(config, "slack");
     if slack.enabled && slack.accept_inbound && !slack.token.trim().is_empty() && !slack.default_target.trim().is_empty() {
@@ -696,6 +700,8 @@ fn looks_group(kind: &str, target: &str, value: &Value) -> bool {
             Some("group" | "supergroup" | "channel")
         ),
         "discord" => {
+            // REST GET /channels/{id}/messages omits guild_id. Message `type` is
+            // the message kind (0 = DEFAULT), not the channel kind — do not use it.
             let channel_type = value
                 .get("channel_type")
                 .or_else(|| value.pointer("/channel/type"))
@@ -703,7 +709,7 @@ fn looks_group(kind: &str, target: &str, value: &Value) -> bool {
             if let Some(kind) = channel_type {
                 return kind != 1;
             }
-            value.get("guild_id").is_some()
+            value.get("guild_id").is_some() || !target.trim().is_empty()
         }
         "slack" => {
             let channel = if target.is_empty() {
@@ -1007,8 +1013,8 @@ fn send_discord(ch: &BridgeChannel, text: &str, media: &[BridgeMedia]) -> Result
         }
         return post_json(&url, None, body);
     }
-    let token = ch.token.trim();
-    let channel = ch.default_target.trim();
+    let token = discord_token(&ch.token);
+    let channel = discord_channel(&ch.default_target);
     if token.is_empty() || channel.is_empty() {
         return Err("缺少 Bot Token 或频道 ID".into());
     }
@@ -1816,23 +1822,120 @@ fn telegram_poll_loop(ctx: InboundCtx, ch: BridgeChannel, stop: Arc<AtomicBool>)
     }
 }
 
+fn discord_token(raw: &str) -> String {
+    raw.trim().trim_start_matches("Bot ").trim().to_string()
+}
+
+fn discord_channel(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(inner) = trimmed.strip_prefix("<#").and_then(|item| item.strip_suffix('>')) {
+        return inner.trim().to_string();
+    }
+    trimmed.trim_start_matches('#').to_string()
+}
+
+fn discord_auth(token: &str) -> String {
+    format!("Bot {token}")
+}
+
+fn annotate_discord_message(item: &Value, channel_type: Option<u64>, guild_id: &str) -> Value {
+    let mut next = item.clone();
+    if let Some(obj) = next.as_object_mut() {
+        if let Some(kind) = channel_type {
+            obj.insert("channel_type".into(), json!(kind));
+        }
+        if !guild_id.is_empty() && !obj.contains_key("guild_id") {
+            obj.insert("guild_id".into(), json!(guild_id));
+        }
+    }
+    next
+}
+
+fn discord_explain(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("401") || lower.contains("unauthorized") {
+        return format!("{err} · Bot Token 无效，请用开发者后台 Bot 页的 Token，不要填 Client Secret");
+    }
+    if lower.contains("50001") || lower.contains("missing access") || lower.contains("403") {
+        return format!("{err} · 机器人进不了这个频道。邀请时勾选 bot，并给 View Channel / Send Messages / Read Message History");
+    }
+    if lower.contains("10003") || lower.contains("unknown channel") {
+        return format!("{err} · 频道 ID 不对。打开 Discord 开发者模式，右键频道复制 ID，不要复制服务器 ID");
+    }
+    if lower.contains("429") {
+        return format!("{err} · Discord 限流，稍后会自动重试");
+    }
+    err.to_string()
+}
+
+fn probe_discord(ch: &BridgeChannel) -> Result<String, String> {
+    let token = discord_token(&ch.token);
+    let auth = discord_auth(&token);
+    get_json("https://discord.com/api/v10/users/@me", Some(&auth)).map_err(|err| discord_explain(&err))?;
+    let channel = discord_channel(&ch.default_target);
+    if channel.is_empty() {
+        return Ok("Discord Bot 有效。入站还要填频道 Channel ID".into());
+    }
+    let info = get_json(&format!("https://discord.com/api/v10/channels/{channel}"), Some(&auth))
+        .map_err(|err| discord_explain(&err))?;
+    let channel_type = info.get("type").and_then(Value::as_u64).unwrap_or(0);
+    if channel_type == 1 {
+        return Ok("Discord Bot 有效，当前目标是私信频道".into());
+    }
+    let rows = get_json(
+        &format!("https://discord.com/api/v10/channels/{channel}/messages?limit=5"),
+        Some(&auth),
+    )
+    .map_err(|err| discord_explain(&err))?;
+    if let Some(rows) = rows.as_array() {
+        let empty_user = rows.iter().any(|item| {
+            item.get("author").and_then(|a| a.get("bot")).and_then(Value::as_bool) != Some(true)
+                && item.get("content").and_then(Value::as_str).unwrap_or("").trim().is_empty()
+                && item
+                    .get("attachments")
+                    .and_then(Value::as_array)
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
+        });
+        if empty_user {
+            return Ok("Discord 能读这个频道，但消息内容是空的。去开发者后台 Privileged Gateway Intents 打开 Message Content Intent".into());
+        }
+    }
+    Ok("Discord Bot 有效，也能读这个频道".into())
+}
+
 fn discord_poll_loop(ctx: InboundCtx, ch: BridgeChannel, stop: Arc<AtomicBool>) {
-    let token = ch.token.trim().to_string();
-    let channel = ch.default_target.trim().to_string();
+    let token = discord_token(&ch.token);
+    let channel = discord_channel(&ch.default_target);
     if token.is_empty() || channel.is_empty() {
         return;
     }
+    let auth = discord_auth(&token);
+    let mut channel_type: Option<u64> = None;
+    let mut guild_id = String::new();
+    if let Ok(info) = get_json(&format!("https://discord.com/api/v10/channels/{channel}"), Some(&auth)) {
+        channel_type = info.get("type").and_then(Value::as_u64);
+        guild_id = info
+            .get("guild_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        clear_error(&ctx.errors, "discord");
+    }
     let mut after = String::new();
     let mut primed = false;
+    let mut warned_empty = false;
     while !stop.load(Ordering::SeqCst) {
         let url = if after.is_empty() {
             format!("https://discord.com/api/v10/channels/{channel}/messages?limit=5")
         } else {
             format!("https://discord.com/api/v10/channels/{channel}/messages?after={after}&limit=20")
         };
-        match get_json(&url, Some(&format!("Bot {token}"))) {
+        match get_json(&url, Some(&auth)) {
             Ok(value) => {
-                clear_error(&ctx.errors, "discord");
+                if !warned_empty {
+                    clear_error(&ctx.errors, "discord");
+                }
                 if let Some(rows) = value.as_array() {
                     if !primed {
                         after = rows
@@ -1852,8 +1955,32 @@ fn discord_poll_loop(ctx: InboundCtx, ch: BridgeChannel, stop: Arc<AtomicBool>) 
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            let text = item.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string();
-                            route_inbound(&ctx, "discord", &sender, &channel, &text, item);
+                            let mut text = item.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                            if text.is_empty() {
+                                let has_file = item
+                                    .get("attachments")
+                                    .and_then(Value::as_array)
+                                    .map(|rows| !rows.is_empty())
+                                    .unwrap_or(false);
+                                if has_file {
+                                    text = "[附件]".into();
+                                } else {
+                                    if !warned_empty {
+                                        warned_empty = true;
+                                        record_error(
+                                            &ctx.errors,
+                                            "discord",
+                                            "读到了频道消息但内容是空的。Discord 开发者后台 Privileged Gateway Intents 打开 Message Content Intent，再重新邀请机器人。",
+                                        );
+                                    }
+                                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                                        after = id.to_string();
+                                    }
+                                    continue;
+                                }
+                            }
+                            let annotated = annotate_discord_message(item, channel_type, &guild_id);
+                            route_inbound(&ctx, "discord", &sender, &channel, &text, &annotated);
                             if let Some(id) = item.get("id").and_then(Value::as_str) {
                                 after = id.to_string();
                             }
@@ -1861,7 +1988,7 @@ fn discord_poll_loop(ctx: InboundCtx, ch: BridgeChannel, stop: Arc<AtomicBool>) 
                     }
                 }
             }
-            Err(err) => record_error(&ctx.errors, "discord", err),
+            Err(err) => record_error(&ctx.errors, "discord", discord_explain(&err)),
         }
         sleep_while(&stop, Duration::from_secs(6));
     }
@@ -1927,8 +2054,11 @@ fn get_json(url: &str, auth: Option<&str>) -> Result<Value, String> {
     if let Some(auth) = auth {
         req = req.set("Authorization", auth);
     }
-    let response = req.call().map_err(|err| err.to_string())?;
-    read_ureq(response)
+    match req.call() {
+        Ok(response) => read_ureq(response),
+        Err(ureq::Error::Status(_, response)) => read_ureq(response),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -2024,7 +2154,16 @@ mod tests {
     fn discord_dm_is_not_group() {
         assert!(!looks_group("discord", "dm1", &json!({"channel_type": 1, "content": "hi"})));
         assert!(looks_group("discord", "c1", &json!({"guild_id": "1", "content": "hi"})));
-        assert!(!looks_group("discord", "dm1", &json!({"type": 0, "content": "hi"})));
+        assert!(looks_group("discord", "c1", &json!({"channel_type": 0, "content": "hi"})));
+        // REST messages use message.type=0 and omit guild_id — still a guild channel.
+        assert!(looks_group("discord", "c1", &json!({"type": 0, "content": "hi"})));
+    }
+
+    #[test]
+    fn discord_token_and_channel_sanitize() {
+        assert_eq!(discord_token("Bot abc.def"), "abc.def");
+        assert_eq!(discord_channel("<#1234567890>"), "1234567890");
+        assert_eq!(discord_channel("#1234567890"), "1234567890");
     }
 
     #[test]

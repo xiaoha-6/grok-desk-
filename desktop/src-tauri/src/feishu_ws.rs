@@ -194,7 +194,7 @@ pub fn fetch_endpoint(base: &str, app_id: &str, app_secret: &str) -> Result<Endp
     let rec = ureq::post(&url)
         .set("Content-Type", "application/json")
         .set("locale", "zh")
-        .set("User-Agent", "GrokDesk-Bridge/0.6.71")
+        .set("User-Agent", "GrokDesk-Bridge/0.6.72")
         .send_string(
             &json!({
                 "AppID": app_id,

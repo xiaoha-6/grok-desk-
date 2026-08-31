@@ -26,7 +26,7 @@ export const BRIDGE_CATALOG: BridgeMeta[] = [
     group: "core",
     fields: ["token", "target", "webhook"],
     name: { zh: "Discord", hant: "Discord", en: "Discord" },
-    hint: { zh: "Bot Token + 频道 ID，或只用 Webhook。入站轮询该频道。", hant: "Bot Token + 頻道 ID，或只用 Webhook。入站輪詢該頻道。", en: "Bot token + channel ID, or a webhook. Inbound polls the channel." },
+    hint: { zh: "入站必须填 Bot Token + 频道 Channel ID（开发者模式右键复制）。Webhook 只能往外发。Bot 要开 Message Content Intent，并邀请进服务器。", hant: "入站必須填 Bot Token + 頻道 Channel ID（開發者模式右鍵複製）。Webhook 只能往外發。Bot 要開 Message Content Intent，並邀請進伺服器。", en: "Inbound needs a bot token + channel ID (Developer Mode → Copy Channel ID). A webhook is outbound-only. Enable Message Content Intent and invite the bot." },
     targetHint: { zh: "频道 Channel ID", hant: "頻道 Channel ID", en: "Channel ID" },
   },
   {
