@@ -21,6 +21,7 @@ import {
   IconTerminal,
 } from "./icons";
 import { BridgesPanel } from "./BridgesPanel";
+import { openRelayPromo } from "./RelayPromo";
 import { KeybindingsEditor } from "./KeybindingsEditor";
 import { RelayUsagePanel } from "./RelayUsagePanel";
 import { fill, type Copy } from "./i18n";
@@ -528,6 +529,13 @@ export function SettingsView(props: {
           {props.settingsPage === "relay" && (
             <>
               <p className="lede">{copy.relayHint}</p>
+              <section className="group">
+                <SettingsRow title={copy.relayPromoTitle} detail={copy.relayPromoHint}>
+                  <button className="primary compact" type="button" onClick={() => void openRelayPromo()}>
+                    {copy.relayPromoOpen}
+                  </button>
+                </SettingsRow>
+              </section>
               <section className="group stacked">
                 <label>
                   {copy.endpoint}

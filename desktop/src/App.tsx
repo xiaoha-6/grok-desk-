@@ -77,6 +77,7 @@ import { MarkdownPreview } from "./MarkdownPreview";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
 import { QuickOpen } from "./QuickOpen";
+import { RelayPromoBanner } from "./RelayPromo";
 import { SettingsView } from "./SettingsView";
 import { bridgeLabel, bridgeSessionMeta } from "./bridgeCatalog";
 import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
@@ -438,9 +439,7 @@ function friendlyError(raw: string, copy: Copy) {
 function isUserCancelError(raw?: string) {
   const text = String(raw || "").trim();
   if (!text) return false;
-  return /连接已取消|連線已取消|cancelled by user|session\/cancel|user cancel|canceled by the user|prompt cancelled|turn cancelled/i.test(
-    text,
-  );
+  return /连接已取消|連線已取消|cancelled by user|canceled by the user/i.test(text);
 }
 
 function isTransientUpstreamError(raw?: string) {
@@ -450,13 +449,11 @@ function isTransientUpstreamError(raw?: string) {
   if (/图片太大|圖片太大|weekly limit|run out of credits|status 402|额度不足|周限额|額度不足|週限額|401|unauthorized|invalid api key/i.test(text)) {
     return false;
   }
-  return /超时|超時|timeout|timed out|502|503|504|unavailable|overloaded|已退出|尚未连接|尚未連接|尚未就绪|尚未就緒|bad gateway|broken pipe|connection reset|connection refused|写入.*失败|寫入.*失敗|upstream|上游|internal error/i.test(
-    text,
-  );
+  return true;
 }
 
 function sealAssistantMessage(message: ChatMessage, options?: { error?: string; stopped?: boolean; copy?: Copy }): ChatMessage {
-  const cancelled = Boolean(options?.stopped || isUserCancelError(options?.error));
+  const cancelled = Boolean(options?.stopped);
   const err = options?.error && !cancelled ? friendlyError(options.error, options.copy || translate("zh")) : undefined;
   const thoughtOut =
     message.thought && message.thought.length > 8000 ? message.thought.slice(-8000) : message.thought;
@@ -1606,6 +1603,8 @@ export default function App() {
   const persistNowRef = useRef(() => {});
   const contextRetryRef = useRef(new Set<string>());
   const compactRetryingRef = useRef(new Set<string>());
+  const userStoppedRef = useRef(new Set<string>());
+  const ignoreStaleCancelRef = useRef(new Set<string>());
   const lastOutboundRef = useRef<Record<string, { text: string; attachments: PromptAttachment[]; assistantId: string; turnId: number }>>({});
   const retryCompactRef = useRef<(conversationId: string) => Promise<void>>(async () => {});
   const modelRef = useRef(model);
@@ -2219,8 +2218,13 @@ export default function App() {
   const finishTurn = useCallback((error?: string, conversationId?: string) => {
     const targetId = conversationId || selectedIdRef.current;
     flushPendingStream(targetId || undefined, true);
-    const cancelled = isUserCancelError(error);
-    const err = error && !cancelled ? friendlyError(error, tRef.current) : undefined;
+    const userStop = Boolean(targetId && userStoppedRef.current.has(targetId));
+    const cancelled = userStop;
+    const dropped = !cancelled && isUserCancelError(error);
+    const err =
+      error && !cancelled
+        ? friendlyError(dropped ? tRef.current.turnDropped : error, tRef.current)
+        : undefined;
     setConversations((list) => {
       const next = list.map((item) => {
         if (item.id !== targetId) return item;
@@ -2232,7 +2236,7 @@ export default function App() {
         const sealed = item.messages.map((message) => {
           if (message.role === "assistant" && message.streaming) {
             sealedLive = true;
-            const next = sealAssistantMessage(message, { error, stopped: cancelled, copy: tRef.current });
+            const next = sealAssistantMessage(message, { error: err || error, stopped: cancelled, copy: tRef.current });
             if (!err && !cancelled) {
               next.events = next.events.map((event) =>
                 event.id === "upstream-reconnect" && event.status === "in_progress"
@@ -2897,9 +2901,9 @@ export default function App() {
       const targetId = payload.conversationId || selectedIdRef.current;
       const attempt = Math.max(1, Number(payload.attempt) || 1);
       const copy = tRef.current;
-      const title = fill(copy.reconnectingUpstreamEvent, { n: attempt });
+      const title = copy.reconnectingUpstreamEvent;
       if (targetId && targetId === selectedIdRef.current) {
-        setStatusText(fill(copy.reconnectingUpstream, { n: attempt }));
+        setStatusText(copy.reconnectingUpstream);
       }
       mutateTargetRef.current = targetId;
       mutateAssistant((assistant) => {
@@ -2909,7 +2913,9 @@ export default function App() {
           kind: "retry",
           title,
           status: "in_progress",
-          output: payload.error || "",
+          output: [copy.reconnectingUpstream, attempt > 1 ? String(attempt) : "", payload.error]
+            .filter(Boolean)
+            .join(" · "),
         });
       });
     },
@@ -3388,6 +3394,10 @@ export default function App() {
           const targetId = conversationId || selectedIdRef.current;
           if (targetId && compactRetryingRef.current.has(targetId) && isUserCancelError(error)) {
             return;
+          }
+          if (targetId && ignoreStaleCancelRef.current.has(targetId) && (!event.payload.ok || isUserCancelError(error))) {
+            ignoreStaleCancelRef.current.delete(targetId);
+            if (!event.payload.ok) return;
           }
           if (!event.payload.ok && isContextTooLarge(error)) {
             const conv = conversationsRef.current.find((item) => item.id === targetId);
@@ -3872,6 +3882,7 @@ export default function App() {
         promptQueueRef.current = promptQueueRef.current.filter((item) => item.conversationId !== conversation.id);
         setQueuedPrompts([...promptQueueRef.current]);
         bumpConversationTurn(conversation.id);
+        userStoppedRef.current.add(conversation.id);
         // Seal the in-flight assistant BEFORE tearing down the session so tool/
         // process output cannot vanish when stop_session races history merges.
         setConversations((list) => {
@@ -3903,6 +3914,7 @@ export default function App() {
         } catch {
           // ignore
         }
+        ignoreStaleCancelRef.current.add(conversation.id);
       } else {
         const queuedUser: ChatMessage = {
           id: uid(),
@@ -3979,6 +3991,7 @@ export default function App() {
       setStatusText(t.needCredentials);
       return;
     }
+    userStoppedRef.current.delete(conversation.id);
     const turnId = bumpConversationTurn(conversation.id);
     // Invalidate any in-flight history fetch immediately, before React re-renders.
     historyEpochRef.current[conversation.id] = (historyEpochRef.current[conversation.id] || 0) + 1;
@@ -4110,14 +4123,13 @@ export default function App() {
         enableSubagents: settingsRef.current.enableSubagents,
         conversationId: conversation.id,
       };
-      const maxAttempts = 4;
       let lastError = "";
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      for (let attempt = 1; ; attempt++) {
         if (turnId !== conversationTurn(conversation.id)) return;
         try {
           if (attempt > 1) {
             if (conversation.id === selectedIdRef.current) {
-              setStatusText(fill(t.reconnectingUpstream, { n: attempt }));
+              setStatusText(t.reconnectingUpstream);
             }
             mutateTargetRef.current = conversation.id;
             mutateAssistant((current) => {
@@ -4125,11 +4137,11 @@ export default function App() {
               current.events = upsertEvent(current.events, {
                 id: "upstream-reconnect",
                 kind: "retry",
-                title: fill(t.reconnectingUpstreamEvent, { n: attempt }),
+                title: t.reconnectingUpstreamEvent,
                 status: "in_progress",
               });
             });
-            await new Promise((resolve) => setTimeout(resolve, Math.min(8000, 800 * 2 ** (attempt - 2))));
+            await new Promise((resolve) => setTimeout(resolve, Math.min(15_000, 1000 * Math.min(attempt, 15))));
             if (turnId !== conversationTurn(conversation.id)) return;
             const latest = conversationsRef.current.find((item) => item.id === conversation.id);
             sessionOptions.existingSessionId = latest?.grokSessionId ?? sessionOptions.existingSessionId;
@@ -4175,7 +4187,8 @@ export default function App() {
           break;
         } catch (error) {
           lastError = String(error);
-          if (!isTransientUpstreamError(lastError) || attempt === maxAttempts) break;
+          if (isUserCancelError(lastError) || turnId !== conversationTurn(conversation.id)) return;
+          if (!isTransientUpstreamError(lastError)) break;
         }
       }
       if (lastError) {
@@ -4294,7 +4307,10 @@ export default function App() {
 
   async function stopTurn() {
     const id = selectedIdRef.current;
-    if (id) bumpConversationTurn(id);
+    if (id) {
+      bumpConversationTurn(id);
+      userStoppedRef.current.add(id);
+    }
     // Freeze the live assistant first so cancel/stop cannot blank the transcript.
     finishTurn(t.connectionCancelled, id || undefined);
     try {
@@ -5220,6 +5236,7 @@ export default function App() {
   if (view === "settings") {
     return (
       <>
+      <RelayPromoBanner copy={t} />
       {splashOverlay}
       <SettingsView
         t={t}
@@ -5330,6 +5347,7 @@ export default function App() {
 
   return (
     <div className={`app${workspaceSide === "left" ? " ws-left" : " ws-right"}`} onClick={() => { setShowAccountMenu(false); setShowProjectMenu(false); }}>
+      <RelayPromoBanner copy={t} />
       {splashOverlay}
       {showSidebar ? (
         <>
