@@ -1,3 +1,5 @@
+use crate::text_decode::{decode_os_name, decode_text_bytes};
+use base64::Engine;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,7 @@ pub const SKIP_DIRS: &[&str] = &[
 pub const SHOW_DOT_DIRS: &[&str] = &[".vscode", ".cursor", ".github", ".grok"];
 pub const MAX_ENTRIES: usize = 250;
 pub const MAX_FILE_BYTES: u64 = 400_000;
+pub const MAX_IMAGE_PREVIEW_BYTES: u64 = 15 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +43,15 @@ pub struct WorkspaceFile {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkspaceImage {
+    pub path: String,
+    pub mime_type: String,
+    pub data: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalPathInfo {
     pub path: String,
     pub name: String,
@@ -54,8 +66,8 @@ pub fn inspect_local_path(path: &str) -> Result<LocalPathInfo, String> {
     let canon = fs::canonicalize(&raw).map_err(|err| format!("路径无效：{err}"))?;
     let name = canon
         .file_name()
-        .map(|item| item.to_string_lossy().into_owned())
-        .unwrap_or_else(|| canon.display().to_string());
+        .map(decode_os_name)
+        .unwrap_or_else(|| decode_os_name(canon.as_os_str()));
     Ok(LocalPathInfo {
         path: canon.to_string_lossy().into_owned(),
         name,
@@ -74,7 +86,7 @@ pub fn list_workspace(root: &str, rel: Option<&str>) -> Result<Vec<WorkspaceEntr
     let mut entries = Vec::new();
     let reader = fs::read_dir(&dir).map_err(|err| format!("无法读取工作区：{err}"))?;
     for item in reader.flatten() {
-        let name = item.file_name().to_string_lossy().to_string();
+        let name = decode_os_name(&item.file_name());
         if name == "." || name == ".." {
             continue;
         }
@@ -116,7 +128,7 @@ pub fn read_workspace_file(root: &str, rel: &str) -> Result<WorkspaceFile, Strin
     } else {
         fs::read(&path).map_err(|err| format!("无法读取文件：{err}"))?
     };
-    let mut content = String::from_utf8_lossy(&bytes).into_owned();
+    let mut content = decode_text_bytes(&bytes);
     if truncated {
         content.push_str("\n…");
     }
@@ -125,6 +137,46 @@ pub fn read_workspace_file(root: &str, rel: &str) -> Result<WorkspaceFile, Strin
         language: language_for_name(&rel.replace('\\', "/")),
         content,
         truncated,
+        size,
+    })
+}
+
+pub fn image_mime_for_name(path: &str) -> Option<&'static str> {
+    match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "svg" => Some("image/svg+xml"),
+        "heic" | "heif" => Some("image/heic"),
+        _ => None,
+    }
+}
+
+pub fn read_workspace_image(root: &str, rel: &str) -> Result<WorkspaceImage, String> {
+    let mime = image_mime_for_name(rel).ok_or_else(|| "不是图片文件".to_string())?;
+    let path = resolve_in_root(root, rel)?;
+    if path.is_dir() {
+        return Err("这是文件夹".into());
+    }
+    let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    if size > MAX_IMAGE_PREVIEW_BYTES {
+        return Err("图片太大，无法预览".into());
+    }
+    let bytes = fs::read(&path).map_err(|err| format!("无法读取图片：{err}"))?;
+    Ok(WorkspaceImage {
+        path: rel.replace('\\', "/"),
+        mime_type: mime.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
         size,
     })
 }
@@ -204,7 +256,7 @@ fn walk_search(dir: &Path, rel: &str, needle: &str, limit: usize, out: &mut Vec<
         if out.len() >= limit {
             break;
         }
-        let name = item.file_name().to_string_lossy().to_string();
+        let name = decode_os_name(&item.file_name());
         if name == "." || name == ".." {
             continue;
         }
@@ -261,7 +313,7 @@ fn walk_grep(dir: &Path, rel: &str, needle: &str, limit: usize, out: &mut Vec<Gr
         if out.len() >= limit {
             break;
         }
-        let name = item.file_name().to_string_lossy().to_string();
+        let name = decode_os_name(&item.file_name());
         if name == "." || name == ".." || name.starts_with('.') {
             continue;
         }
@@ -288,7 +340,7 @@ fn walk_grep(dir: &Path, rel: &str, needle: &str, limit: usize, out: &mut Vec<Gr
         if bytes.contains(&0) {
             continue;
         }
-        let text = String::from_utf8_lossy(&bytes);
+        let text = decode_text_bytes(&bytes);
         for (index, line) in text.lines().enumerate() {
             if out.len() >= limit {
                 break;
@@ -450,6 +502,16 @@ mod tests {
         assert!(!info.is_dir);
         let folder = inspect_local_path(dir.to_str().unwrap()).unwrap();
         assert!(folder.is_dir);
+        fs::write(dir.join("note.txt"), [0xB2, 0xE2, 0xCA, 0xD4, 0xCE, 0xC4, 0xBC, 0xFE]).unwrap();
+        let gbk = read_workspace_file(root, "note.txt").unwrap();
+        assert_eq!(gbk.content, "测试文件");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+            .unwrap();
+        fs::write(dir.join("dot.png"), png).unwrap();
+        let preview = read_workspace_image(root, "dot.png").unwrap();
+        assert_eq!(preview.mime_type, "image/png");
+        assert!(!preview.data.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

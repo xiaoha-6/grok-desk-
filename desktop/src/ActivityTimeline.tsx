@@ -175,11 +175,13 @@ export const InlineThought = memo(function InlineThought({
   events,
   lang,
   streaming,
+  reconnecting,
 }: {
   thought?: string;
   events: TimelineEvent[];
   lang: Lang;
   streaming?: boolean;
+  reconnecting?: boolean;
 }) {
   const copy = translate(lang);
   const event = events.find(isThoughtEvent);
@@ -187,11 +189,13 @@ export const InlineThought = memo(function InlineThought({
   if (!text) return null;
   const seconds = thoughtTiming(event);
   const heading =
-    streaming && !seconds
-      ? copy.thinkingNow
-      : seconds
-        ? fill(copy.thoughtFor, { n: seconds })
-        : copy.thinking;
+    reconnecting
+      ? copy.reconnectingUpstream
+      : streaming && !seconds
+        ? copy.thinkingNow
+        : seconds
+          ? fill(copy.thoughtFor, { n: seconds })
+          : copy.thinking;
   const shown = streaming && text.length > 3500 ? `…\n${text.slice(-3500)}` : clip(text, 6000);
   return (
     <div className={`inline-thought${streaming ? " live" : ""}`}>

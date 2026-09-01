@@ -1,6 +1,10 @@
 use crate::config::{is_relay_configured, read_relay_profile, render_config, RelayImport};
 use crate::runtime::grok_home;
-use crate::workspace::{WorkspaceEntry, WorkspaceFile, SKIP_DIRS, MAX_FILE_BYTES, language_for_name};
+use crate::text_decode::decode_text_bytes;
+use crate::workspace::{
+    image_mime_for_name, language_for_name, WorkspaceEntry, WorkspaceFile, WorkspaceImage, MAX_FILE_BYTES,
+    MAX_IMAGE_PREVIEW_BYTES, SKIP_DIRS,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -271,16 +275,17 @@ if not os.path.isdir(root):
     print('ERR:not_dir'); raise SystemExit(2)
 if not os.access(root, os.R_OK):
     print('ERR:denied'); raise SystemExit(2)
-print('OK')
+sys.stdout.buffer.write(b'OK\n')
 for name in os.listdir(root):
     path=os.path.join(root, name)
-    print(('D' if os.path.isdir(path) else 'F') + '\t' + name)
+    line=('D' if os.path.isdir(path) else 'F') + '\t' + name + '\n'
+    sys.stdout.buffer.write(line.encode('utf-8', 'surrogateescape'))
 " {path}"#,
         path = sh_single(&remote),
     );
     let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = decode_text_bytes(&output.stdout);
+    let stderr = decode_text_bytes(&output.stderr);
     if stdout.contains("ERR:not_found") {
         return Err("远程路径不存在".into());
     }
@@ -303,12 +308,12 @@ for name in os.listdir(root):
         let Some((kind, name)) = line.split_once('\t') else {
             continue;
         };
-        let name = name.trim();
+        let name = decode_text_bytes(name.trim().as_bytes());
         if name.is_empty() {
             continue;
         }
         let is_dir = kind == "D" || kind == "d";
-        if name.starts_with('.') || (is_dir && skip.contains(name)) {
+        if name.starts_with('.') || (is_dir && skip.contains(name.as_str())) {
             continue;
         }
         let path = if rel.is_empty() {
@@ -385,7 +390,7 @@ with open(path, 'rb') as handle:
         .unwrap_or(0);
     let body = if split < stdout.len() { &stdout[split + 1..] } else { &[] };
     let truncated = size > MAX_FILE_BYTES;
-    let mut content = String::from_utf8_lossy(body).into_owned();
+    let mut content = decode_text_bytes(body);
     if truncated {
         content.push_str("\n…");
     }
@@ -394,6 +399,69 @@ with open(path, 'rb') as handle:
         language: language_for_name(&rel),
         content,
         truncated,
+        size,
+    })
+}
+
+pub fn read_remote_image(target: &SshTarget, rel: &str) -> Result<WorkspaceImage, String> {
+    let rel = sanitize_rel(rel)?;
+    if rel.is_empty() {
+        return Err("还没有选择文件".into());
+    }
+    let mime = image_mime_for_name(&rel).ok_or_else(|| "不是图片文件".to_string())?;
+    let remote = join_remote(&target.remote_path, &rel);
+    let script = format!(
+        r#"python3 -c "import os,sys
+path=os.path.expanduser(sys.argv[1])
+limit=int(sys.argv[2])
+if os.path.isdir(path):
+    sys.stdout.write('ERR:dir\n'); raise SystemExit(2)
+if not os.path.exists(path):
+    sys.stdout.write('ERR:not_found\n'); raise SystemExit(2)
+if not os.access(path, os.R_OK):
+    sys.stdout.write('ERR:denied\n'); raise SystemExit(2)
+size=os.path.getsize(path)
+if size > limit:
+    sys.stdout.write('ERR:too_large %d\n' % size); raise SystemExit(2)
+sys.stdout.buffer.write(('OK %d\n' % size).encode())
+with open(path, 'rb') as handle:
+    sys.stdout.buffer.write(handle.read(limit))
+" {path} {limit}"#,
+        path = sh_single(&remote),
+        limit = MAX_IMAGE_PREVIEW_BYTES,
+    );
+    let output = run_ssh(target, &script, SSH_TIMEOUT_SECS, None)?;
+    let stdout = output.stdout;
+    let split = stdout.iter().position(|byte| *byte == b'\n').unwrap_or(stdout.len());
+    let header = String::from_utf8_lossy(&stdout[..split]).trim().to_string();
+    if header.starts_with("ERR:dir") {
+        return Err("这是文件夹".into());
+    }
+    if header.starts_with("ERR:not_found") {
+        return Err("远程文件不存在".into());
+    }
+    if header.starts_with("ERR:denied") {
+        return Err("没有权限读取该文件".into());
+    }
+    if header.starts_with("ERR:too_large") {
+        return Err("图片太大，无法预览".into());
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ssh_error(&stderr, &header, output.status.code()));
+    }
+    if !header.starts_with("OK ") {
+        return Err(format!("无法读取远程图片：{header}"));
+    }
+    let size = header
+        .strip_prefix("OK ")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let body = if split < stdout.len() { &stdout[split + 1..] } else { &[] };
+    Ok(WorkspaceImage {
+        path: rel.replace('\\', "/"),
+        mime_type: mime.into(),
+        data: base64::engine::general_purpose::STANDARD.encode(body),
         size,
     })
 }

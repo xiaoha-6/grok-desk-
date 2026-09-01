@@ -11,6 +11,7 @@ mod pty;
 mod runtime;
 mod sessions;
 mod ssh;
+mod text_decode;
 mod workspace;
 
 use accounts::{
@@ -30,7 +31,7 @@ use sessions::{LocalSessionHistory, LocalSessionSummary};
 use ssh::{SshConfigHost, SshProbe, SshTarget};
 use git::{GitCommit, GitFileDiff, GitReview, GitStatus, GithubIdentity, SnapshotFile};
 use image_gen::GeneratedImage;
-use workspace::{GrepHit, LocalPathInfo, ProjectRules, WorkspaceEntry, WorkspaceFile};
+use workspace::{GrepHit, LocalPathInfo, ProjectRules, WorkspaceEntry, WorkspaceFile, WorkspaceImage};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
@@ -235,6 +236,23 @@ async fn read_workspace_file(
             ssh::read_remote_file(&target, &path)
         } else {
             workspace::read_workspace_file(&root, &path)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+async fn read_workspace_image(
+    root: String,
+    path: String,
+    ssh: Option<SshTarget>,
+) -> Result<WorkspaceImage, String> {
+    run_blocking(move || {
+        if let Some(target) = ssh {
+            let target = target.normalized()?;
+            ssh::read_remote_image(&target, &path)
+        } else {
+            workspace::read_workspace_image(&root, &path)
         }
     })
     .await
@@ -989,6 +1007,7 @@ pub fn run() {
             pick_ssh_identity,
             list_workspace,
             read_workspace_file,
+            read_workspace_image,
             write_workspace_file,
             search_workspace,
             grep_workspace,

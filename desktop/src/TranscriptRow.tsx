@@ -7,7 +7,7 @@ import {
   isShowableImage,
   wantsImageGen,
 } from "./ChatImage";
-import { AgentStatus, SubagentSwarm, agentOrbForMessage } from "./components/thinking-orbs/ThinkingOrbs";
+import { AgentStatus, SubagentSwarm, agentOrbForMessage, isUpstreamReconnecting } from "./components/thinking-orbs/ThinkingOrbs";
 import type { Copy, Lang } from "./i18n";
 import { isImeEvent } from "./keybindings";
 import { isSubagentEvent, statusLabel } from "./timeline";
@@ -25,12 +25,13 @@ export type TranscriptRowActions = {
   revealCommandInTerminal: () => void;
 };
 
-function assistantLivePhase(message: ChatMessage): "thinking" | "working" | null {
+function assistantLivePhase(message: ChatMessage): "reconnecting" | "thinking" | "working" | null {
   if (message.role !== "assistant" || !message.streaming) return null;
+  if (isUpstreamReconnecting(message.events)) return "reconnecting";
   const hasOutput =
     Boolean(message.text) ||
     message.media.length > 0 ||
-    message.events.some((event) => event.kind !== "thought");
+    message.events.some((event) => event.kind !== "thought" && event.id !== "upstream-reconnect");
   return hasOutput ? "working" : "thinking";
 }
 
@@ -76,9 +77,11 @@ export const TranscriptRow = memo(function TranscriptRow({
   const askedImage = wantsImageGen(prevUser?.text || "");
   const imageBusy = isImageGenBusy(message, prevUser?.text || "");
   const expectImage = imageBusy && !(message.media || []).some(isShowableImage);
-  const activity = agentOrbForMessage(message, copy, { imageBusy });
+  const reconnecting = livePhase === "reconnecting";
+  const activity = agentOrbForMessage(message, copy, { imageBusy, reconnecting });
   const hasSubagents = message.events.some(isSubagentEvent);
   const hasThought = Boolean(message.thought) || message.events.some((event) => event.kind === "thought" && event.output);
+  const showReconnectBar = reconnecting && !hasThought;
   const showThinkingBar = livePhase === "thinking" && !hasThought;
   const showWorkingBar = livePhase === "working" && !imageBusy && !hasSubagents;
   const canRedraw = message.role === "assistant" && Boolean(prevUser) && askedImage && !running;
@@ -128,6 +131,7 @@ export const TranscriptRow = memo(function TranscriptRow({
               events={message.events}
               lang={lang}
               streaming={Boolean(message.streaming)}
+              reconnecting={reconnecting}
             />
             {message.events.length ? (
               <>
@@ -152,7 +156,11 @@ export const TranscriptRow = memo(function TranscriptRow({
             ) : null}
           </>
         ) : null}
-        {showThinkingBar ? <AgentStatus className="thinking-bar" state="solving" label={copy.thinkingNow} /> : null}
+        {showReconnectBar ? (
+          <AgentStatus className="thinking-bar" state="connecting" label={copy.reconnectingUpstream} />
+        ) : showThinkingBar ? (
+          <AgentStatus className="thinking-bar" state="solving" label={copy.thinkingNow} />
+        ) : null}
         {editing ? null : (
           <ChatMessageMedia
             message={message}

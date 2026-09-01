@@ -752,7 +752,7 @@ fn extract_user_query(text: &str) -> String {
 /// Drop desktop-injected wrappers so history bubbles match what the user typed.
 fn strip_injected_prompt_context(text: &str) -> String {
     let mut out = text.to_string();
-    for tag in ["tool_policy", "file", "folder", "project_rules"] {
+    for tag in ["tool_policy", "file", "folder", "project_rules", "resume_context"] {
         out = strip_xml_blocks(&out, tag);
     }
     collapse_blank_lines(&out)
@@ -997,6 +997,25 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text, "hi");
         assert!(!messages[0].text.contains("tool_policy"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_strips_resume_context_from_continue_bubbles() {
+        let dir = std::env::temp_dir().join(format!("grokdesk-resume-{}", std::process::id()));
+        let path = dir.join("chat_history.jsonl");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"{"type":"user","prompt_index":1,"content":[{"type":"text","text":"继续\n\n<resume_context>Original task:\nbuild the app</resume_context>"}]}
+{"type":"assistant","content":"接着做"}
+"#,
+        )
+        .unwrap();
+        let messages = reconstruct_turns(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "继续");
+        assert!(!messages[0].text.contains("resume_context"));
         let _ = fs::remove_dir_all(&dir);
     }
 

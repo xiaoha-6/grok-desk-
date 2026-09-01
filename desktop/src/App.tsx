@@ -445,7 +445,15 @@ function isUserCancelError(raw?: string) {
 function isTransientUpstreamError(raw?: string) {
   const text = String(raw || "").trim();
   if (!text) return false;
-  if (isUserCancelError(text) || isContextTooLarge(text) || isMissingCredentials(text)) return false;
+  if (isUserCancelError(text)) return false;
+  if (
+    /502|503|504|bad gateway|gateway timeout|timeout|超时|超時|broken pipe|connection reset|连接失败|連線失敗|已退出|尚未连接|尚未連接|尚未就绪|尚未就緒|正在重连|正在重連/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  if (isContextTooLarge(text) || isMissingCredentials(text)) return false;
   if (/图片太大|圖片太大|weekly limit|run out of credits|status 402|额度不足|周限额|額度不足|週限額|401|unauthorized|invalid api key/i.test(text)) {
     return false;
   }
@@ -764,6 +772,14 @@ function compactEvents(events: TimelineEvent[], copy: Copy = translate(uiLang)):
   ];
 }
 
+function completeUpstreamReconnect(events: TimelineEvent[]) {
+  return events.map((event) =>
+    event.id === "upstream-reconnect" && event.status === "in_progress"
+      ? { ...event, status: "completed" }
+      : event,
+  );
+}
+
 function upsertEvent(events: TimelineEvent[], event: TimelineEvent, copy: Copy = translate(uiLang)) {
   const index = events.findIndex((item) => item.id === event.id);
   if (index >= 0) {
@@ -844,10 +860,60 @@ function isGenericTitle(title: string) {
 
 function stripInjectedPromptContext(text: string) {
   return String(text || "")
-    .replace(/<(tool_policy|file|folder|project_rules)(?:\s[^>]*)?>[\s\S]*?(?:<\/\1>|$)/gi, "")
+    .replace(/<(tool_policy|file|folder|project_rules|resume_context)(?:\s[^>]*)?>[\s\S]*?(?:<\/\1>|$)/gi, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function isResumePrompt(text: string) {
+  return /^(继续|繼續|接着[做着]?|接著[做著]?|请继续|請繼續|再继续|再繼續|继续吧|繼續吧|continue|go on|keep going|resume)\s*[。.!！]?$/i.test(
+    String(text || "").trim(),
+  );
+}
+
+function buildResumeContext(conversation: Conversation) {
+  const lastTask = [...conversation.messages]
+    .reverse()
+    .find((item) => item.role === "user" && !isResumePrompt(item.text));
+  const lastAssistant = [...conversation.messages].reverse().find((item) => item.role === "assistant");
+  const task = stripInjectedPromptContext(lastTask?.text || "").slice(0, 4000);
+  const done = stripInjectedPromptContext(lastAssistant?.text || "").slice(0, 2500);
+  const parts = [
+    "<resume_context>",
+    "The previous turn was interrupted. Continue that same work from where it stopped.",
+    "Do not repeat finished steps. Do not paste the earlier conversation back into the chat.",
+    task ? `Original task:\n${task}` : "",
+    done ? `Last assistant output (for continuity only, do not restate):\n${done}` : "",
+    lastAssistant?.stopped || lastAssistant?.error
+      ? "The last turn ended in a stop or error. Resume from that breakpoint."
+      : "",
+    "</resume_context>",
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
+function historyFingerprint(message: ChatMessage) {
+  const text = stripInjectedPromptContext(message.text || "").replace(/\s+/g, " ").trim();
+  return text ? `${message.role}:${text.slice(0, 800)}` : "";
+}
+
+function adoptHistoryIds(incoming: ChatMessage[], existing: ChatMessage[]) {
+  const used = new Set<string>();
+  return incoming.map((item) => {
+    const print = historyFingerprint(item);
+    if (!print) return item;
+    const match = existing.find((entry) => !used.has(entry.id) && historyFingerprint(entry) === print);
+    if (!match) return item;
+    used.add(match.id);
+    return {
+      ...item,
+      id: match.id,
+      media: (match.media?.length || 0) >= (item.media?.length || 0) ? match.media : item.media,
+      events: (item.events?.length || 0) >= (match.events?.length || 0) ? item.events : match.events,
+      thought: item.thought || match.thought,
+    };
+  });
 }
 
 function sanitizeConversationTitle(title: string, messages?: ChatMessage[]) {
@@ -1094,13 +1160,19 @@ type QueuedPrompt = {
 function mergeHistoryMessages(existing: ChatMessage[], incoming: ChatMessage[], prepend: boolean) {
   if (!incoming.length) return existing;
   const keep = existing.filter((item) => item.local || item.queued || item.streaming);
+  const rest = existing.filter((item) => !item.local && !item.queued && !item.streaming);
+  const adopted = adoptHistoryIds(incoming, rest);
   // Initial history load replaces persisted transcript. Appending used to keep an
   // old assistant-only fragment window and hide the real user turns.
   if (!prepend) {
-    return mergeConversationMessages(incoming, keep);
+    return mergeConversationMessages(adopted, keep);
   }
-  const rest = existing.filter((item) => !item.local && !item.queued && !item.streaming);
-  return mergeConversationMessages([...incoming, ...rest], keep);
+  const incomingPrints = new Set(adopted.map(historyFingerprint).filter(Boolean));
+  const unseenRest = rest.filter((item) => {
+    const print = historyFingerprint(item);
+    return !print || !incomingPrints.has(print);
+  });
+  return mergeConversationMessages([...adopted, ...unseenRest], keep);
 }
 
 function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary[]): Conversation[] {
@@ -1626,6 +1698,7 @@ export default function App() {
   const historyBusyRef = useRef(new Set<string>());
   const historyLockedRef = useRef(false);
   const historyEpochRef = useRef<Record<string, number>>({});
+  const streamHoldRef = useRef(new Set<string>());
   const checkpointsRef = useRef(new Map<string, SnapshotFile[]>());
   const turnUserIdRef = useRef<Record<string, string>>({});
   const mentionRef = useRef(mention);
@@ -1730,6 +1803,9 @@ export default function App() {
   }, [visibleMessages]);
   const liveActivity = useMemo(() => {
     if (!running) return null;
+    if (statusText === t.reconnectingUpstream) {
+      return { state: "connecting" as const, label: t.reconnectingUpstream };
+    }
     if (liveImageBusy) return { state: "shaping" as const, label: t.generatingImage };
     if (statusText === t.connecting) return { state: "connecting" as const, label: t.connecting };
     const assistant = findLast(visibleMessages, (item) => item.role === "assistant" && Boolean(item.streaming));
@@ -2178,7 +2254,13 @@ export default function App() {
       pending.buffers.delete(id);
       if (!buf || (!buf.text && !buf.thought)) continue;
       mutateTargetRef.current = id;
+      if (id === selectedIdRef.current) {
+        setStatusText((current) =>
+          current === tRef.current.reconnectingUpstream ? tRef.current.running : current,
+        );
+      }
       mutateAssistant((assistant) => {
+        assistant.events = completeUpstreamReconnect(assistant.events);
         if (buf.text) assistant.text += buf.text;
         if (buf.thought) {
           assistant.thought += buf.thought;
@@ -2410,6 +2492,13 @@ export default function App() {
       const targetId = String(payload.conversationId || selectedIdRef.current || "");
       const isActiveView = !payload.conversationId || payload.conversationId === selectedIdRef.current;
       mutateTargetRef.current = targetId;
+      if (targetId && streamHoldRef.current.has(targetId)) {
+        if (payload.method === "x.ai/models/update" || payload.method === "_x.ai/models/update") {
+          const current = String(params.currentModelId || params.current_model_id || "");
+          if (current && isActiveView) setModel(current);
+        }
+        return;
+      }
       const meta = asRecord(params._meta);
       if (payload.method === "x.ai/models/update" || payload.method === "_x.ai/models/update") {
         const current = String(params.currentModelId || params.current_model_id || "");
@@ -2488,7 +2577,13 @@ export default function App() {
         return;
       }
       flushPendingStream(targetId || undefined);
+      if (targetId === selectedIdRef.current) {
+        setStatusText((current) =>
+          current === tRef.current.reconnectingUpstream ? tRef.current.running : current,
+        );
+      }
       mutateAssistant((assistant, conversation) => {
+        assistant.events = completeUpstreamReconnect(assistant.events);
         if (type === "agent_message_chunk") {
           const content = asRecord(update.content) || {};
           const chunkType = String(content.type || "text").toLowerCase();
@@ -2989,8 +3084,8 @@ export default function App() {
       ) {
         return;
       }
-      const incoming: ChatMessage[] = (history.messages || []).map((item) => ({
-        id: uid(),
+      const incoming: ChatMessage[] = (history.messages || []).map((item, index, all) => ({
+        id: `hist:${history.sessionId || conversation.grokSessionId}:${skip + all.length - 1 - index}`,
         role: item.role === "assistant" ? "assistant" : "user",
         text: stripInjectedPromptContext(item.text || ""),
         thought: "",
@@ -4124,72 +4219,90 @@ export default function App() {
         conversationId: conversation.id,
       };
       let lastError = "";
-      for (let attempt = 1; ; attempt++) {
-        if (turnId !== conversationTurn(conversation.id)) return;
-        try {
-          if (attempt > 1) {
-            if (conversation.id === selectedIdRef.current) {
-              setStatusText(t.reconnectingUpstream);
-            }
-            mutateTargetRef.current = conversation.id;
-            mutateAssistant((current) => {
-              current.error = undefined;
-              current.events = upsertEvent(current.events, {
-                id: "upstream-reconnect",
-                kind: "retry",
-                title: t.reconnectingUpstreamEvent,
-                status: "in_progress",
-              });
-            });
-            await new Promise((resolve) => setTimeout(resolve, Math.min(15_000, 1000 * Math.min(attempt, 15))));
-            if (turnId !== conversationTurn(conversation.id)) return;
-            const latest = conversationsRef.current.find((item) => item.id === conversation.id);
-            sessionOptions.existingSessionId = latest?.grokSessionId ?? sessionOptions.existingSessionId;
-          }
-          const session = await invoke<SessionInfo>("ensure_session", { options: sessionOptions });
+      streamHoldRef.current.add(conversation.id);
+      try {
+        for (let attempt = 1; ; attempt++) {
           if (turnId !== conversationTurn(conversation.id)) return;
-          setConversations((list) => {
-            const next = list.map((item) => {
-              if (item.id !== conversation.id) return item;
-              // Re-assert optimistic bubbles after session id attach — history merge may race here.
-              const hasUser = item.messages.some((message) => message.id === user.id);
-              const hasAssistant = item.messages.some((message) => message.id === assistant.id);
-              const messages =
-                hasUser && hasAssistant
-                  ? item.messages
-                  : mergeConversationMessages(item.messages, [user, assistant]);
-              return {
-                ...item,
-                title,
-                messages,
-                grokSessionId: session.sessionId,
-                cwd: workspaceCwd,
-                ssh: sshTarget || item.ssh || null,
-                accountId: relayOn ? undefined : account?.id,
-              };
+          streamHoldRef.current.add(conversation.id);
+          try {
+            if (attempt > 1) {
+              if (conversation.id === selectedIdRef.current) {
+                setStatusText(t.reconnectingUpstream);
+              }
+              mutateTargetRef.current = conversation.id;
+              mutateAssistant((current) => {
+                current.error = undefined;
+                current.events = upsertEvent(current.events, {
+                  id: "upstream-reconnect",
+                  kind: "retry",
+                  title: t.reconnectingUpstreamEvent,
+                  status: "in_progress",
+                });
+              });
+              await new Promise((resolve) => setTimeout(resolve, Math.min(15_000, 1000 * Math.min(attempt, 15))));
+              if (turnId !== conversationTurn(conversation.id)) return;
+              const latest = conversationsRef.current.find((item) => item.id === conversation.id);
+              sessionOptions.existingSessionId = latest?.grokSessionId ?? sessionOptions.existingSessionId;
+            }
+            const previousSessionId = conversation.grokSessionId || "";
+            const session = await invoke<SessionInfo>("ensure_session", { options: sessionOptions });
+            if (turnId !== conversationTurn(conversation.id)) return;
+            setConversations((list) => {
+              const next = list.map((item) => {
+                if (item.id !== conversation.id) return item;
+                // Re-assert optimistic bubbles after session id attach — history merge may race here.
+                const hasUser = item.messages.some((message) => message.id === user.id);
+                const hasAssistant = item.messages.some((message) => message.id === assistant.id);
+                const messages =
+                  hasUser && hasAssistant
+                    ? item.messages
+                    : mergeConversationMessages(item.messages, [user, assistant]);
+                return {
+                  ...item,
+                  title,
+                  messages,
+                  grokSessionId: session.sessionId,
+                  cwd: workspaceCwd,
+                  ssh: sshTarget || item.ssh || null,
+                  accountId: relayOn ? undefined : account?.id,
+                };
+              });
+              conversationsRef.current = next;
+              return next;
             });
-            conversationsRef.current = next;
-            return next;
-          });
-          if (conversation.id === selectedIdRef.current) setStatusText(t.running);
-          const snapshot = await checkpointPromise;
-          const key = checkpointKey(conversation.id, user.id);
-          if (snapshot.length) {
-            checkpointsRef.current.set(key, snapshot);
-            setCheckpointFlags((flags) => ({ ...flags, [key]: true }));
+            if (conversation.id === selectedIdRef.current && attempt === 1) setStatusText(t.running);
+            const snapshot = await checkpointPromise;
+            const key = checkpointKey(conversation.id, user.id);
+            if (snapshot.length) {
+              checkpointsRef.current.set(key, snapshot);
+              setCheckpointFlags((flags) => ({ ...flags, [key]: true }));
+            }
+            const sessionLost = Boolean(previousSessionId) && session.sessionId !== previousSessionId;
+            const orphanedResume =
+              !previousSessionId &&
+              conversation.messages.some((item) => item.role === "assistant" && (item.text || item.events?.length));
+            const promptText =
+              isResumePrompt(visible) && (sessionLost || orphanedResume)
+                ? `${expanded}\n\n${buildResumeContext(conversation)}`
+                : expanded;
+            streamHoldRef.current.delete(conversation.id);
+            await invoke("send_prompt", {
+              text: promptText,
+              attachments: attachments.length ? attachments : null,
+              conversationId: conversation.id,
+            });
+            lastError = "";
+            break;
+          } catch (error) {
+            lastError = String(error);
+            if (isUserCancelError(lastError) || turnId !== conversationTurn(conversation.id)) return;
+            // First connect can still fail fast on real fatals. Once we are
+            // reconnecting, keep going until the user hits Stop.
+            if (attempt === 1 && !isTransientUpstreamError(lastError)) break;
           }
-          await invoke("send_prompt", {
-            text: expanded,
-            attachments: attachments.length ? attachments : null,
-            conversationId: conversation.id,
-          });
-          lastError = "";
-          break;
-        } catch (error) {
-          lastError = String(error);
-          if (isUserCancelError(lastError) || turnId !== conversationTurn(conversation.id)) return;
-          if (!isTransientUpstreamError(lastError)) break;
         }
+      } finally {
+        streamHoldRef.current.delete(conversation.id);
       }
       if (lastError) {
         if (turnId !== conversationTurn(conversation.id)) return;

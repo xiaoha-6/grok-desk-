@@ -31,6 +31,7 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 cipher = "0.4"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
+encoding_rs = "0.8"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

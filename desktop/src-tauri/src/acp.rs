@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -151,6 +151,8 @@ struct AgentProcess {
     pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
     diagnostics: Arc<DiagnosticBuffer>,
     home: PathBuf,
+    /// Off while session/load replays history so the UI does not append a second copy.
+    accept_ui_updates: Arc<AtomicBool>,
 }
 
 impl AgentProcess {
@@ -565,12 +567,19 @@ impl AcpClient {
             (agent, restart_agent, this.generation)
         };
 
-        let connect_result = (|| {
-            if need_init {
-                agent.initialize()?;
-            }
-            agent.open_session(&cwd, existing_session_id.as_deref(), &options)
-        })();
+        // session/load (and initialize) replay prior turns as session/update.
+        // Those must not land in the live assistant bubble under「继续」.
+        let connect_result = {
+            agent.accept_ui_updates.store(false, Ordering::SeqCst);
+            let result = (|| {
+                if need_init {
+                    agent.initialize()?;
+                }
+                agent.open_session(&cwd, existing_session_id.as_deref(), &options)
+            })();
+            agent.accept_ui_updates.store(true, Ordering::SeqCst);
+            result
+        };
 
         match connect_result {
             Ok(session_id) => {
@@ -792,6 +801,7 @@ impl AcpClient {
             .unwrap_or_default()
             .to_string();
         self.conversation_id = conversation_id.clone();
+        let accept_ui_updates = Arc::new(AtomicBool::new(true));
         spawn_stdout_reader(
             app.clone(),
             Arc::clone(&stdin),
@@ -799,6 +809,7 @@ impl AcpClient {
             Arc::clone(&diagnostics),
             Arc::clone(&permission_mode),
             Arc::clone(&pending_interactions),
+            Arc::clone(&accept_ui_updates),
             stdout,
             conversation_id.clone(),
         );
@@ -813,6 +824,7 @@ impl AcpClient {
             pending_interactions,
             diagnostics,
             home,
+            accept_ui_updates,
         }));
         Ok(())
     }
@@ -934,6 +946,7 @@ fn spawn_stdout_reader(
     diagnostics: Arc<DiagnosticBuffer>,
     permission_mode: Arc<Mutex<String>>,
     pending_interactions: Arc<Mutex<HashMap<String, Value>>>,
+    accept_ui_updates: Arc<AtomicBool>,
     stdout: impl std::io::Read + Send + 'static,
     conversation_id: String,
 ) {
@@ -955,6 +968,7 @@ fn spawn_stdout_reader(
                 &diagnostics,
                 &permission_mode,
                 &pending_interactions,
+                &accept_ui_updates,
                 json,
                 &conversation_id,
             );
@@ -990,6 +1004,7 @@ fn dispatch_message(
     diagnostics: &DiagnosticBuffer,
     permission_mode: &Mutex<String>,
     pending_interactions: &Mutex<HashMap<String, Value>>,
+    accept_ui_updates: &AtomicBool,
     json: Value,
     conversation_id: &str,
 ) {
@@ -1029,6 +1044,33 @@ fn dispatch_message(
         } else {
             method = method.trim_start_matches('_').to_string();
         }
+    }
+
+    // session/load replays the whole transcript as notifications. RPC responses
+    // already returned above; swallow UI events so they are not copied below「继续」.
+    if !accept_ui_updates.load(Ordering::Relaxed) {
+        if let Some(id) = id {
+            let allowed = if method == "session/request_permission" {
+                pick_permission_option(&params)
+                    .map(|option_id| {
+                        json!({
+                            "outcome": { "outcome": "selected", "optionId": option_id }
+                        })
+                    })
+                    .unwrap_or_else(|| json!({ "outcome": { "outcome": "cancelled" } }))
+            } else {
+                json!({ "outcome": { "outcome": "cancelled" } })
+            };
+            let _ = write_message(
+                stdin,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": allowed
+                }),
+            );
+        }
+        return;
     }
 
     if let Some(id) = id {
@@ -1261,10 +1303,48 @@ fn is_user_cancel_error(err: &str) -> bool {
         || lower.contains("canceled by the user")
 }
 
+fn is_transient_disconnect(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("bad gateway")
+        || lower.contains("gateway timeout")
+        || lower.contains("timeout")
+        || err.contains("超时")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection failed")
+        || err.contains("连接失败")
+        || err.contains("連線失敗")
+        || err.contains("已退出")
+        || err.contains("尚未连接")
+        || err.contains("尚未連接")
+        || err.contains("尚未就绪")
+        || err.contains("尚未就緒")
+        || err.contains("正在重连")
+        || err.contains("正在重連")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("econnreset")
+        || lower.contains("econnrefused")
+        || lower.contains("network")
+        || lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("eof")
+        || lower.contains("os error")
+}
+
 fn is_fatal_rpc_error(err: &str) -> bool {
+    if is_user_cancel_error(err) {
+        return true;
+    }
+    // A 502/timeout page can mention 401 or quota words. Those are reconnects, not Stop.
+    if is_transient_disconnect(err) {
+        return false;
+    }
     let lower = err.to_ascii_lowercase();
     looks_like_official_quota(err)
-        || is_user_cancel_error(err)
         || lower.contains("context_too_large")
         || lower.contains("context too large")
         || lower.contains("maximum context")
@@ -1399,7 +1479,7 @@ fn send_prompt_with_reconnect(
                 emit_turn_done(&app, &conversation_id, false, Some(&error));
                 return;
             }
-            Err(error) if !is_retryable_rpc_error(&error) => {
+            Err(error) if !is_retryable_rpc_error(&error) && !is_transient_disconnect(&error) => {
                 emit_turn_done(&app, &conversation_id, false, Some(&error));
                 return;
             }
@@ -1452,10 +1532,6 @@ fn reconnect_session(
         match AcpClient::connect(shared, app, options) {
             Ok(_) => return true,
             Err(error) if is_user_cancel_error(&error) || cancel_epoch_changed(shared, epoch) => {
-                emit_turn_done(app, conversation_id, false, Some(&error));
-                return false;
-            }
-            Err(error) if !is_retryable_rpc_error(&error) => {
                 emit_turn_done(app, conversation_id, false, Some(&error));
                 return false;
             }
@@ -2174,6 +2250,8 @@ mod tests {
         assert!(is_retryable_rpc_error("无法启动 Grok Agent：os error 32"));
         assert!(!is_retryable_rpc_error("连接已取消"));
         assert!(is_retryable_rpc_error("ACP 请求超时：session/cancel leftover"));
+        assert!(is_retryable_rpc_error("502 Bad Gateway\n401 unauthorized leftover"));
+        assert!(is_retryable_rpc_error("上游断开，正在重连"));
         assert!(!is_user_cancel_error("ACP 请求超时：session/prompt"));
         assert!(!is_user_cancel_error("method session/cancel in log"));
         assert!(is_user_cancel_error("连接已取消"));
@@ -2182,5 +2260,6 @@ mod tests {
         assert!(!is_retryable_rpc_error("status 402 weekly limit"));
         assert!(!is_retryable_rpc_error("maximum context length exceeded"));
         assert!(!is_retryable_rpc_error("上下文爆了"));
+        assert!(!is_retryable_rpc_error("invalid api key"));
     }
 }

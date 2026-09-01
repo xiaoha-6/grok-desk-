@@ -27,7 +27,17 @@ function isLiveEvent(event: TimelineEvent) {
 }
 
 function latestLiveTool(events: TimelineEvent[]) {
-  return [...events].reverse().find((event) => event.kind !== "thought" && isLiveEvent(event));
+  return [...events]
+    .reverse()
+    .find((event) => event.kind !== "thought" && event.id !== "upstream-reconnect" && isLiveEvent(event));
+}
+
+export function isUpstreamReconnecting(events?: TimelineEvent[]) {
+  return Boolean(
+    events?.some(
+      (event) => event.id === "upstream-reconnect" && isLiveEvent(event),
+    ),
+  );
 }
 
 function parseJson(raw?: string): Record<string, unknown> | null {
@@ -137,9 +147,12 @@ export function subagentOrbState(type: string, status?: string): OrbState {
 export function agentOrbForMessage(
   message: ChatMessage,
   copy: Copy,
-  opts?: { imageBusy?: boolean; connecting?: boolean },
+  opts?: { imageBusy?: boolean; connecting?: boolean; reconnecting?: boolean },
 ): { state: OrbState; label: string } {
   if (opts?.connecting) return { state: "connecting", label: copy.connecting };
+  if (opts?.reconnecting || isUpstreamReconnecting(message.events)) {
+    return { state: "connecting", label: copy.reconnectingUpstream };
+  }
   if (opts?.imageBusy) return { state: "shaping", label: copy.generatingImage };
 
   const spawned = subagentEvents(message.events || []);

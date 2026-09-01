@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import "./monacoSetup";
 import Editor, { DiffEditor } from "@monaco-editor/react";
@@ -7,7 +8,7 @@ import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panel
 import { diffStats, fileLabel, applyHunk, diffHunks, type DiffHunk } from "./diff";
 import { FileKindIcon, fileBadge, fileExtension } from "./fileIcons";
 import { HunkOverlay } from "./HunkOverlay";
-import { IconCheck, IconChevronRight, IconClose, IconCodePane, IconDebug, IconFiles, IconGit, IconPanelLeft, IconUndo } from "./icons";
+import { IconCheck, IconChevronRight, IconClose, IconCodePane, IconDebug, IconDownload, IconExpand, IconFiles, IconGit, IconPanelLeft, IconSave, IconUndo } from "./icons";
 import type { Copy } from "./i18n";
 import { fill } from "./i18n";
 import { chordsMatch, toMonacoKeybinding, withShortcut } from "./keybindings";
@@ -27,6 +28,14 @@ export type WorkspaceFile = {
   language: string;
   content: string;
   truncated: boolean;
+  size: number;
+  previewSrc?: string;
+};
+
+type WorkspaceImage = {
+  path: string;
+  mimeType: string;
+  data: string;
   size: number;
 };
 
@@ -191,6 +200,25 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
     async (rel: string, options?: { dropDraft?: boolean }) => {
       if (!cwd || !rel) return;
       try {
+        if (isWorkspaceImagePath(rel)) {
+          const image = await invoke<WorkspaceImage>("read_workspace_image", { root: cwd, path: rel, ssh: ssh || null });
+          if (cwdRef.current !== cwd) return;
+          const next: WorkspaceFile = {
+            path: rel,
+            language: "image",
+            content: "",
+            truncated: false,
+            size: image.size,
+            previewSrc: `data:${image.mimeType || "image/png"};base64,${image.data}`,
+          };
+          filesRef.current[rel] = next;
+          dropDraft(rel);
+          if (activePathRef.current === rel) {
+            setFile(next);
+            setError("");
+          }
+          return;
+        }
         const loaded = await invoke<WorkspaceFile>("read_workspace_file", { root: cwd, path: rel, ssh: ssh || null });
         if (cwdRef.current !== cwd) return;
         const next = isBinaryFile(rel, loaded.content) ? { ...loaded, language: "binary", content: "", truncated: true } : loaded;
@@ -242,11 +270,12 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
         delete filesRef.current[rel];
         if (activePathRef.current === rel) {
           setFile(null);
-          setError(String(err));
+          const text = String(err);
+          setError(/太大|too large/i.test(text) && isWorkspaceImagePath(rel) ? copy.workspaceImageTooLarge : text);
         }
       }
     },
-    [cwd, dropDraft, loadDir, ssh],
+    [copy.workspaceImageTooLarge, cwd, dropDraft, loadDir, ssh],
   );
 
   const showTab = useCallback(
@@ -480,9 +509,11 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
   const showDiff = tab === "diff" && Boolean(review) && hunks.length > 0;
   const language = monacoLanguage(file?.language || "", file?.path || activeRel);
   const isMd = isMarkdownPath(activeRel, file?.language || language);
+  const isImage = isWorkspaceImagePath(activeRel) || file?.language === "image";
   const previewText = review?.newText ?? drafts[activeRel] ?? file?.content ?? "";
   const showPreview = isMd && (mdMode === "preview" || mdMode === "split");
-  const showCode = !isMd || mdMode !== "preview" || showDiff;
+  const showImage = isImage && !showDiff;
+  const showCode = !showImage && (!isMd || mdMode !== "preview" || showDiff);
   const stats = review ? diffStats(review.oldText, review.newText) : null;
   const diffOptions = useMemo(() => monacoDiffOptions(sideBySide, hunks.length > 0), [sideBySide, hunks.length]);
   const editorOptions = useMemo(() => monacoFileOptions(Boolean(file?.truncated), hunks.length > 0), [file?.truncated, hunks.length]);
@@ -1113,6 +1144,8 @@ export function WorkspacePanel({ cwd, ssh, changedPaths, diffs, focusPath, focus
                       />
                     ) : null}
                   </div>
+                ) : showImage && file?.previewSrc ? (
+                  <WorkspaceImagePreview src={file.previewSrc} name={fileLabel(activeRel) || activeRel} copy={copy} />
                 ) : showCode && file?.language === "binary" ? (
                   <p className="hint">{copy.binaryFile}</p>
                 ) : showCode && file ? (
@@ -1232,12 +1265,87 @@ function WorkspaceTreeNode({
   );
 }
 
+function isWorkspaceImagePath(path: string) {
+  return /\.(png|jpe?g|gif|webp|bmp|ico|tiff?|svg|heic|heif)$/i.test(path);
+}
+
 function isBinaryFile(path: string, content?: string) {
-  if (/\.(zip|png|jpe?g|gif|webp|bmp|ico|pdf|dmg|exe|wasm|mp4|mov|gz|7z|rar)$/i.test(path)) return true;
+  if (isWorkspaceImagePath(path)) return false;
+  if (/\.(zip|pdf|dmg|exe|wasm|mp4|mov|gz|7z|rar)$/i.test(path)) return true;
   const head = (content || "").slice(0, 800);
   if (!head) return false;
   if (head.startsWith("PK")) return true;
   return head.includes("\0");
+}
+
+function WorkspaceImagePreview({ src, name, copy }: { src: string; name: string; copy: Copy }) {
+  const [open, setOpen] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const data = src.startsWith("data:") ? src.replace(/^data:[^;]+;base64,/, "") : "";
+  useEffect(() => {
+    setFailed(false);
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, src]);
+  const saveAs = () => {
+    void invoke("save_image_as", { path: null, data: data || undefined, name }).catch(() => undefined);
+  };
+  const download = () => {
+    const link = document.createElement("a");
+    link.href = src;
+    link.download = name || "image.png";
+    link.click();
+  };
+  if (failed) {
+    return <p className="hint">{copy.workspaceImageFailed}</p>;
+  }
+  return (
+    <div className="workspace-image-preview">
+      <img src={src} alt={name} onClick={() => setOpen(true)} onError={() => setFailed(true)} />
+      <div className="workspace-image-actions">
+        <button type="button" className="ghost compact" onClick={() => setOpen(true)}>
+          <IconExpand size={13} />
+          {copy.openImage}
+        </button>
+        <button type="button" className="ghost compact" onClick={download}>
+          <IconDownload size={13} />
+          {copy.downloadImage}
+        </button>
+        <button type="button" className="ghost compact" onClick={saveAs}>
+          <IconSave size={13} />
+          {copy.saveImageAs}
+        </button>
+      </div>
+      {open
+        ? createPortal(
+            <div className="chat-image-lightbox" onClick={() => setOpen(false)} role="dialog" aria-modal="true">
+              <div className="chat-image-lightbox-inner" onClick={(event) => event.stopPropagation()}>
+                <img src={src} alt={name} />
+                <div className="chat-image-lightbox-bar">
+                  <button type="button" title={copy.downloadImage} onClick={download}>
+                    <IconDownload size={16} />
+                    <span>{copy.downloadImage}</span>
+                  </button>
+                  <button type="button" title={copy.saveImageAs} onClick={saveAs}>
+                    <IconSave size={16} />
+                    <span>{copy.saveImageAs}</span>
+                  </button>
+                  <button type="button" title={copy.closeImage} onClick={() => setOpen(false)}>
+                    <IconClose size={16} />
+                    <span>{copy.closeImage}</span>
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+    </div>
+  );
 }
 
 function isFolderError(err: unknown) {
