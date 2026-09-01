@@ -18,7 +18,7 @@ use tauri::{AppHandle, Emitter};
 type Aes256CbcDec = Decryptor<Aes256>;
 
 const WEBHOOK_PORT: u16 = 18791;
-const UA: &str = "GrokDesk-Bridge/0.6.72";
+const UA: &str = "GrokDesk-Bridge/0.6.73";
 const KNOWN_KINDS: &[&str] = &[
     "telegram", "discord", "slack", "whatsapp", "feishu", "qq", "wechat", "wecom", "dingtalk",
     "line", "zalo", "googlechat", "msteams", "mattermost", "matrix", "sms", "synology", "signal",

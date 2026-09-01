@@ -25,8 +25,11 @@ export type TranscriptRowActions = {
   revealCommandInTerminal: () => void;
 };
 
-function assistantLivePhase(message: ChatMessage): "reconnecting" | "thinking" | "working" | null {
-  if (message.role !== "assistant" || !message.streaming) return null;
+function assistantLivePhase(
+  message: ChatMessage,
+  running: boolean,
+): "reconnecting" | "thinking" | "working" | null {
+  if (message.role !== "assistant" || !message.streaming || message.stopped || !running) return null;
   if (isUpstreamReconnecting(message.events)) return "reconnecting";
   const hasOutput =
     Boolean(message.text) ||
@@ -73,7 +76,7 @@ export const TranscriptRow = memo(function TranscriptRow({
   isLatestAssistant: boolean;
   actionsRef: MutableRefObject<TranscriptRowActions>;
 }) {
-  const livePhase = assistantLivePhase(message);
+  const livePhase = assistantLivePhase(message, running);
   const askedImage = wantsImageGen(prevUser?.text || "");
   const imageBusy = isImageGenBusy(message, prevUser?.text || "");
   const expectImage = imageBusy && !(message.media || []).some(isShowableImage);

@@ -2409,20 +2409,23 @@ export default function App() {
           });
       }
     }
-    window.setTimeout(() => {
-      const index = promptQueueRef.current.findIndex((item) => !targetId || item.conversationId === targetId);
-      if (index < 0) return;
-      const next = promptQueueRef.current[index];
-      promptQueueRef.current = promptQueueRef.current.filter((_, i) => i !== index);
-      setQueuedPrompts([...promptQueueRef.current]);
-      if (!next) return;
-      void sendTextRef.current(next.text, next.attachments, {
-        fromQueue: true,
-        conversationId: next.conversationId,
-        messageId: next.messageId,
-        displayText: next.displayText,
-      });
-    }, 40);
+    if (!cancelled) {
+      window.setTimeout(() => {
+        if (targetId && userStoppedRef.current.has(targetId)) return;
+        const index = promptQueueRef.current.findIndex((item) => !targetId || item.conversationId === targetId);
+        if (index < 0) return;
+        const next = promptQueueRef.current[index];
+        promptQueueRef.current = promptQueueRef.current.filter((_, i) => i !== index);
+        setQueuedPrompts([...promptQueueRef.current]);
+        if (!next) return;
+        void sendTextRef.current(next.text, next.attachments, {
+          fromQueue: true,
+          conversationId: next.conversationId,
+          messageId: next.messageId,
+          displayText: next.displayText,
+        });
+      }, 40);
+    }
   }, [flushPendingStream]);
 
   async function completeDirectImageGen(conversationId: string, prompt: string, assistantId?: string, turnId?: number) {
@@ -2492,6 +2495,7 @@ export default function App() {
       const targetId = String(payload.conversationId || selectedIdRef.current || "");
       const isActiveView = !payload.conversationId || payload.conversationId === selectedIdRef.current;
       mutateTargetRef.current = targetId;
+      if (targetId && userStoppedRef.current.has(targetId)) return;
       if (targetId && streamHoldRef.current.has(targetId)) {
         if (payload.method === "x.ai/models/update" || payload.method === "_x.ai/models/update") {
           const current = String(params.currentModelId || params.current_model_id || "");
@@ -2994,6 +2998,7 @@ export default function App() {
   const handleAcpReconnect = useCallback(
     (payload: AcpReconnect) => {
       const targetId = payload.conversationId || selectedIdRef.current;
+      if (targetId && userStoppedRef.current.has(targetId)) return;
       const attempt = Math.max(1, Number(payload.attempt) || 1);
       const copy = tRef.current;
       const title = copy.reconnectingUpstreamEvent;
@@ -4423,6 +4428,9 @@ export default function App() {
     if (id) {
       bumpConversationTurn(id);
       userStoppedRef.current.add(id);
+      ignoreStaleCancelRef.current.add(id);
+      pendingStreamRef.current.buffers.delete(id);
+      streamHoldRef.current.delete(id);
     }
     // Freeze the live assistant first so cancel/stop cannot blank the transcript.
     finishTurn(t.connectionCancelled, id || undefined);
