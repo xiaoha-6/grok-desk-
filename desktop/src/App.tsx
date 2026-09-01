@@ -77,7 +77,14 @@ import { MarkdownPreview } from "./MarkdownPreview";
 import { ModelPicker } from "./ModelPicker";
 import { Select } from "./Select";
 import { QuickOpen } from "./QuickOpen";
-import { RelayPromoBanner } from "./RelayPromo";
+import {
+  RelayPromoBanner,
+  RelayQuotaBanner,
+  formatAmount,
+  relayQuotaLevel,
+  relayQuotaMessage,
+  relayQuotaNeedsAttention,
+} from "./RelayPromo";
 import { SettingsView } from "./SettingsView";
 import { bridgeLabel, bridgeSessionMeta } from "./bridgeCatalog";
 import type { AgentTermJob, PanelChannel } from "./TerminalPanel";
@@ -360,25 +367,25 @@ function SidebarSession(props: {
   onDelete: () => void;
 }) {
   return (
-    <button
-      className={`session${props.nested ? " nested" : ""}${props.selected ? " on" : ""}`}
-      type="button"
-      onClick={props.onSelect}
-    >
-      {props.nested ? null : <IconChat className="session-ico" size={15} />}
-      <span className="session-title">{props.item.title}</span>
-      {props.live ? <span className="session-live" /> : null}
-      <span
+    <div className={`session-row${props.nested ? " nested" : ""}${props.selected ? " on" : ""}`}>
+      <button className="session" type="button" onClick={props.onSelect}>
+        {props.nested ? null : <IconChat className="session-ico" size={15} />}
+        <span className="session-title">{props.item.title}</span>
+        {props.live ? <span className="session-live" /> : null}
+      </button>
+      <button
         className="session-delete"
+        type="button"
         title={props.deleteLabel}
+        aria-label={props.deleteLabel}
         onClick={(event) => {
           event.stopPropagation();
           props.onDelete();
         }}
       >
         <IconClose />
-      </span>
-    </button>
+      </button>
+    </div>
   );
 }
 
@@ -1235,15 +1242,15 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
   return dedupeConversations([...merged, ...extras]);
 }
 
-function formatAmount(value: number) {
-  if (!Number.isFinite(value)) return "0";
-  const abs = Math.abs(value);
-  if (abs >= 100 || Number.isInteger(value)) return String(Math.round(value * 100) / 100);
-  return value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
-}
-
 function formatRelayQuota(quota: RelayQuota | null | undefined, copy: Copy) {
   if (!quota?.configured) return "";
+  const level = relayQuotaLevel(quota);
+  if (level === "empty") return copy.relayQuotaEmptyPill;
+  if (level === "low") {
+    const unit = quota.unit || "USD";
+    return `${copy.relayQuotaLowPill} · ${formatAmount(quota.remaining || 0)} ${unit}`;
+  }
+  if (level === "auth" || level === "unavailable") return relayQuotaMessage(quota, copy);
   if (quota.remaining == null) return copy.quotaPending;
   if (quota.remaining < 0 || quota.remaining >= 99_000_000) return copy.relayUnlimited;
   const unit = quota.unit || "USD";
@@ -5388,7 +5395,8 @@ export default function App() {
   if (view === "settings") {
     return (
       <>
-      <RelayPromoBanner copy={t} />
+      <RelayQuotaBanner quota={relayQuota} copy={t} />
+      <RelayPromoBanner copy={t} suppressed={relayQuotaNeedsAttention(relayQuota)} />
       {splashOverlay}
       <SettingsView
         t={t}
@@ -5499,7 +5507,8 @@ export default function App() {
 
   return (
     <div className={`app${workspaceSide === "left" ? " ws-left" : " ws-right"}`} onClick={() => { setShowAccountMenu(false); setShowProjectMenu(false); }}>
-      <RelayPromoBanner copy={t} />
+      <RelayQuotaBanner quota={relayQuota} copy={t} />
+      <RelayPromoBanner copy={t} suppressed={relayQuotaNeedsAttention(relayQuota)} />
       {splashOverlay}
       {showSidebar ? (
         <>
@@ -6615,11 +6624,11 @@ export default function App() {
                   <header>
                     <span className="dot on" />
                     <strong>{relayQuota.name || t.xiaohaRelay}</strong>
-                    <span className="pill ok">{t.relayQuota}</span>
+                    <span className={`pill ${relayQuotaNeedsAttention(relayQuota) ? "warn" : "ok"}`}>{t.relayQuota}</span>
                   </header>
                   {relayQuotaText ? <p className="hint left">{relayQuotaText}</p> : <p className="hint left">{t.quotaPending}</p>}
                   {relayQuota.planName ? <p className="hint left">{relayQuota.planName}</p> : null}
-                  {relayQuota.error ? <p className="error">{relayQuota.error}</p> : null}
+                  {relayQuotaMessage(relayQuota, t) ? <p className="error">{relayQuotaMessage(relayQuota, t)}</p> : null}
                 </div>
               ) : null}
               {accounts.filter((account) => account.enabled).map((account) => (

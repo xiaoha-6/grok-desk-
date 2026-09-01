@@ -21,7 +21,7 @@ import {
   IconTerminal,
 } from "./icons";
 import { BridgesPanel } from "./BridgesPanel";
-import { openRelayPromo } from "./RelayPromo";
+import { openRelayPromo, relayQuotaLevel, relayQuotaMessage } from "./RelayPromo";
 import { KeybindingsEditor } from "./KeybindingsEditor";
 import { RelayUsagePanel } from "./RelayUsagePanel";
 import { fill, type Copy } from "./i18n";
@@ -597,13 +597,20 @@ export function SettingsView(props: {
               {props.relayQuota?.configured ? (
                 <section className="group">
                   <SettingsRow title={copy.relayQuota} detail={props.relayQuota.endpoint || props.form.endpoint}>
-                    <span className="pill ok">{props.relayQuotaText || copy.quotaPending}</span>
+                    <span className={`pill ${relayQuotaLevel(props.relayQuota) === "ok" ? "ok" : "warn"}`}>
+                      {props.relayQuotaText || copy.quotaPending}
+                    </span>
                   </SettingsRow>
                   {props.relayQuota.planName ? (
                     <SettingsRow title={copy.name} detail={props.relayQuota.planName} />
                   ) : null}
-                  {props.relayQuota.error ? <p className="error">{props.relayQuota.error}</p> : null}
+                  {relayQuotaMessage(props.relayQuota, copy) ? (
+                    <p className="error">{relayQuotaMessage(props.relayQuota, copy)}</p>
+                  ) : null}
                   <div className="actions">
+                    <button className="primary compact" type="button" onClick={() => void openRelayPromo()}>
+                      {copy.goRecharge}
+                    </button>
                     <button className="ghost" type="button" disabled={props.refreshingQuota} onClick={props.onRefreshQuotas}>
                       {props.refreshingQuota ? copy.refreshing : copy.refreshQuota}
                     </button>

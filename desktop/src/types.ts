@@ -151,6 +151,7 @@ export type RelayQuota = {
   unit?: string | null;
   planName?: string | null;
   error?: string | null;
+  errorKind?: string | null;
 };
 
 export type RelayUsageDay = {

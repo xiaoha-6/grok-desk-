@@ -514,6 +514,7 @@ pub struct RelayQuota {
     pub unit: Option<String>,
     pub plan_name: Option<String>,
     pub error: Option<String>,
+    pub error_kind: Option<String>,
 }
 
 impl RelayQuota {
@@ -528,6 +529,7 @@ impl RelayQuota {
             unit: None,
             plan_name: None,
             error: None,
+            error_kind: None,
         }
     }
 }
@@ -802,17 +804,21 @@ pub fn fetch_relay_quota(grok_home: &Path) -> RelayQuota {
             quota.endpoint = profile.endpoint;
             quota
         }
-        Err(error) => RelayQuota {
-            configured: true,
-            name: profile.name,
-            endpoint: profile.endpoint,
-            remaining: None,
-            used: None,
-            total: None,
-            unit: None,
-            plan_name: None,
-            error: Some(error),
-        },
+        Err(error) => {
+            let (error_kind, message, remaining) = classify_relay_error(&error);
+            RelayQuota {
+                configured: true,
+                name: profile.name,
+                endpoint: profile.endpoint,
+                remaining,
+                used: None,
+                total: None,
+                unit: Some("USD".into()),
+                plan_name: None,
+                error: Some(message),
+                error_kind: Some(error_kind),
+            }
+        }
     }
 }
 
@@ -1173,6 +1179,7 @@ fn parse_relay_quota(value: &serde_json::Value) -> RelayQuota {
     );
     let unit = json_string(root, &["unit", "currency"]).or(Some("USD".into()));
     let plan_name = json_string(root, &["planName", "plan_name", "plan", "name"]);
+    let empty = remaining.is_some_and(|value| value <= 0.0 && value > -1.0);
     RelayQuota {
         configured: true,
         name: DEFAULT_PROVIDER.to_string(),
@@ -1183,6 +1190,7 @@ fn parse_relay_quota(value: &serde_json::Value) -> RelayQuota {
         unit,
         plan_name,
         error: None,
+        error_kind: empty.then(|| "no_balance".to_string()),
     }
 }
 
@@ -1282,9 +1290,10 @@ fn http_json_get_timeout(url: &str, api_key: &str, timeout_secs: &str) -> Result
     let mut command = std::process::Command::new("curl");
     command
         .arg("-sS")
-        .arg("-f")
         .arg("-m")
         .arg(timeout_secs)
+        .arg("-w")
+        .arg("\n__HTTP__%{http_code}")
         .arg("-H")
         .arg(format!("Authorization: Bearer {api_key}"))
         .arg("-H")
@@ -1295,12 +1304,101 @@ fn http_json_get_timeout(url: &str, api_key: &str, timeout_secs: &str) -> Result
     hide_window(&mut command);
     let output = command
         .output()
-        .map_err(|err| format!("无法连接中转站：{err}"))?;
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        return Err(format!("中转站接口 HTTP {code}"));
+        .map_err(|err| format!("unavailable:无法连接中转站：{err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (body, status) = split_curl_http(&stdout);
+    if status == 0 && !output.status.success() {
+        return Err(classify_curl_fail(output.status.code(), &stderr, body));
     }
-    serde_json::from_slice(&output.stdout).map_err(|err| format!("中转站响应无法解析：{err}"))
+    if !(200..300).contains(&status) {
+        return Err(classify_http_status(status, body));
+    }
+    serde_json::from_str(body.trim()).map_err(|err| format!("parse:中转站响应无法解析：{err}"))
+}
+
+fn split_curl_http(stdout: &str) -> (&str, u16) {
+    if let Some(idx) = stdout.rfind("\n__HTTP__") {
+        let code = stdout[idx + 9..].trim().parse().unwrap_or(0);
+        return (&stdout[..idx], code);
+    }
+    if let Some(idx) = stdout.rfind("__HTTP__") {
+        let code = stdout[idx + 8..].trim().parse().unwrap_or(0);
+        return (&stdout[..idx], code);
+    }
+    (stdout, 0)
+}
+
+fn looks_like_no_balance(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "insufficient",
+        "no credit",
+        "no balance",
+        "quota",
+        "out of credits",
+        "payment required",
+        "余额",
+        "餘額",
+        "额度不足",
+        "額度不足",
+        "欠费",
+        "欠費",
+        "没有余额",
+        "沒有餘額",
+    ]
+    .iter()
+    .any(|item| lower.contains(item))
+}
+
+fn classify_http_status(status: u16, body: &str) -> String {
+    if status == 402 || looks_like_no_balance(body) {
+        return "no_balance:中转站没有余额了".into();
+    }
+    if status == 401 || status == 403 {
+        return "auth:中转站密钥无效或已过期".into();
+    }
+    if status == 429 || status >= 500 {
+        return "unavailable:中转站暂时连不上".into();
+    }
+    format!("http:中转站额度查询失败")
+}
+
+fn classify_curl_fail(code: Option<i32>, stderr: &str, body: &str) -> String {
+    if looks_like_no_balance(stderr) || looks_like_no_balance(body) {
+        return "no_balance:中转站没有余额了".into();
+    }
+    // curl -f used to surface HTTP errors as exit 22. Treat that as empty
+    // balance unless the server clearly returned a 5xx in stderr.
+    if code == Some(22) && !stderr.contains(" 5") {
+        return "no_balance:中转站没有余额了".into();
+    }
+    if code == Some(6) || code == Some(7) || code == Some(28) {
+        return "unavailable:中转站暂时连不上".into();
+    }
+    "unavailable:中转站暂时连不上".into()
+}
+
+fn classify_relay_error(raw: &str) -> (String, String, Option<f64>) {
+    if let Some(message) = raw.strip_prefix("no_balance:") {
+        return ("no_balance".into(), message.to_string(), Some(0.0));
+    }
+    if let Some(message) = raw.strip_prefix("auth:") {
+        return ("auth".into(), message.to_string(), None);
+    }
+    if let Some(message) = raw.strip_prefix("unavailable:") {
+        return ("unavailable".into(), message.to_string(), None);
+    }
+    if let Some(message) = raw.strip_prefix("parse:") {
+        return ("parse".into(), message.to_string(), None);
+    }
+    if let Some(message) = raw.strip_prefix("http:") {
+        return ("http".into(), message.to_string(), None);
+    }
+    if looks_like_no_balance(raw) || raw.contains("HTTP 22") {
+        return ("no_balance".into(), "中转站没有余额了".into(), Some(0.0));
+    }
+    ("unavailable".into(), raw.to_string(), None)
 }
 
 fn backup_if_exists(path: &Path) -> io::Result<Option<PathBuf>> {
@@ -1338,6 +1436,22 @@ fn restrict_owner_only(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_curl_http_reads_trailer() {
+        let (body, status) = split_curl_http("{\"remaining\":1}\n__HTTP__402");
+        assert_eq!(body, "{\"remaining\":1}");
+        assert_eq!(status, 402);
+    }
+
+    #[test]
+    fn classify_http_22_as_no_balance() {
+        let (kind, _, remaining) = classify_relay_error("中转站接口 HTTP 22");
+        assert_eq!(kind, "no_balance");
+        assert_eq!(remaining, Some(0.0));
+        assert!(classify_http_status(402, "").starts_with("no_balance:"));
+        assert!(classify_curl_fail(Some(22), "", "").starts_with("no_balance:"));
+    }
 
     #[test]
     fn with_v1_does_not_double() {
