@@ -969,6 +969,11 @@ function mergeConversationMessages(left: ChatMessage[] = [], right: ChatMessage[
   return order.map((key) => byId.get(key)!);
 }
 
+function stickyForConversation(sticky: ChatMessage[], conversationId: string | null | undefined) {
+  if (!conversationId) return [];
+  return sticky.filter((item) => item.conversationId === conversationId);
+}
+
 /** Keep sticky user bubbles in chronological place (above the live reply), not tacked on the end. */
 function withStickyOutgoing(base: ChatMessage[], sticky: ChatMessage[]): ChatMessage[] {
   if (!sticky.length) return base;
@@ -1012,6 +1017,18 @@ function betterConversation(current: Conversation, incoming: Conversation) {
 function combineConversations(current: Conversation, incoming: Conversation): Conversation {
   const winner = betterConversation(current, incoming) ? incoming : current;
   const loser = winner === incoming ? current : incoming;
+  const currentSid = String(current.grokSessionId || "").trim();
+  const incomingSid = String(incoming.grokSessionId || "").trim();
+  // Same UI id but two Grok sessions — never splice the other chat's user turns in.
+  if (currentSid && incomingSid && currentSid !== incomingSid) {
+    return {
+      ...winner,
+      id: (current.id && current.id !== currentSid ? current.id : "") || winner.id || incoming.id,
+      grokSessionId: winner.grokSessionId,
+      messages: winner.messages || [],
+      updatedAt: Math.max(winner.updatedAt || 0, loser.updatedAt || 0),
+    };
+  }
   const sessionId = winner.grokSessionId || loser.grokSessionId || "";
   const stableId =
     (current.id && current.id !== sessionId ? current.id : "") ||
@@ -1200,9 +1217,10 @@ function mergeLocalSessions(list: Conversation[], summaries: LocalSessionSummary
     });
   }
   const merged = unique.map((item) => {
-    const summary = summaries.find(
-      (entry) => entry.grokSessionId === item.grokSessionId,
-    );
+    const sessionId = String(item.grokSessionId || "").trim();
+    const summary = sessionId
+      ? summaries.find((entry) => entry.grokSessionId === sessionId)
+      : undefined;
     if (!summary) return item;
     const untitled = isGenericTitle(item.title);
     return {
@@ -1438,10 +1456,10 @@ async function expandPromptContext(
   if (projectAsset) {
     next +=
       "\n\n<tool_policy>用户要的是项目素材，不是在对话里看图。可以调用 ImageGen、Imagine 或 grok-imagine-image，但必须把图片保存到当前工作区（优先用户指定路径，否则 assets/ 或 images/），不要把图片、base64 或预览贴进对话。生成后继续改代码引用这些文件。</tool_policy>";
-  } else if (!askedImage) {
-    next +=
-      "\n\n<tool_policy>用户没有要求生成图片。不要调用 ImageGen、Imagine 或 grok-imagine-image。用读文件和改代码回答。</tool_policy>";
   }
+  // Do not attach a tool_policy to greetings or ordinary Q&A. The previous
+  // "answer by reading files / do not scan directories" lines made Grok loop
+  // on ls in empty folders; the image-gen ban only belongs on image prompts.
   const slim = Boolean(options?.slim);
   const mentions = [...text.matchAll(/(?:^|[\s])@([^\s@]+)/g)].map((item) => item[1]);
   if (!cwd && !mentions.some((path) => isAbsoluteLocalPath(path))) return next;
@@ -1790,11 +1808,8 @@ export default function App() {
     if (!stickyOutgoing.length) return base;
     // Prefer sticky copies for outgoing user bubbles so a mid-turn conversations rewrite
     // cannot blank the transcript. Overlay in place so the user turn stays above Grok.
-    return withStickyOutgoing(
-      base,
-      stickyOutgoing.filter((item) => !item.conversationId || item.conversationId === selectedId),
-    );
-  }, [selected?.messages, stickyOutgoing]);
+    return withStickyOutgoing(base, stickyForConversation(stickyOutgoing, selectedId));
+  }, [selected?.messages, selectedId, stickyOutgoing]);
   const liveImageBusy = useMemo(() => {
     const assistant = findLast(visibleMessages, (item) => item.role === "assistant" && Boolean(item.streaming));
     if (!assistant) return false;
@@ -1961,11 +1976,12 @@ export default function App() {
     setStickyOutgoing((current) => {
       if (!current.length) return current;
       const next = current.filter((item) => {
+        const cid = item.conversationId;
+        if (!cid) return false;
         if (item.queued) return true;
-        const cid = item.conversationId || selectedId;
-        if (cid && liveTurns.includes(cid)) return true;
+        if (liveTurns.includes(cid)) return true;
         const conv = conversations.find((entry) => entry.id === cid);
-        if (!conv) return Boolean(cid);
+        if (!conv) return false;
         return !(item.id && conv.messages.some((message) => message.id === item.id));
       });
       return next.length === current.length ? current : next;
@@ -2310,9 +2326,7 @@ export default function App() {
     setConversations((list) => {
       const next = list.map((item) => {
         if (item.id !== targetId) return item;
-        const sticky = stickyOutgoingRef.current.filter(
-          (message) => !message.conversationId || message.conversationId === targetId,
-        );
+        const sticky = stickyForConversation(stickyOutgoingRef.current, targetId);
         // Only seal the live turn. Never rewrite older completed assistants on cancel.
         let sealedLive = false;
         const sealed = item.messages.map((message) => {
@@ -3213,7 +3227,7 @@ export default function App() {
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
-        if (historyLockedRef.current || liveTurnsRef.current.has(selectedIdRef.current || "") || stickyOutgoingRef.current.some((item) => !item.conversationId || item.conversationId === selectedIdRef.current)) return;
+        if (historyLockedRef.current || liveTurnsRef.current.has(selectedIdRef.current || "") || stickyForConversation(stickyOutgoingRef.current, selectedIdRef.current).length) return;
         if (followRef.current && !userPinnedRef.current) return;
         const rootEl = transcriptRef.current;
         if (!rootEl || rootEl.scrollTop > 8) return;
@@ -3579,6 +3593,19 @@ export default function App() {
     };
   }, [ensureConversation, loadAccounts, loadLocalSessions, loadRelayModels, loadRelayQuota, loadSessionHistory, refresh, refreshQuotas, refreshSkills]);
 
+  function resetComposerForNewChat() {
+    setPrompt("");
+    setPendingImages([]);
+    setPendingFiles([]);
+    setIgnoredDrops([]);
+    setShownCount(VIEW_PAGE);
+    setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
+    lastUsageTokensRef.current = 0;
+    followRef.current = true;
+    setShowJumpToBottom(false);
+    setView("chat");
+  }
+
   function newConversation(
     account?: AccountRecord,
     projectRef?: string | ProjectRecord,
@@ -3592,16 +3619,18 @@ export default function App() {
       (item) =>
         item.messages.length === 0 &&
         !item.archivedAt &&
-        !item.grokSessionId &&
+        !String(item.grokSessionId || "").trim() &&
+        !item.sessionDir &&
+        !item.historySkip &&
         (project ? item.projectId === project.id || (!item.projectId && sameWorkspace(item, project)) : !item.projectId),
     );
     if (blank && !account) {
-      followRef.current = true;
-      setShowJumpToBottom(false);
+      historyLoadedRef.current.delete(blank.id);
+      historyEpochRef.current[blank.id] = (historyEpochRef.current[blank.id] || 0) + 1;
       setSelectedId(blank.id);
-      setView("chat");
       if (project) setActiveProjectId(project.id);
       if (blank.cwd) setCwd(blank.cwd);
+      resetComposerForNewChat();
       return;
     }
 
@@ -3631,6 +3660,8 @@ export default function App() {
       updatedAt: Date.now(),
     };
 
+    historyLoadedRef.current.add(created.id);
+    historyEpochRef.current[created.id] = (historyEpochRef.current[created.id] || 0) + 1;
     setConversations((list) => [created, ...list.filter((item) => item.id !== created.id)]);
     setSelectedId(created.id);
     if (project) {
@@ -3640,14 +3671,7 @@ export default function App() {
       );
     }
     if (project || workspace) setCwd(nextCwd);
-    setView("chat");
-    setPrompt("");
-    setPendingImages([]);
-    setPendingFiles([]);
-    setIgnoredDrops([]);
-    setUsage({ usedTokens: 0, totalTokens: settings.contextWindowTokens, compactionCount: 0 });
-    followRef.current = true;
-    setShowJumpToBottom(false);
+    resetComposerForNewChat();
   }
 
   newChatRef.current = () => newConversation();
@@ -4197,7 +4221,14 @@ export default function App() {
       const catalogModel = availableModelsRef.current.find((item) => item.id === canonicalModelId(modelRef.current));
       const contextWindowTokens = channelContextWindow(settingsRef.current, relayOn, catalogModel);
       const autoCompactThresholdPercent = channelCompactPercent(settingsRef.current, relayOn);
-      const slimPrompt = Boolean(conversation.grokSessionId) || conversation.messages.length > 2 || usagePercent >= 45;
+      const ownSessionId = conversation.grokSessionId?.trim() || "";
+      const sessionOwnedElsewhere = Boolean(
+        ownSessionId &&
+          conversationsRef.current.some(
+            (item) => item.id !== conversation.id && item.grokSessionId === ownSessionId,
+          ),
+      );
+      const slimPrompt = Boolean(ownSessionId && !sessionOwnedElsewhere) || conversation.messages.length > 2 || usagePercent >= 45;
       const expanded = await expandPromptContext(outbound, promptCwd, sshTarget || null, { slim: slimPrompt });
       lastOutboundRef.current[conversation.id] = {
         text: outbound,
@@ -4212,7 +4243,7 @@ export default function App() {
         model: canonicalModelId(modelRef.current),
         cwd: sshTarget?.remotePath || conversation.cwd || cwdRef.current,
         ssh: sshTarget,
-        existingSessionId: conversation.grokSessionId ?? null,
+        existingSessionId: sessionOwnedElsewhere ? null : ownSessionId || null,
         grokHome: relayOn ? null : account?.homePath || null,
         permissionMode: settingsRef.current.permissionMode,
         reasoningEffort: settingsRef.current.reasoningEffort,
@@ -4247,7 +4278,7 @@ export default function App() {
               await new Promise((resolve) => setTimeout(resolve, Math.min(15_000, 1000 * Math.min(attempt, 15))));
               if (turnId !== conversationTurn(conversation.id)) return;
               const latest = conversationsRef.current.find((item) => item.id === conversation.id);
-              sessionOptions.existingSessionId = latest?.grokSessionId ?? sessionOptions.existingSessionId;
+              sessionOptions.existingSessionId = latest?.grokSessionId?.trim() || sessionOptions.existingSessionId;
             }
             const previousSessionId = conversation.grokSessionId || "";
             const session = await invoke<SessionInfo>("ensure_session", { options: sessionOptions });
@@ -4362,7 +4393,7 @@ export default function App() {
           model: canonicalModelId(modelRef.current),
           cwd: promptCwd,
           ssh: sshTarget,
-          existingSessionId: conversation.grokSessionId ?? null,
+          existingSessionId: conversation.grokSessionId?.trim() || null,
           grokHome: relayOn ? null : accountsRef.current.find((item) => item.id === conversation.accountId)?.homePath || null,
           permissionMode: settingsRef.current.permissionMode,
           reasoningEffort: settingsRef.current.reasoningEffort,
@@ -4903,7 +4934,7 @@ export default function App() {
   }
 
   function revealOlder(conversationId: string) {
-    if (historyLockedRef.current || historyBusyRef.current.has(conversationId) || liveTurnsRef.current.has(conversationId) || stickyOutgoingRef.current.some((item) => !item.conversationId || item.conversationId === conversationId)) return;
+    if (historyLockedRef.current || historyBusyRef.current.has(conversationId) || liveTurnsRef.current.has(conversationId) || stickyForConversation(stickyOutgoingRef.current, conversationId).length) return;
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) return;
     if (conversation.ssh || isSshWorkspace(conversation.cwd)) return;
@@ -4933,7 +4964,7 @@ export default function App() {
     const el = transcriptRef.current;
     if (!el) return;
     updateFollowState(el);
-    if (historyLockedRef.current || liveTurnsRef.current.has(selectedIdRef.current || "") || stickyOutgoingRef.current.some((item) => !item.conversationId || item.conversationId === selectedIdRef.current)) return;
+    if (historyLockedRef.current || liveTurnsRef.current.has(selectedIdRef.current || "") || stickyForConversation(stickyOutgoingRef.current, selectedIdRef.current).length) return;
     if (followRef.current && !userPinnedRef.current) return;
     if (el.scrollTop > 8) return;
     if (selectedIdRef.current) revealOlder(selectedIdRef.current);
